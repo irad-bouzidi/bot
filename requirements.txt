@@ -1,0 +1,6 @@
+MetaTrader5
+pandas
+numpy
+fastapi
+uvicorn
+python-multipart
