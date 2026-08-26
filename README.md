@@ -26,18 +26,19 @@ The bot uses a non-repainting Gaussian kernel estimator to determine a smoothed 
 
 ## 🛠 Usage
 
-The bot can be run for either Bitcoin (`BTCUSDm`) or Gold (`XAUUSDm`) using command-line arguments.
-
-### Run for BTCUSDm (Default)
+### Run Backend
 ```bash
-python bot.py
-# OR
-python bot.py BTCUSDm
+python -m backend.main
 ```
 
-### Run for XAUUSDm
+### Run Frontend
 ```bash
-python bot.py XAUUSDm
+cd frontend; npm start
+```
+
+### Run Both (Single Terminal)
+```bash
+npx concurrently "python -m backend.main" "npm start --prefix frontend"
 ```
 
 ## ⚙️ Configuration
