@@ -24,7 +24,7 @@ def get_stats():
     return {
         "account": manager.get_account_info(),
         "bots": {
-            "BTCUSDm": manager.get_bot_stats("BTCUSDm"),
+            "XAUUSDm": manager.get_bot_stats("XAUUSDm"),
             "XAUUSDm": manager.get_bot_stats("XAUUSDm")
         }
     }

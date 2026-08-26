@@ -10,7 +10,7 @@ from typing import Dict
 BANDWIDTH = 8.0
 MULT = 3.0
 WINDOW_SIZE = 500
-LOT_SIZE = 0.01
+LOT_SIZE = 0.10
 MAGIC_NUMBER = 123456
 TIMEFRAME = mt5.TIMEFRAME_M5
 
@@ -70,8 +70,20 @@ class TradingBot(threading.Thread):
 
     def open_trade(self, action):
         tick = mt5.symbol_info_tick(self.symbol)
+        symbol_info = mt5.symbol_info(self.symbol)
+        
         price = tick.ask if action == "BUY" else tick.bid
         order_type = mt5.ORDER_TYPE_BUY if action == "BUY" else mt5.ORDER_TYPE_SELL
+        
+        # For Gold: 1 USD = 10 pips, so 1 pip = 0.1 USD
+        pip = 0.1
+        
+        if action == "BUY":
+            sl = price - (70 * pip)
+            tp = price + (50 * pip)
+        else:
+            sl = price + (70 * pip)
+            tp = price - (50 * pip)
         
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
@@ -79,6 +91,8 @@ class TradingBot(threading.Thread):
             "volume": LOT_SIZE,
             "type": order_type,
             "price": price,
+            "sl": sl,
+            "tp": tp,
             "magic": MAGIC_NUMBER,
             "comment": "NW Dashboard Bot",
             "type_time": mt5.ORDER_TIME_GTC,
@@ -202,6 +216,10 @@ class BotManager:
             print("MT5 Init Failed")
 
     def start_bot(self, symbol: str):
+        if symbol.upper() not in ["XAUUSD", "GOLD", "XAUUSDM"]:
+            print(f"Bot only supports Gold (XAUUSD/GOLD/XAUUSDm). Received: {symbol}")
+            return
+
         if symbol in self.bots and self.bots[symbol].is_alive():
             return
 
