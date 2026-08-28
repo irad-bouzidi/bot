@@ -31,7 +31,8 @@ def get_stats():
     return {
         "account": manager.get_account_info(),
         "bots": {
-            "XAUUSDm": manager.get_bot_stats("XAUUSDm")        }
+            "XAUUSDm": manager.get_bot_stats("XAUUSDm")
+        }
     }
 
 @app.post("/control")
