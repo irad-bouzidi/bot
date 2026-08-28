@@ -47,28 +47,24 @@ class TradingBot(threading.Thread):
         weights = np.exp(-(i_vals**2 / (2 * h**2)))
         sum_weights = np.sum(weights)
         
-        outs = []
-        for j in range(len(src) - WINDOW_SIZE, len(src)):
+        # Vectorized calculation for the entire series
+        outs = np.full(len(src), np.nan)
+        for j in range(WINDOW_SIZE - 1, len(src)):
             window = src[j - WINDOW_SIZE + 1 : j + 1]
-            if len(window) < WINDOW_SIZE:
-                outs.append(np.nan)
-                continue
             val = np.sum(window * weights[::-1]) / sum_weights
-            outs.append(val)
+            outs[j] = val
         
-        current_out = outs[-1]
-        
-        diffs = []
-        for j in range(len(src) - WINDOW_SIZE * 2, len(src)):
+        # Calculate MAE for the entire series
+        diffs = np.full(len(src), np.nan)
+        for j in range(WINDOW_SIZE - 1, len(src)):
             window = src[j - WINDOW_SIZE + 1 : j + 1]
-            if len(window) < WINDOW_SIZE:
-                diffs.append(np.nan)
-                continue
             val = np.sum(window * weights[::-1]) / sum_weights
-            diffs.append(abs(src[j] - val))
+            diffs[j] = abs(src[j] - val)
             
-        mae = np.nanmean(diffs[-WINDOW_SIZE:]) * MULT
-        return current_out, current_out + mae, current_out - mae
+        # Use a rolling mean for MAE
+        mae = pd.Series(diffs).rolling(window=WINDOW_SIZE).mean().values * MULT
+        
+        return outs, outs + mae, outs - mae
 
     def open_trade(self, action):
         tick = mt5.symbol_info_tick(self.symbol)
@@ -238,6 +234,104 @@ class BotManager:
         if symbol in self.bots:
             return self.bots[symbol].stats
         return {"status": "Stopped"}
+
+    def run_backtest(self, symbol: str, start_date: datetime, end_date: datetime, initial_balance: float):
+        if not mt5.initialize():
+            return {"error": "MT5 Init Failed"}
+
+        # Fetch rates
+        rates = mt5.copy_rates_range(symbol, TIMEFRAME, start_date, end_date)
+        if rates is None or len(rates) == 0:
+            return {"error": "No historical data found for the given range"}
+
+        df = pd.DataFrame(rates)
+        df['time'] = pd.to_datetime(df['time'], unit='s')
+
+        # Create a temporary bot instance to use its envelope logic
+        bot = TradingBot(symbol)
+        outs, uppers, lowers = bot.calculate_envelope(df)
+
+        balance = initial_balance
+        equity = initial_balance
+        trades_opened = 0
+        wins = 0
+        losses = 0
+        total_pl = 0.0
+        max_drawdown = 0.0
+        peak_balance = initial_balance
+        
+        position = None # None, 'BUY', or 'SELL'
+        entry_price = 0.0
+        
+        pip = 0.1 # 1 pip for Gold
+        sl_pips = 70 * pip
+        tp_pips = 100 * pip
+
+        for i in range(len(df)):
+            price = df['close'].iloc[i]
+            out = outs[i]
+            upper = uppers[i]
+            lower = lowers[i]
+            
+            if np.isnan(out) or np.isnan(upper) or np.isnan(lower):
+                continue
+
+            if position is None:
+                if price < lower:
+                    position = 'BUY'
+                    entry_price = price
+                    trades_opened += 1
+                elif price > upper:
+                    position = 'SELL'
+                    entry_price = price
+                    trades_opened += 1
+            elif position == 'BUY':
+                # Check TP/SL or Out
+                if price >= entry_price + tp_pips or price <= entry_price - sl_pips or price >= out:
+                    # Use actual exit price for TP/SL, or current price for 'out' exit
+                    exit_price = price
+                    if price <= entry_price - sl_pips:
+                        exit_price = entry_price - sl_pips
+                    elif price >= entry_price + tp_pips:
+                        exit_price = entry_price + tp_pips
+                        
+                    pl = (exit_price - entry_price) * (LOT_SIZE * 100)
+                    balance += pl
+                    total_pl += pl
+                    if pl > 0: wins += 1
+                    elif pl < 0: losses += 1
+                    position = None
+            elif position == 'SELL':
+                # Check TP/SL or Out
+                if price <= entry_price - tp_pips or price >= entry_price + sl_pips or price <= out:
+                    # Use actual exit price for TP/SL, or current price for 'out' exit
+                    exit_price = price
+                    if price >= entry_price + sl_pips:
+                        exit_price = entry_price + sl_pips
+                    elif price <= entry_price - tp_pips:
+                        exit_price = entry_price - tp_pips
+                        
+                    pl = (entry_price - exit_price) * (LOT_SIZE * 100)
+                    balance += pl
+                    total_pl += pl
+                    if pl > 0: wins += 1
+                    elif pl < 0: losses += 1
+                    position = None
+            
+            peak_balance = max(peak_balance, balance)
+            drawdown = (peak_balance - balance) / peak_balance * 100 if peak_balance != 0 else 0
+            max_drawdown = max(max_drawdown, drawdown)
+
+        return {
+            "initial_balance": initial_balance,
+            "final_balance": balance,
+            "total_pl": total_pl,
+            "trades_opened": trades_opened,
+            "wins": wins,
+            "losses": losses,
+            "win_rate": (wins / trades_opened * 100) if trades_opened > 0 else 0,
+            "max_drawdown": max_drawdown
+        }
 
     def get_account_info(self):
         acc = mt5.account_info()
