@@ -115,24 +115,24 @@ const BacktestPage = () => {
           </div>
 
           <div className="preset-group">
-            <button 
-              onClick={() => handleDatePreset('week')}
-              style={activePreset === 'week' ? { background: 'var(--accent-color)', color: 'white', borderColor: 'var(--accent-color)' } : {}}
-            >
-              Last Week
-            </button>
-            <button 
-              onClick={() => handleDatePreset('month')}
-              style={activePreset === 'month' ? { background: 'var(--accent-color)', color: 'white', borderColor: 'var(--accent-color)' } : {}}
-            >
-              Last Month
-            </button>
-            <button 
-              onClick={() => handleDatePreset('year')}
-              style={activePreset === 'year' ? { background: 'var(--accent-color)', color: 'white', borderColor: 'var(--accent-color)' } : {}}
-            >
-              Last Year
-            </button>
+             <button 
+               onClick={() => handleDatePreset('week')}
+               className={`preset-btn ${activePreset === 'week' ? 'active' : ''}`}
+             >
+               Last Week
+             </button>
+             <button 
+               onClick={() => handleDatePreset('month')}
+               className={`preset-btn ${activePreset === 'month' ? 'active' : ''}`}
+             >
+               Last Month
+             </button>
+             <button 
+               onClick={() => handleDatePreset('year')}
+               className={`preset-btn ${activePreset === 'year' ? 'active' : ''}`}
+             >
+               Last Year
+             </button>
           </div>
 
           <button className="btn-run" onClick={runBacktest} disabled={loading}>

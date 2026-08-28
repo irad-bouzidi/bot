@@ -166,20 +166,23 @@ class TradingBot(threading.Thread):
                 
                 df = pd.DataFrame(rates)
                 current_close = df['close'].iloc[-1]
-                out, upper, lower = self.calculate_envelope(df)
+                out_arr, upper_arr, lower_arr = self.calculate_envelope(df)
+                out = out_arr[-1]
+                upper = upper_arr[-1]
+                lower = lower_arr[-1]
                 
                 self.stats.update({
                     "last_close": current_close,
-                    "out": out,
-                    "upper": upper,
-                    "lower": lower
+                    "out": out_arr,
+                    "upper": upper_arr,
+                    "lower": lower_arr
                 })
                 
                 # Update profit stats periodically
                 self.update_performance_stats()
                 
                 positions = mt5.positions_get(symbol=self.symbol)
-                if not positions:
+                if positions is None or len(positions) == 0:
                     if current_close < lower:
                         self.open_trade("BUY")
                     elif current_close > upper:
@@ -232,7 +235,12 @@ class BotManager:
 
     def get_bot_stats(self, symbol: str):
         if symbol in self.bots:
-            return self.bots[symbol].stats
+            stats = self.bots[symbol].stats.copy()
+            # Convert numpy arrays to latest scalar values for JSON serialization
+            for key in ["out", "upper", "lower"]:
+                if isinstance(stats[key], np.ndarray):
+                    stats[key] = float(stats[key][-1]) if len(stats[key]) > 0 else 0.0
+            return stats
         return {"status": "Stopped"}
 
     def run_backtest(self, symbol: str, start_date: datetime, end_date: datetime, initial_balance: float):
@@ -337,6 +345,9 @@ class BotManager:
         acc = mt5.account_info()
         if acc is None: return {}
         
+        # Convert named tuple to dict
+        acc_dict = acc._asdict() if hasattr(acc, '_asdict') else dict(acc)
+        
         # Calculate time-based profits
         now = datetime.now()
         time_frames = {
@@ -355,11 +366,11 @@ class BotManager:
                 profits[label] = 0.0
 
         return {
-            "balance": acc.balance,
-            "equity": acc.equity,
-            "profit": acc.profit,
-            "leverage": acc.leverage,
-            "margin": acc.margin,
-            "drawdown": ((acc.balance - acc.equity) / acc.balance * 100) if acc.balance != 0 else 0,
+            "balance": acc_dict.get("balance", 0),
+            "equity": acc_dict.get("equity", 0),
+            "profit": acc_dict.get("profit", 0),
+            "leverage": acc_dict.get("leverage", 0),
+            "margin": acc_dict.get("margin", 0),
+            "drawdown": ((acc_dict.get("balance", 0) - acc_dict.get("equity", 0)) / acc_dict.get("balance", 1) * 100) if acc_dict.get("balance", 0) != 0 else 0,
             "time_profits": profits
         }
