@@ -1,3 +1,5 @@
+import pip
+
 import MetaTrader5 as mt5
 import pandas as pd
 import numpy as np
@@ -10,7 +12,7 @@ from typing import Dict
 BANDWIDTH = 8.0
 MULT = 3.0
 WINDOW_SIZE = 500
-LOT_SIZE = 0.10
+LOT_SIZE = 0.05
 MAGIC_NUMBER = 123456
 TIMEFRAME = mt5.TIMEFRAME_M5
 
@@ -68,86 +70,20 @@ class TradingBot(threading.Thread):
         mae = np.nanmean(diffs[-WINDOW_SIZE:]) * MULT
         return current_out, current_out + mae, current_out - mae
 
-    def get_consecutive_losses(self, action):
-        from_date = datetime.now() - timedelta(days=30)
-        history = mt5.history_deals_get(from_date, datetime.now(), group=f"*{self.symbol}*")
-        if history is None or len(history) == 0:
-            return 0
-        
-        bot_deals = [d for d in history if d.magic == MAGIC_NUMBER and d.entry == mt5.DEAL_ENTRY_OUT]
-        if not bot_deals:
-            return 0
-            
-        target_type = mt5.DEAL_TYPE_SELL if action == "BUY" else mt5.DEAL_TYPE_BUY
-        opposite_type = mt5.DEAL_TYPE_BUY if action == "BUY" else mt5.DEAL_TYPE_SELL
-        
-        # We only care about trades of the same direction
-        target_deals = [d for d in bot_deals if d.type == target_type]
-        if not target_deals:
-            return 0
-        
-        streak = 0
-        for d in reversed(target_deals):
-            if d.profit < 0:
-                streak += 1
-            else:
-                break
-        
-        if streak == 0:
-            return 0
-        
-        # If we hit 3 or more losses, we must wait for an opposite trade to reset
-        if streak >= 3:
-            # Find index of the 3rd most recent loss of this type
-            third_loss_deal = target_deals[-3]
-            # Check all bot deals after that 3rd loss for any opposite trade
-            for d in bot_deals:
-                if d == third_loss_deal:
-                    # Once we find the 3rd loss, check subsequent deals
-                    # We iterate through the remaining list using a slice in a real scenario, 
-                    # but here we just need to know if any opposite trade happened AFTER it.
-                    pass
-            
-            # Correct way to check for opposite trade after 3rd loss
-            found_third = False
-            for d in bot_deals:
-                if d == third_loss_deal:
-                    found_third = True
-                    continue
-                if found_third and d.type == opposite_type:
-                    return 0 # Reset the martingale
-            return streak # Still blocked
-            
-        return streak
-
     def open_trade(self, action):
         tick = mt5.symbol_info_tick(self.symbol)
         symbol_info = mt5.symbol_info(self.symbol)
-        
         price = tick.ask if action == "BUY" else tick.bid
         order_type = mt5.ORDER_TYPE_BUY if action == "BUY" else mt5.ORDER_TYPE_SELL
-        
-        # Martingale lot size calculation
-        losses = self.get_consecutive_losses(action)
-        if losses >= 3:
-            print(f"Martingale blocked for {action}: 3+ consecutive losses. Waiting for opposite position.")
-            return False
-            
         lot_size = LOT_SIZE
-        if losses == 1:
-            lot_size = 0.15
-        elif losses == 2:
-            lot_size = 0.25
-
         # For Gold: 1 USD = 10 pips, so 1 pip = 0.1 USD
         pip = 0.1
-        
         if action == "BUY":
             sl = price - (70 * pip)
-            tp = price + (50 * pip)
+            tp = price + (100 * pip)
         else:
             sl = price + (70 * pip)
-            tp = price - (50 * pip)
+            tp = price - (100 * pip)
         
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
