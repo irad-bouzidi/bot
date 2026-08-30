@@ -8,6 +8,26 @@ const Skeleton = ({ className = '' }: { className?: string }) => (
   <div className={`skeleton ${className}`} />
 );
 
+// Signature device: a stylized Nadaraya-Watson kernel-regression envelope —
+// the exact smoothed mean + upper/lower bands these bots trade against.
+const EnvelopeCurve = () => (
+  <svg className="envelope-curve" viewBox="0 0 1200 100" preserveAspectRatio="none" aria-hidden="true">
+    <line className="env-baseline" x1="0" y1="99" x2="1200" y2="99" />
+    <path
+      className="env-band"
+      d="M0,32 C100,2 200,2 300,32 C400,62 500,62 600,32 C700,2 800,2 900,32 C1000,62 1100,62 1200,32"
+    />
+    <path
+      className="env-band"
+      d="M0,68 C100,38 200,38 300,68 C400,98 500,98 600,68 C700,38 800,38 900,68 C1000,98 1100,98 1200,68"
+    />
+    <path
+      className="env-mean"
+      d="M0,50 C100,20 200,20 300,50 C400,80 500,80 600,50 C700,20 800,20 900,50 C1000,80 1100,80 1200,50"
+    />
+  </svg>
+);
+
 const StatCardSkeleton = () => (
   <div className="stat-card">
     <Skeleton className="stat-label-skeleton" />
@@ -94,7 +114,13 @@ const Dashboard = () => {
       <div className="dashboard-container">
         <header className="dashboard-header">
           <div className="header-left">
-            <h1>NW Trading Dashboard</h1>
+            <div className="brand">
+              <span className="brand-mark">NW</span>
+              <div className="brand-text">
+                <h1>Nadaraya-Watson Desk</h1>
+                <span className="brand-sub">Kernel-regression execution terminal</span>
+              </div>
+            </div>
             <nav className="nav-links">
               <button className="nav-btn active" disabled>Dashboard</button>
               <button className="nav-btn" disabled>Backtest</button>
@@ -102,6 +128,7 @@ const Dashboard = () => {
           </div>
           <Skeleton className="theme-toggle-skeleton" />
         </header>
+        <EnvelopeCurve />
         <div className="stats-grid">
           {[...Array(4)].map((_, i) => <StatCardSkeleton key={i} />)}
         </div>
@@ -123,16 +150,28 @@ const Dashboard = () => {
       <div className="dashboard-container">
         <header className="dashboard-header">
           <div className="header-left">
-            <h1>NW Trading Dashboard</h1>
+            <div className="brand">
+              <span className="brand-mark">NW</span>
+              <div className="brand-text">
+                <h1>Nadaraya-Watson Desk</h1>
+                <span className="brand-sub">Kernel-regression execution terminal</span>
+              </div>
+            </div>
             <nav className="nav-links">
               <button className={`nav-btn ${view === 'dashboard' ? 'active' : ''}`} onClick={() => setView('dashboard')}>Dashboard</button>
               <button className={`nav-btn ${view === 'backtest' ? 'active' : ''}`} onClick={() => setView('backtest')}>Backtest</button>
             </nav>
           </div>
-          <button className="theme-toggle" onClick={toggleTheme}>
-            {theme === 'light' ? '🌙' : '☀️'}
-          </button>
+          <label className="theme-switch" title={theme === 'light' ? 'Switch to dark mode' : 'Switch to light mode'}>
+            <input
+              type="checkbox"
+              checked={theme === 'dark'}
+              onChange={toggleTheme}
+            />
+            <span className="switch-slider"></span>
+          </label>
         </header>
+        <EnvelopeCurve />
         <div className="error-banner">
           <span>⚠️</span>
           <p>{error}</p>
@@ -146,7 +185,13 @@ const Dashboard = () => {
     <div className="dashboard-container">
       <header className="dashboard-header">
         <div className="header-left">
-          <h1>NW Trading Dashboard</h1>
+          <div className="brand">
+            <span className="brand-mark">NW</span>
+            <div className="brand-text">
+              <h1>Nadaraya-Watson Desk</h1>
+              <span className="brand-sub">Kernel-regression execution terminal</span>
+            </div>
+          </div>
           <nav className="nav-links">
             <button 
               className={`nav-btn ${view === 'dashboard' ? 'active' : ''}`} 
@@ -171,12 +216,14 @@ const Dashboard = () => {
           <span className="switch-slider"></span>
         </label>
       </header>
-       
+      <EnvelopeCurve />
+
       {view === 'backtest' ? (
         <BacktestPage />
       ) : (
         <>
           {/* Account Overview */}
+          <p className="eyebrow">Account Overview</p>
           <div className="stats-grid">
             {data?.account && Object.entries(data.account).map(([key, val]: any) => {
               if (key === 'time_profits') return null;
@@ -212,6 +259,7 @@ const Dashboard = () => {
                   <div className="bot-header">
                     <h2>{symbol}</h2>
                     <span className={`status-badge ${stats.status === 'Running' ? 'status-running' : 'status-stopped'}`}>
+                      <span className="live-dot" />
                       {stats.status}
                     </span>
                   </div>
