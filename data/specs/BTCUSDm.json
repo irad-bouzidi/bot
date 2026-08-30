@@ -1,0 +1,20 @@
+{
+  "captured_at": "2026-08-30T19:20:22.784954+00:00",
+  "contract_size": 1.0,
+  "currency_margin": "BTC",
+  "currency_profit": "USD",
+  "digits": 2,
+  "filling_modes": 3,
+  "freeze_level_points": 0,
+  "name": "BTCUSDm",
+  "point": 0.01,
+  "server_utc_offset_seconds": 0,
+  "source": "mt5",
+  "stops_level_points": 0,
+  "tick_size": 0.01,
+  "tick_value": 0.01,
+  "typical_spread_points": 1000.0,
+  "volume_max": 200.0,
+  "volume_min": 0.01,
+  "volume_step": 0.01
+}
