@@ -72,8 +72,10 @@ const BacktestPage = () => {
   return (
     <div className="backtest-container">
       <div className="backtest-card">
+        <p className="eyebrow">Simulation</p>
         <h2>Strategy Backtester</h2>
-        
+        <p className="backtest-sub">Run the envelope strategy against historical price data before risking it live.</p>
+
         <div className="backtest-form">
           <div className="form-group">
             <label>Symbol</label>

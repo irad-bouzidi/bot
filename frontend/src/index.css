@@ -1,37 +1,52 @@
 body {
   margin: 0;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
-    'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
-    sans-serif;
+  font-family: 'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
 
+/*
+  Light theme: a "paper ledger" session — warm parchment ground, ink text,
+  the same antique-gold accent as the dark desk. Not an inversion of the
+  dark palette; a distinct printed-ticker-tape read on the same identity.
+*/
 :root {
-  --bg-color: #f4f7f6;
+  --bg-color: #f3efe6;
   --card-bg: #ffffff;
-  --text-main: #333333;
-  --text-muted: #666666;
-  --border-color: #dddddd;
-  --accent-color: #48bb78;
-  --danger-color: #f56565;
-  --card-shadow: 0 2px 4px rgba(0,0,0,0.1);
-  --secondary-bg: #f9f9f9;
+  --card-bg-raised: #faf7f0;
+  --text-main: #1b1d22;
+  --text-muted: #6b6f7a;
+  --border-color: #ddd6c6;
+  --accent-color: #a9822f;
+  --accent-color-strong: #8a691f;
+  --danger-color: #c0392b;
+  --success-color: #2f7a4d;
+  --card-shadow: none;
+  --secondary-bg: #ece6d8;
+  --font-display: 'IBM Plex Sans Condensed', 'IBM Plex Sans', sans-serif;
+  --font-mono: 'IBM Plex Mono', 'Courier New', monospace;
 }
 
+/*
+  Dark theme: the primary "desk" — near-black terminal glass, warm bone-white
+  text (phosphor paper, not pure white), antique gold as the operating accent —
+  a literal nod to XAUUSD, the instrument these bots trade.
+*/
 [data-theme='dark'] {
-  --bg-color: #1a202c;
-  --card-bg: #2d3748;
-  --text-main: #f7fafc;
-  --text-muted: #a0aec0;
-  --border-color: #4a5568;
-  --accent-color: #48bb78;
-  --danger-color: #fc8181;
-  --card-shadow: 0 4px 6px rgba(0,0,0,0.3);
-  --secondary-bg: #2d3748;
+  --bg-color: #0b0d12;
+  --card-bg: #12151c;
+  --card-bg-raised: #181c25;
+  --text-main: #edeae2;
+  --text-muted: #7c8496;
+  --border-color: #232833;
+  --accent-color: #c9a961;
+  --accent-color-strong: #e0bf7f;
+  --danger-color: #e2605a;
+  --success-color: #7fb88f;
+  --card-shadow: none;
+  --secondary-bg: #10131a;
 }
 
 code {
-  font-family: source-code-pro, Menlo, Monaco, Consolas, 'Courier New',
-    monospace;
+  font-family: var(--font-mono);
 }
