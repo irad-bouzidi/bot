@@ -1,7 +1,7 @@
 from fastapi import FastAPI, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from backend.bot_manager import BotManager
+from backend.bot_manager import BotManager, SUPPORTED_SYMBOLS
 import uvicorn
 from datetime import datetime
 
@@ -31,7 +31,8 @@ def get_stats():
     return {
         "account": manager.get_account_info(),
         "bots": {
-            "XAUUSDm": manager.get_bot_stats("XAUUSDm")
+            symbol: manager.get_bot_stats(symbol)
+            for symbol in SUPPORTED_SYMBOLS
         }
     }
 

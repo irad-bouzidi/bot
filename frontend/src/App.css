@@ -4,8 +4,6 @@
   min-height: 100vh;
   color: var(--text-main);
   transition: background-color 0.3s, color 0.3s;
-  max-width: 1400px;
-  margin: 0 auto;
 }
 
 .dashboard-header {

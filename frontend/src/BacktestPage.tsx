@@ -2,6 +2,8 @@ import React, { useState } from 'react';
 
 const API_BASE = 'http://localhost:8000';
 
+const SUPPORTED_SYMBOLS = ['XAUUSDm', 'BTCUSDm'];
+
 const BacktestPage = () => {
   const [params, setParams] = useState({
     symbol: 'XAUUSDm',
@@ -75,10 +77,14 @@ const BacktestPage = () => {
         <div className="backtest-form">
           <div className="form-group">
             <label>Symbol</label>
-            <input 
+            <select 
               value={params.symbol} 
               onChange={e => setParams({...params, symbol: e.target.value})} 
-            />
+            >
+              {SUPPORTED_SYMBOLS.map(s => (
+                <option key={s} value={s}>{s}</option>
+              ))}
+            </select>
           </div>
 
           <div className="form-group">
