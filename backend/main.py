@@ -1,20 +1,43 @@
-from fastapi import FastAPI, BackgroundTasks
+import os
+
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from backend.bot_manager import BotManager, SUPPORTED_SYMBOLS
+from backend.bot_manager import BotManager, SUPPORTED_SYMBOLS, log
 import uvicorn
 from datetime import datetime
+
+# S2: this API can start and stop LIVE trading and has no authentication, so it
+# must not be reachable from the network. Bind loopback and allow only the local
+# dev frontend. Override deliberately via env if you know what you are doing.
+HOST = os.environ.get("BOT_HOST", "127.0.0.1")
+PORT = int(os.environ.get("BOT_PORT", "8000"))
+ALLOWED_ORIGINS = [
+    o.strip()
+    for o in os.environ.get(
+        "BOT_ALLOWED_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000"
+    ).split(",")
+    if o.strip()
+]
 
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
 manager = BotManager()
+
+
+@app.on_event("shutdown")
+def _shutdown():
+    """S6: stop bots on exit. Previously the non-daemon threads kept a live
+    position open and Ctrl+C on uvicorn would hang."""
+    log("Shutting down: stopping all bots")
+    manager.stop_all()
 
 class SymbolControl(BaseModel):
     symbol: str
@@ -57,4 +80,6 @@ def backtest(req: BacktestRequest):
         return {"error": str(e)}
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    if HOST != "127.0.0.1":
+        log("WARNING: binding %s exposes UNAUTHENTICATED live-trading control" % HOST)
+    uvicorn.run(app, host=HOST, port=PORT)

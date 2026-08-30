@@ -27,3 +27,6 @@ yarn-error.log*
 # OS
 .DS_Store
 Thumbs.db
+
+# Bar cache + reports (snapshotted on the MT5 host)
+data/

@@ -1,6 +1,9 @@
-MetaTrader5
-pandas
-numpy
+# Runtime deps. Pinned to what is verified working on the trading host
+# (Windows + Python 3.8.10). MetaTrader5 is Windows-only and is imported by
+# exactly two modules: backend/data/mt5_source.py and backend/execution/mt5_broker.py.
+MetaTrader5==5.0.6147
+pandas==2.0.3
+numpy==1.24.4
 fastapi
 uvicorn
 python-multipart
