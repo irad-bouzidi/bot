@@ -60,14 +60,25 @@ def cmd_snapshot(args):
             total += len(existing)
             continue
         m_start = datetime.strptime(m, "%Y-%m").replace(tzinfo=timezone.utc)
+        m_end = _month_end(m)
         try:
-            bs = src.get_bars(args.symbol, args.timeframe, m_start, _month_end(m))
+            bs = src.get_bars(args.symbol, args.timeframe, m_start, m_end)
         except Exception as exc:
             print("MISS  %s: %s" % (m, str(exc).splitlines()[0]))
             continue
-        p = write_shard(bs.df, args.root, args.symbol, args.timeframe, m)
-        total += len(bs.df)
-        print("write %s  %6d bars  -> %s" % (m, len(bs.df), p))
+
+        # For a month the broker has no history for, copy_rates_range does NOT
+        # return an empty array -- it returns a single bar, the earliest one it
+        # holds. Writing that unfiltered put one bogus row into every pre-history
+        # shard. Keep only rows that genuinely belong to this month.
+        part = bs.df[(bs.df.index >= m_start) & (bs.df.index <= m_end)]
+        if not len(part):
+            print("MISS  %s: no history" % m)
+            continue
+
+        p = write_shard(part, args.root, args.symbol, args.timeframe, m)
+        total += len(part)
+        print("write %s  %6d bars  -> %s" % (m, len(part), p))
 
     print("\ntotal %d bars cached for %s %s" % (total, args.symbol, args.timeframe))
     return 0

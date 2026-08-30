@@ -9,7 +9,7 @@
   "name": "BTCUSDm",
   "point": 0.01,
   "server_utc_offset_seconds": 0,
-  "source": "mt5",
+  "source": "mt5+offset-repaired",
   "stops_level_points": 0,
   "tick_size": 0.01,
   "tick_value": 0.01,

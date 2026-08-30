@@ -76,10 +76,23 @@ def read_spec(symbol, root=DEFAULT_ROOT):
 
 def write_shard(df, root, symbol, timeframe, month):
     # type: (pd.DataFrame, str, str, str, str) -> str
-    p = shard_path(root, symbol, timeframe, month)
-    os.makedirs(os.path.dirname(p), exist_ok=True)
+    """Write one month's bars. Refuses rows that do not belong to `month`.
+
+    MT5's copy_rates_range returns a single bar (its earliest) rather than an
+    empty array when asked for a month it has no history for, which silently
+    seeded bogus rows into every pre-history shard until this guard was added.
+    """
     out = df.copy()
     out.index = out.index.tz_convert("UTC")
+    stamps = out.index.strftime("%Y-%m")
+    if len(out) and not (stamps == month).all():
+        bad = sorted(set(stamps[stamps != month]))
+        raise ValueError(
+            "refusing to write shard %s/%s/%s: it contains rows from %s"
+            % (symbol, timeframe, month, ", ".join(bad[:5]))
+        )
+    p = shard_path(root, symbol, timeframe, month)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
     out.to_csv(p, compression="gzip", index_label="time")
     return p
 
