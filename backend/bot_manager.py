@@ -12,14 +12,38 @@ from typing import Dict
 BANDWIDTH = 8.0
 MULT = 3.0
 WINDOW_SIZE = 500
-LOT_SIZE = 0.05
 MAGIC_NUMBER = 123456
 TIMEFRAME = mt5.TIMEFRAME_M5
+
+# Symbol configurations
+# pip: price movement per pip (for SL/TP calculation)
+# lot_size: position size
+# sl_pips/tp_pips: stop loss and take profit in pips
+# profit_mult: multiplier for P&L calculation (profit = price_diff * lot_size * profit_mult)
+SYMBOL_CONFIG = {
+    "XAUUSDm": {
+        "pip": 0.1,
+        "lot_size": 0.05,
+        "sl_pips": 70,
+        "tp_pips": 100,
+        "profit_mult": 100,
+    },
+    "BTCUSDm": {
+        "pip": 0.1,
+        "lot_size": 0.05,
+        "sl_pips": 700,
+        "tp_pips": 500,
+        "profit_mult": 1,
+    },
+}
+
+SUPPORTED_SYMBOLS = list(SYMBOL_CONFIG.keys())
 
 class TradingBot(threading.Thread):
     def __init__(self, symbol: str):
         super().__init__()
         self.symbol = symbol
+        self.config = SYMBOL_CONFIG.get(symbol, SYMBOL_CONFIG["XAUUSDm"])
         self.running = False
         self._stop_event = threading.Event()
         self.stats = {
@@ -71,15 +95,15 @@ class TradingBot(threading.Thread):
         symbol_info = mt5.symbol_info(self.symbol)
         price = tick.ask if action == "BUY" else tick.bid
         order_type = mt5.ORDER_TYPE_BUY if action == "BUY" else mt5.ORDER_TYPE_SELL
-        lot_size = LOT_SIZE
-        # For Gold: 1 USD = 10 pips, so 1 pip = 0.1 USD
-        pip = 0.1
+        lot_size = self.config["lot_size"]
+        
+        pip = self.config["pip"]
         if action == "BUY":
-            sl = price - (70 * pip)
-            tp = price + (100 * pip)
+            sl = price - (self.config["sl_pips"] * pip)
+            tp = price + (self.config["tp_pips"] * pip)
         else:
-            sl = price + (70 * pip)
-            tp = price - (100 * pip)
+            sl = price + (self.config["sl_pips"] * pip)
+            tp = price - (self.config["tp_pips"] * pip)
         
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
@@ -215,8 +239,8 @@ class BotManager:
             print("MT5 Init Failed")
 
     def start_bot(self, symbol: str):
-        if symbol.upper() not in ["XAUUSD", "GOLD", "XAUUSDM"]:
-            print(f"Bot only supports Gold (XAUUSD/GOLD/XAUUSDm). Received: {symbol}")
+        if symbol.upper() not in [s.upper() for s in SUPPORTED_SYMBOLS]:
+            print(f"Bot only supports: {', '.join(SUPPORTED_SYMBOLS)}. Received: {symbol}")
             return
 
         if symbol in self.bots and self.bots[symbol].is_alive():
@@ -257,6 +281,7 @@ class BotManager:
 
         # Create a temporary bot instance to use its envelope logic
         bot = TradingBot(symbol)
+        config = SYMBOL_CONFIG.get(symbol, SYMBOL_CONFIG["XAUUSDm"])
         outs, uppers, lowers = bot.calculate_envelope(df)
 
         balance = initial_balance
@@ -271,9 +296,11 @@ class BotManager:
         position = None # None, 'BUY', or 'SELL'
         entry_price = 0.0
         
-        pip = 0.1 # 1 pip for Gold
-        sl_pips = 70 * pip
-        tp_pips = 100 * pip
+        pip = config["pip"]
+        sl_pips = config["sl_pips"] * pip
+        tp_pips = config["tp_pips"] * pip
+        lot_size = config["lot_size"]
+        profit_mult = config["profit_mult"]
 
         for i in range(len(df)):
             price = df['close'].iloc[i]
@@ -303,7 +330,7 @@ class BotManager:
                     elif price >= entry_price + tp_pips:
                         exit_price = entry_price + tp_pips
                         
-                    pl = (exit_price - entry_price) * (LOT_SIZE * 100)
+                    pl = (exit_price - entry_price) * lot_size * profit_mult
                     balance += pl
                     total_pl += pl
                     if pl > 0: wins += 1
@@ -319,7 +346,7 @@ class BotManager:
                     elif price <= entry_price - tp_pips:
                         exit_price = entry_price - tp_pips
                         
-                    pl = (entry_price - exit_price) * (LOT_SIZE * 100)
+                    pl = (entry_price - exit_price) * lot_size * profit_mult
                     balance += pl
                     total_pl += pl
                     if pl > 0: wins += 1
