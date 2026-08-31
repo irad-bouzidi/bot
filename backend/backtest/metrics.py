@@ -154,10 +154,25 @@ def compute_metrics(ledger, equity, initial_balance, periods_per_year=252):
         m["short_pl"] = float(shorts["net_pl"].sum())
         m["avg_mae_r"] = float(closed["mae_r"].mean())
         m["avg_mfe_r"] = float(closed["mfe_r"].mean())
+        # Scale-out take-up. A rule that fires on 2% of trades cannot explain a
+        # change in the headline numbers, and knowing that before arguing about
+        # the P&L saves the argument.
+        if "partial_volume" in closed:
+            fired = closed[closed["partial_volume"] > 0]
+            m["partials_fired"] = int(len(fired))
+            m["partials_fired_pct"] = 100.0 * len(fired) / n
+            m["partial_pl"] = float(fired["partial_pl"].sum()) if len(fired) else 0.0
+        else:
+            m["partials_fired"] = 0
+            m["partials_fired_pct"] = 0.0
+            m["partial_pl"] = 0.0
     else:
         for k in ("avg_bars_held", "avg_duration_hours", "total_costs",
                   "long_win_rate", "short_win_rate", "avg_mae_r", "avg_mfe_r"):
             m[k] = None
+        m["partials_fired"] = 0
+        m["partials_fired_pct"] = 0.0
+        m["partial_pl"] = 0.0
         m["exit_reason_counts"] = {}
         m["long_trades"] = m["short_trades"] = 0
         m["long_pl"] = m["short_pl"] = 0.0

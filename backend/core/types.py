@@ -104,6 +104,13 @@ class Signal:
     Keeping prices out of the strategy is what lets the same signal drive both the
     simulated and the live broker: each fills at its own price and owns its own
     rounding and stops-level clamping.
+
+    `be_trigger_distance` and `partial_fraction` describe the SCALE-OUT rule the
+    same way: a favourable distance from entry, and a proportion of the position,
+    never a lot count. The live broker turns the fraction into lots against the
+    symbol's volume_step; the engine turns it into lots against BacktestConfig.
+    Expressing it as lots here would fuse strategy with execution and would break
+    the moment the position size changed.
     """
 
     type: SignalType
@@ -113,6 +120,8 @@ class Signal:
     tp_distance: Optional[float] = None
     strength: float = 0.0
     features: Dict[str, float] = field(default_factory=dict)
+    be_trigger_distance: Optional[float] = None
+    partial_fraction: float = 0.0
 
 
 @dataclass(frozen=True)

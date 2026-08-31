@@ -17,6 +17,12 @@ Entry/exit modes are explicit config rather than implicit behaviour:
 * `sl_mode="band"` sets the stop from the band half-width, which makes the
   risk/reward structural instead of an accident of the instrument's price level.
   That is how BTCUSDm ended up risking 700 points to make 500.
+
+* `be_trigger_mode` / `partial_fraction` add a scale-out: at a set distance in
+  profit, close part of the position and pull the stop to entry. Note what this
+  does and does not do -- it raises the win rate and cuts the loss column, but it
+  also caps the winners it lets through, so it is a variance reduction, not free
+  money. Judge it on expectancy_r and drawdown, never on win rate.
 """
 
 from dataclasses import dataclass
@@ -51,6 +57,22 @@ class NWConfig:
     tp_price: float = 10.0
     tp_r_multiple: float = 1.5     # tp = R * sl_distance -- cannot invert by accident
 
+    # Scale-out / break-even. At `be_trigger` in profit, close `partial_fraction`
+    # of the position and pull the stop to entry.
+    #   "none"        disabled
+    #   "tp_fraction" trigger = be_trigger_tp_fraction * tp_distance (needs a TP)
+    #   "fixed"       trigger = be_trigger_price, in PRICE units
+    #   "r"           trigger = be_trigger_r * sl_distance
+    # tp_fraction is the default because it is the only mode that stays sane across
+    # symbols: 0.5 means "half way to target" whether the target is 10 or 50 price
+    # units, where a hardcoded 5.0 would be half the target on gold and a tenth of
+    # it on BTC.
+    be_trigger_mode: str = "tp_fraction"
+    be_trigger_tp_fraction: float = 0.5
+    be_trigger_price: float = 5.0
+    be_trigger_r: float = 0.7
+    partial_fraction: float = 0.5  # 0.5 of 0.1 lots = 0.05 out, 0.05 runs to target
+
     min_strength: float = 0.0      # penetration depth filter, in band half-widths
     max_spread_points: Optional[float] = None
 
@@ -74,6 +96,12 @@ class NWEnvelopeStrategy(Strategy):
             raise ValueError("entry_mode must be 'level' or 'cross'")
         if self.cfg.sl_mode not in ("fixed", "band", "atr"):
             raise ValueError("sl_mode must be 'fixed', 'band' or 'atr'")
+        if self.cfg.be_trigger_mode not in ("none", "fixed", "tp_fraction", "r"):
+            raise ValueError("be_trigger_mode must be 'none', 'fixed', "
+                             "'tp_fraction' or 'r'")
+        if not 0.0 <= self.cfg.partial_fraction < 1.0:
+            raise ValueError("partial_fraction must be in [0, 1) -- 1.0 would close "
+                             "the whole position and leave nothing running")
 
     def warmup_bars(self):
         c = self.cfg
@@ -121,6 +149,25 @@ class NWEnvelopeStrategy(Strategy):
         if c.tp_mode == "fixed":
             return c.tp_price
         return c.tp_r_multiple * sl
+
+    def _be_trigger_distance(self, sl, tp):
+        c = self.cfg
+        if c.be_trigger_mode == "none" or c.partial_fraction <= 0:
+            return None
+        if c.be_trigger_mode == "fixed":
+            d = c.be_trigger_price
+        elif c.be_trigger_mode == "r":
+            d = c.be_trigger_r * sl
+        else:
+            if not tp:
+                return None
+            d = c.be_trigger_tp_fraction * tp
+        # A trigger at or past the target would never arm before the TP closed the
+        # trade; the engine drops it too, but returning None keeps the ledger's
+        # be_trigger_price honest about the rule that was actually in force.
+        if d <= 0 or (tp and d >= tp):
+            return None
+        return d
 
     # -- the rules ----------------------------------------------------------
 
@@ -174,4 +221,6 @@ class NWEnvelopeStrategy(Strategy):
             reason="close_below_lower" if below else "close_above_upper",
             ref_price=close, sl_distance=sl, tp_distance=tp,
             strength=float(strength), features=dict(f),
+            be_trigger_distance=self._be_trigger_distance(sl, tp),
+            partial_fraction=c.partial_fraction,
         )]

@@ -31,9 +31,18 @@ This bot places **real market orders**. Read this section before running it.
   its zero-cost break-even win rate — so the configuration has no edge before
   costs and loses the spread on every trade. **Recommend leaving it stopped**
   pending measurement on real broker data.
-- Position sizing is a fixed 0.05 lots with no equity-based sizing, no daily or
-  weekly loss cap, and no margin check. At the same "0.05 lots", XAU risks ~$35
-  per trade and BTC ~$3.50 — a 10× asymmetry.
+- **The scale-out / break-even rule reduces expectancy on every setting tested.**
+  On gold from 2025-05 with central costs it lifts the win rate from 45.9% to
+  ~54% while expectancy falls from -0.071R to -0.104R, because it clips the
+  average winner while doing nothing for trades that run straight to the stop.
+  A 3x3 sweep of trigger and size was monotonically worse than leaving it off, on
+  both symbols. It is enabled because it was requested; disable it with
+  `--no-breakeven`, or `partial_fraction = 0` in `SYMBOL_CONFIG`.
+- **`lot_size` is 0.1, which risks ~$70 per gold trade** against the 70-pip stop,
+  with no equity-based sizing, no daily or weekly loss cap and no margin check.
+  This configuration produced runs of 11-12 consecutive losses in backtest — about
+  $840 — at roughly 4.4 trades per day. At the same "0.1 lots" BTC risks ~$7, a
+  10x asymmetry, because the two symbols' contract sizes differ by 100x.
 - The backtest engine has no ruin or margin model, so a simulated balance can go
   negative and drawdown can exceed 100%.
 
@@ -49,6 +58,10 @@ against that mean, scaled by `MULT`.
 - **Short entry** — the closed bar's price is above the upper band.
 - **Exit** — price returns to the centre line, **or** the broker-side fixed
   SL/TP triggers first.
+- **Scale-out** — at half the target in profit, `partial_fraction` of the
+  position is closed and the stop is pulled to entry, so the remainder runs at
+  no risk. Measured on cached data this *lowers* expectancy (see below); it is
+  configuration, not a recommendation.
 
 **What actually happens in practice matters here.** On gold the fixed SL/TP
 resolves roughly 90% of trades and the mean-reversion exit only ~10%; on BTC the
@@ -107,6 +120,8 @@ Strategy constants live at the top of `backend/bot_manager.py`:
 | `WINDOW_SIZE` | `500` | Kernel window |
 | `MAE_WINDOW` | `500` | Band lookback (Pine uses 499) |
 | `COOLDOWN_BARS` | `3` | Minimum closed bars between entries |
+| `be_trigger_pips` | `50` / `250` | Profit distance that arms the scale-out (half the target) |
+| `partial_fraction` | `0.5` | Proportion closed at that trigger; the rest runs to TP |
 | `DEVIATION_POINTS` | `20` | Max slippage tolerated on a market order |
 | `MAGIC_NUMBER` | `123456` | Identifies this bot's positions |
 | `TIMEFRAME` | `M5` | Chart timeframe |
@@ -248,7 +263,8 @@ Press **Stop** to halt. The bot finishes its current cycle within about a second
 
 - [ ] Ran on a demo account first
 - [ ] `BOT_HOST` is `127.0.0.1`
-- [ ] `lot_size` in `SYMBOL_CONFIG` is sized for your account, not left at `0.05`
+- [ ] `lot_size` in `SYMBOL_CONFIG` is sized for your account — 0.1 risks ~$70
+      per gold trade, so a 12-loss streak is ~$840
 - [ ] `BTCUSDm` left stopped unless you have measured that its R:R works
 - [ ] You know the bot has no daily loss limit — monitor it
 - [ ] Backend log is visible; it is where order rejections appear

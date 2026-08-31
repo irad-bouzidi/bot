@@ -45,6 +45,9 @@ def build_strategy(args):
         bandwidth=args.bandwidth, mult=args.mult, window=args.window,
         mae_window=args.mae_window, entry_mode=args.entry_mode,
         sl_mode="fixed", sl_price=args.sl, tp_mode="fixed", tp_price=args.tp,
+        be_trigger_mode="none" if args.no_breakeven else "tp_fraction",
+        be_trigger_tp_fraction=args.be_trigger_fraction,
+        partial_fraction=args.partial_fraction,
     ))
 
 
@@ -97,6 +100,8 @@ def print_report(name, m):
         ("  (iid expectation)", "max_consecutive_losses_expected_iid"),
         ("ROI %", "roi_pct"), ("Sharpe", "sharpe"), ("Sortino", "sortino"),
         ("Avg bars held", "avg_bars_held"), ("Trades / day", "trades_per_day"),
+        ("Scale-outs fired", "partials_fired"), ("  as % of trades", "partials_fired_pct"),
+        ("  banked on partials", "partial_pl"),
         ("Long win rate %", "long_win_rate"), ("Short win rate %", "short_win_rate"),
         ("Long P&L", "long_pl"), ("Short P&L", "short_pl"),
     ]
@@ -119,7 +124,7 @@ def main(argv=None):
     p.add_argument("--end", default=datetime.now(timezone.utc).strftime("%Y-%m-%d"))
     p.add_argument("--root", default=DEFAULT_ROOT)
     p.add_argument("--balance", type=float, default=1000.0)
-    p.add_argument("--volume", type=float, default=0.05)
+    p.add_argument("--volume", type=float, default=0.1)
     p.add_argument("--bandwidth", type=float, default=8.0)
     p.add_argument("--mult", type=float, default=3.0)
     p.add_argument("--window", type=int, default=500)
@@ -130,6 +135,12 @@ def main(argv=None):
     p.add_argument("--commission", type=float, default=0.0)
     p.add_argument("--slippage", type=float, default=0.0, help="points")
     p.add_argument("--no-costs", action="store_true")
+    p.add_argument("--no-breakeven", action="store_true",
+                   help="disable the scale-out / break-even rule, to measure it")
+    p.add_argument("--be-trigger-fraction", type=float, default=0.5,
+                   help="scale-out trigger as a fraction of the TP distance")
+    p.add_argument("--partial-fraction", type=float, default=0.5,
+                   help="proportion of the position closed at the trigger")
     p.add_argument("--compare-legacy", action="store_true",
                    help="also run the ORIGINAL close-only, cost-free engine to show "
                         "how much it was flattering itself")

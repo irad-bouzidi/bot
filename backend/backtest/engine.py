@@ -23,6 +23,14 @@ are the ones the previous implementation got wrong:
    from wins/losses/win_rate. The old code discarded it while still counting it.
 8. Max drawdown is computed from the bar-by-bar EQUITY curve (balance +
    unrealised), not the realised-balance curve, which under-reports it.
+9. SCALE-OUT: when a favourable move reaches `be_trigger_distance`, part of the
+   position closes and the stop moves to entry. A bar that reaches both the
+   trigger and the original stop is booked as a full stop-out with NO partial,
+   because OHLC cannot order the two. The new break-even stop goes live on the
+   NEXT bar; on the firing bar only a TP can still close the remainder, since
+   entry -> trigger -> TP is the one ordering OHLC does determine. See
+   `_resolve_bar` for why that asymmetry is the right way round. The remainder's
+   break-even exit is reported as `be_stop`, never folded into `sl`.
 """
 
 from dataclasses import dataclass, field
@@ -33,7 +41,8 @@ import pandas as pd
 
 from backend.backtest.costs import CostConfig, CostModel
 from backend.backtest.ledger import (
-    EXIT_END_OF_DATA, EXIT_SIGNAL, EXIT_SL, EXIT_TP, TradeRecord, session_of, to_frame,
+    EXIT_BE, EXIT_END_OF_DATA, EXIT_SIGNAL, EXIT_SL, EXIT_TP, TradeRecord,
+    session_of, to_frame,
 )
 from backend.core.types import PositionView, Side, SignalType, SymbolSpec
 from backend.data.market_data import BarSet
@@ -43,7 +52,7 @@ from backend.strategy.base import Bar, BarContext, Strategy
 @dataclass(frozen=True)
 class BacktestConfig:
     initial_balance: float = 1000.0
-    volume: float = 0.05
+    volume: float = 0.1        # matches SYMBOL_CONFIG lot_size; keep the two equal
     tie_break: str = "sl_first"     # "sl_first" | "tp_first" | "ambiguous"
     legacy_mode: bool = False       # reproduce the ORIGINAL engine, for regression only
 
@@ -107,6 +116,130 @@ class BacktestEngine:
             return (tp, EXIT_TP)
         return (None, None)
 
+    # -- scale-out / break-even (rule 9) -------------------------------------
+
+    def _trigger_touch(self, side, b, o, h, l):
+        """First available price at which scale-out trigger `b` fills, or None.
+
+        Same gap principle as rule 5: if the bar OPENS beyond the trigger, the
+        first price actually available is the open. Here that is in the trade's
+        favour, so it books at the open rather than at the trigger -- the mirror of
+        a gapped stop booking worse than its level, not a free improvement.
+        """
+        if b <= 0:
+            return None
+        if side is Side.LONG:
+            if o >= b:
+                return o
+            return b if h >= b else None
+        if o <= b:
+            return o
+        return b if l <= b else None
+
+    def _resolve_bar(self, t, side, o, h, l):
+        """Everything that can happen to open trade `t` during one bar.
+
+        Returns (partial_price | None, exit_price | None, exit_reason, ambiguous).
+
+        Ordering, in the same conservative spirit as rules 4-5:
+
+        * The trigger sits strictly between entry and TP, so any path that reached
+          TP must have passed the trigger first. That ordering IS determinable from
+          OHLC, so the partial is always booked before a TP.
+        * A bar that reaches both the trigger (in profit) and the ORIGINAL stop (in
+          loss) is not resolvable from OHLC. It is booked as a full stop-out with no
+          partial -- the pessimistic reading, consistent with tie_break="sl_first".
+          Booking the partial here instead would let every losing trade first bank a
+          risk-free profit, which is exactly the flattery this engine exists to avoid.
+        * A break-even stop created midway through a bar is NOT live on that bar at
+          all -- it did not exist when the bar's low printed, and OHLC cannot order
+          the low against the trigger touch. From the next bar on it is an ordinary
+          stop and rule 5 applies to it normally.
+        """
+        sl, tp, be = t.sl_price, t.tp_price, t.be_trigger_price
+        partial_px = None
+        ambiguous = False
+
+        if not t.be_moved and be > 0:
+            b_px = self._trigger_touch(side, be, o, h, l)
+            sl_px, sl_reason = self._resolve_stops(side, sl, 0.0, o, h, l)
+            if b_px is not None and sl_px is not None:
+                # Trigger and original stop both touched: order unknowable.
+                return (None, sl_px, EXIT_SL, True)
+            if sl_px is not None:
+                return (None, sl_px, EXIT_SL, False)
+            if b_px is not None:
+                partial_px = b_px
+                # The break-even stop is live from the NEXT bar, not this one.
+                #
+                # On this bar the stop is created part-way through, and OHLC cannot
+                # order the bar's low against the moment the trigger was touched.
+                # Both readings need exactly one visit to each extreme, so neither is
+                # more physical than the other -- but they are not symmetric in how
+                # wrong they can be. The common shape for a mean-reversion long is a
+                # bar that OPENS below entry and then rallies through the trigger:
+                # stopping that out at break-even books an exit against a stop that
+                # did not exist when the low printed, and it happens on a large
+                # fraction of exactly the trades the rule is supposed to help. The
+                # opposite error costs one bar of exposure on the REMAINDER only,
+                # with its stop already at entry -- bounded by a fraction of a bar's
+                # range, not by 1R.
+                #
+                # A same-bar TP is still booked, because entry -> trigger -> TP is a
+                # determinable order. Bars where the outcome was genuinely
+                # unresolvable are counted as ambiguous so the exposure is measured
+                # rather than assumed away.
+                sl = t.entry_price
+                if side is Side.LONG:
+                    gap_tp = tp > 0 and o >= tp
+                    hit_tp = tp > 0 and h >= tp
+                    unresolved = l <= sl
+                else:
+                    gap_tp = tp > 0 and o <= tp
+                    hit_tp = tp > 0 and l <= tp
+                    unresolved = h >= sl
+                if gap_tp:
+                    # Gapped clean past the target: both legs fill at the open.
+                    return (partial_px, o, EXIT_TP, False)
+                if hit_tp:
+                    return (partial_px, tp, EXIT_TP, unresolved)
+                return (partial_px, None, "", unresolved)
+
+        px, reason = self._resolve_stops(side, sl, tp, o, h, l)
+        if px is not None and reason == EXIT_SL and t.be_moved:
+            reason = EXIT_BE
+        return (partial_px, px, reason or "", ambiguous)
+
+    def _fire_partial(self, t, side, px, i, ts, spec, spread_pts):
+        """Bank the scale-out leg and pull the stop to entry. Returns cash banked.
+
+        The partial volume is derived here rather than at open, because it must be
+        legal against the symbol's volume_step and must leave a runnable remainder.
+        If the position is too small to split, the break-even move still happens --
+        halving a 0.01-lot position is not possible at any broker, and silently
+        skipping the whole rule in that case would be worse than skipping half of it.
+        """
+        t.be_moved = True
+        # Exactly the entry, not a tick-rounded version of it: _resolve_bar tests
+        # the same number, and a half-tick disagreement between the level being
+        # tested and the level being filled is how off-by-one exits get born.
+        t.sl_price = t.entry_price
+
+        want = t.volume * t.partial_fraction
+        vol = spec.round_volume(want) if want > 0 else 0.0
+        remainder = round(t.volume - vol, 8)
+        if vol <= 0 or remainder < spec.volume_min:
+            return 0.0
+
+        fill = self.costs.exit_fill(side, px, spec, spread_pts)
+        t.partial_volume = vol
+        t.partial_price = fill
+        t.partial_index = i
+        t.partial_time = ts.to_pydatetime()
+        t.partial_pl = spec.pl(t.entry_price, fill, side, vol)
+        t.remaining_volume = remainder
+        return t.partial_pl
+
     # -- main loop -----------------------------------------------------------
 
     def run(self, barset):
@@ -160,7 +293,7 @@ class BacktestEngine:
                     open_trade, position = self._open(
                         sig, side, px, i, idx[i], spec, spr[i], len(trades) + 1)
 
-            # --- intrabar stops on the CURRENT bar (rules 3-6) ---
+            # --- intrabar stops on the CURRENT bar (rules 3-6, 9) ---
             if open_trade is not None and i > open_trade.entry_index:
                 if not cfg.legacy_mode:
                     both_in = (
@@ -172,15 +305,27 @@ class BacktestEngine:
                     )
                     if both_in:
                         ambiguous_bars += 1
-                    px, reason = self._resolve_stops(
-                        position.side, open_trade.sl_price, open_trade.tp_price,
-                        o[i], hi[i], lo[i])
+                    partial_px, px, reason, amb = self._resolve_bar(
+                        open_trade, position.side, o[i], hi[i], lo[i])
+                    if amb and not both_in:
+                        ambiguous_bars += 1
+                    if partial_px is not None:
+                        balance += self._fire_partial(
+                            open_trade, position.side, partial_px, i, idx[i],
+                            spec, spr[i])
+                        position = PositionView(
+                            ticket=position.ticket, symbol=position.symbol,
+                            side=position.side, volume=open_trade.remaining_volume,
+                            entry_price=position.entry_price,
+                            entry_time=position.entry_time,
+                            sl=open_trade.sl_price, tp=open_trade.tp_price)
                 else:
                     px, reason = self._legacy_stops(open_trade, position.side, cl[i])
 
                 if px is not None:
-                    fill = self.costs.exit_fill(position.side, px, spec, spr[i],
-                                                is_stop=(reason == EXIT_SL))
+                    fill = self.costs.exit_fill(
+                        position.side, px, spec, spr[i],
+                        is_stop=(reason in (EXIT_SL, EXIT_BE)))
                     balance += self._close(open_trade, fill, i, idx[i], reason, spec)
                     trades.append(open_trade)
                     open_trade, position = None, None
@@ -248,14 +393,24 @@ class BacktestEngine:
     def _open(self, sig, side, price, i, ts, spec, spread_pts, trade_id):
         sl_d = sig.sl_distance or 0.0
         tp_d = sig.tp_distance or 0.0
+        be_d = sig.be_trigger_distance or 0.0
         sl = price - sl_d * side.sign if sl_d else 0.0
         tp = price + tp_d * side.sign if tp_d else 0.0
+        # A trigger at or beyond the target can never fire before the TP resolves
+        # the trade, and one at or below zero is meaningless: treat both as disabled
+        # rather than carrying a level that silently never arms.
+        if be_d > 0 and tp_d > 0 and be_d >= tp_d:
+            be_d = 0.0
+        be = price + be_d * side.sign if be_d > 0 else 0.0
         f = sig.features or {}
         t = TradeRecord(
             trade_id=trade_id, symbol=spec.name, side=side.value,
             entry_time=ts.to_pydatetime(), entry_index=i, entry_price=price,
             volume=self.cfg.volume, sl_price=spec.round_price(sl) if sl else 0.0,
             tp_price=spec.round_price(tp) if tp else 0.0, r_price=sl_d,
+            remaining_volume=self.cfg.volume,
+            be_trigger_price=spec.round_price(be) if be else 0.0,
+            partial_fraction=max(0.0, min(1.0, sig.partial_fraction or 0.0)),
             entry_reason=sig.reason, signal_strength=sig.strength,
             spread_at_entry=float(spread_pts) * spec.point,
             atr_at_entry=float(f.get("atr", 0.0) or 0.0),
@@ -266,7 +421,7 @@ class BacktestEngine:
         t.mae_price = 0.0
         t.mfe_price = 0.0
         pos = PositionView(ticket=trade_id, symbol=spec.name, side=side,
-                           volume=self.cfg.volume, entry_price=price,
+                           volume=t.remaining_volume, entry_price=price,
                            entry_time=ts.to_pydatetime(), sl=t.sl_price, tp=t.tp_price)
         return t, pos
 
@@ -279,6 +434,12 @@ class BacktestEngine:
             t.mfe_price = max(t.mfe_price, t.entry_price - low)
 
     def _close(self, t, price, i, ts, reason, spec):
+        """Close the remaining leg. Returns the CASH DELTA, not the trade's P&L.
+
+        `partial_pl` was already added to the balance on the bar the scale-out
+        fired, so returning `net_pl` here would bank it twice. The ledger row still
+        reports `net_pl` as the whole trade, which is what analysis wants.
+        """
         side = Side.LONG if t.side == "long" else Side.SHORT
         t.exit_price = price
         t.exit_index = i
@@ -286,22 +447,32 @@ class BacktestEngine:
         t.exit_reason = reason
         t.bars_held = i - t.entry_index
         t.duration_s = (t.exit_time - t.entry_time).total_seconds()
-        t.gross_pl = spec.pl(t.entry_price, price, side, t.volume)
+        remainder_gross = spec.pl(t.entry_price, price, side, t.remaining_volume)
+        t.gross_pl = t.partial_pl + remainder_gross
+        # Round turn on the volume OPENED: both legs eventually close, so the total
+        # closed volume equals `volume` however many pieces it left in.
         t.commission = self.costs.commission(t.volume)
-        t.swap = self.costs.swap(side, t.volume, t.entry_time, t.exit_time, spec)
+        t.swap = self.costs.swap(side, t.remaining_volume, t.entry_time,
+                                 t.exit_time, spec)
+        if t.partial_volume and t.partial_time is not None:
+            t.swap += self.costs.swap(side, t.partial_volume, t.entry_time,
+                                      t.partial_time, spec)
         t.net_pl = t.gross_pl - t.commission + t.swap
         if t.r_price > 0:
+            # 1R stays the risk taken at ENTRY, on the volume opened. Re-basing it
+            # on the surviving remainder would make a scaled-out trade look like it
+            # risked less than it did, and inflate every R-multiple after a partial.
             risk = abs(spec.pl(t.entry_price, t.entry_price - t.r_price * side.sign,
                                side, t.volume))
             t.pnl_r = t.net_pl / risk if risk else 0.0
             t.mae_r = t.mae_price / t.r_price
             t.mfe_r = t.mfe_price / t.r_price
-        return t.net_pl
+        return remainder_gross - t.commission + t.swap
 
     def _unrealised(self, t, pos, close, spec):
         if t is None or pos is None:
             return 0.0
-        return spec.pl(t.entry_price, close, pos.side, t.volume)
+        return spec.pl(t.entry_price, close, pos.side, t.remaining_volume)
 
 
 def _strategy_cfg(strategy):

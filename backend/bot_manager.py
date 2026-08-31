@@ -50,20 +50,30 @@ def log(msg):
 # lot_size: position size
 # sl_pips/tp_pips: stop loss and take profit in pips
 # profit_mult: multiplier for P&L calculation (profit = price_diff * lot_size * profit_mult)
+# be_trigger_pips: profit distance at which the scale-out arms. Half the target in
+#   both cases -- see NWConfig.be_trigger_mode="tp_fraction", the same rule.
+# partial_fraction: proportion of the position closed at that trigger. 0.5 of the
+#   0.1 default is 0.05 out and 0.05 left running to the target, which is what was
+#   asked for. It is a FRACTION, not a lot count, so it tracks lot_size instead of
+#   silently becoming a different share of the position when the size changes.
 SYMBOL_CONFIG = {
     "XAUUSDm": {
         "pip": 0.1,
-        "lot_size": 0.05,
+        "lot_size": 0.1,            # risks ~$70/trade at the 70-pip stop
         "sl_pips": 70,
         "tp_pips": 100,
         "profit_mult": 100,
+        "be_trigger_pips": 50,      # 5.00 in price -- half of the 100-pip target
+        "partial_fraction": 0.5,    # 0.05 out at +5.00, 0.05 runs to the target
     },
     "BTCUSDm": {
         "pip": 0.1,
-        "lot_size": 0.05,
+        "lot_size": 0.1,
         "sl_pips": 700,
         "tp_pips": 500,
         "profit_mult": 1,
+        "be_trigger_pips": 250,     # 25.00 in price -- half of the 500-pip target
+        "partial_fraction": 0.5,
     },
 }
 
@@ -266,6 +276,137 @@ class TradingBot(threading.Thread):
         log("%s: closed #%s @ %.5f" % (self.symbol, position.ticket, price))
         return True
 
+    # ---- scale-out / break-even ----------------------------------------------
+
+    def _round_volume(self, volume, info):
+        """Snap to the symbol's volume step and clamp to its limits."""
+        step = getattr(info, "volume_step", 0.0) or 0.01
+        vol = round(volume / step) * step
+        vol = max(getattr(info, "volume_min", 0.01) or 0.01,
+                  min(getattr(info, "volume_max", 100.0) or 100.0, vol))
+        return round(vol, 8)
+
+    def _modify_sl(self, position, new_sl, info):
+        """Move the stop on an OPEN position, keeping its take profit.
+
+        TRADE_ACTION_SLTP replaces both fields, so tp must be passed back
+        explicitly -- omitting it silently deletes the take profit.
+        """
+        request = {
+            "action": mt5.TRADE_ACTION_SLTP,
+            "symbol": position.symbol,
+            "position": position.ticket,
+            "sl": self._round_price(new_sl, info),
+            "tp": position.tp,
+            "magic": MAGIC_NUMBER,
+        }
+        return self._send(request, "move SL #%s" % position.ticket) is not None
+
+    def _close_partial(self, position, volume, info):
+        """Close `volume` lots of an open position, leaving the rest running.
+
+        A partial close is an ordinary opposite DEAL carrying `position`, with a
+        volume smaller than the position's. MT5 keeps the SAME ticket and reduces
+        the position's volume, which is what makes the stateless "has it fired yet"
+        check below work across a bot restart.
+        """
+        tick = mt5.symbol_info_tick(position.symbol)
+        if tick is None:
+            return False
+        is_buy = position.type == mt5.POSITION_TYPE_BUY
+        price = tick.bid if is_buy else tick.ask
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": position.symbol,
+            "volume": volume,
+            "type": mt5.ORDER_TYPE_SELL if is_buy else mt5.ORDER_TYPE_BUY,
+            "position": position.ticket,
+            "price": self._round_price(price, info),
+            "deviation": DEVIATION_POINTS,
+            "magic": MAGIC_NUMBER,
+            "comment": "NW partial TP",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": self._pick_filling(info),
+        }
+        if self._send(request, "partial close #%s" % position.ticket) is None:
+            return False
+        log("%s: scaled out %.2f of #%s @ %.5f (entry %.5f)"
+            % (self.symbol, volume, position.ticket, price, position.price_open))
+        return True
+
+    def manage_position(self, position, info, tick):
+        """At `be_trigger_pips` in profit: bank part of the position, stop to entry.
+
+        Deliberately STATELESS -- it re-derives what still needs doing from the
+        position itself rather than from a flag on the bot:
+
+          * still to scale out  <=>  volume is still the full lot_size
+          * still to move stop  <=>  sl is missing, or not yet at entry
+
+        A dict of tickets would have to survive restarts, reconnects and the
+        BotManager replacing the thread on start_bot(), and would leak a ticket per
+        trade. The position is the single source of truth, so ask it.
+
+        The two guards are independent on purpose: if the scale-out fills but the
+        stop move is rejected, the next cycle retries only the stop, and vice versa.
+        The one assumption is that `lot_size` is not edited while a position is
+        open -- shrinking it mid-trade would make an already-reduced position look
+        un-scaled and scale it out a second time.
+
+        Runs on the live tick, not on bar close: the trigger is an intrabar event,
+        and waiting for a close would skip every move that gave the profit back
+        before the candle ended. Polling is ~15s, so a spike that round-trips
+        inside one cycle is still missed -- by design, since the bot only ever acts
+        on profit it can realise at the price in front of it.
+        """
+        trigger_pips = self.config.get("be_trigger_pips", 0)
+        fraction = self.config.get("partial_fraction", 0.0)
+        if not trigger_pips or fraction <= 0:
+            return
+
+        is_buy = position.type == mt5.POSITION_TYPE_BUY
+        entry = position.price_open
+        trigger_distance = trigger_pips * self.config["pip"]
+        # Value the position at the price it could be CLOSED at -- bid for a long,
+        # ask for a short. Using the other side books a trigger the market has not
+        # actually offered yet, by exactly one spread.
+        mark = tick.bid if is_buy else tick.ask
+        reached = (mark >= entry + trigger_distance) if is_buy \
+            else (mark <= entry - trigger_distance)
+        if not reached:
+            return
+
+        full_lots = self.config["lot_size"]
+        if position.volume >= full_lots - 1e-9:
+            want = self._round_volume(position.volume * fraction, info)
+            remainder = round(position.volume - want, 8)
+            vol_min = getattr(info, "volume_min", 0.01) or 0.01
+            if want > 0 and remainder >= vol_min - 1e-9:
+                self._close_partial(position, want, info)
+            else:
+                # 0.01 lots cannot be halved at any broker. Skip the scale-out and
+                # still protect the position, rather than skipping the whole rule.
+                log("%s: #%s volume %.2f too small to split (min %.2f); "
+                    "moving stop to break-even only"
+                    % (self.symbol, position.ticket, position.volume, vol_min))
+
+        needs_be = (position.sl <= 0
+                    or (is_buy and position.sl < entry - 1e-9)
+                    or (not is_buy and position.sl > entry + 1e-9))
+        if needs_be:
+            # Only ever widened, never tightened, is the rule for entry stops -- but
+            # this one is deliberately TIGHTENED, so it must be checked against the
+            # broker's minimum distance from the CURRENT price, not from entry. If
+            # price has not travelled far enough for entry to be a legal stop yet,
+            # leave it and retry on the next cycle.
+            min_dist = (getattr(info, "trade_stops_level", 0) or 0) * info.point
+            legal = (mark - entry >= min_dist) if is_buy else (entry - mark >= min_dist)
+            if not legal:
+                return
+            if self._modify_sl(position, entry, info):
+                log("%s: #%s stop moved to break-even %.5f"
+                    % (self.symbol, position.ticket, entry))
+
     def update_performance_stats(self):
         """Calculates P&L, Wins, Losses from MT5 History."""
         # Get history for the last 365 days
@@ -357,12 +498,29 @@ class TradingBot(threading.Thread):
                     self._sleep(15)
                     continue
 
-                # S4: act at most once per closed bar.
+                positions = self.bot_positions()   # S1: this bot's positions only
+
+                # S7: position MANAGEMENT runs every cycle, not once per bar. The
+                # break-even trigger is an intrabar event, so gating it on a new bar
+                # would miss any move that handed the profit back before the close.
+                # Entries stay gated below -- S4 was about entries firing repeatedly
+                # inside one candle, and that guard is untouched.
+                if positions:
+                    tick = mt5.symbol_info_tick(self.symbol)
+                    info = self._symbol_info()
+                    if tick is not None and info is not None:
+                        for pos in positions:
+                            self.manage_position(pos, info, tick)
+
+                # S4: enter and exit at most once per closed bar.
                 if bar_time == self._last_bar_time:
                     self._sleep(15)
                     continue
 
-                positions = self.bot_positions()   # S1: this bot's positions only
+                # Re-read: a scale-out above changed the volume of these positions,
+                # and close_position() sends position.volume. Closing a stale 0.1
+                # against a position holding 0.05 is rejected as invalid volume.
+                positions = self.bot_positions()
 
                 if not positions:
                     cooled = (
@@ -540,7 +698,16 @@ class BotManager:
             "wins": wins,
             "losses": losses,
             "win_rate": (wins / trades_opened * 100) if trades_opened > 0 else 0,
-            "max_drawdown": max_drawdown
+            "max_drawdown": max_drawdown,
+            # This engine checks exits on CLOSES only, models no spread, commission
+            # or slippage, and does NOT model the scale-out / break-even rule the
+            # live bot now runs. It therefore cannot be used to evaluate that rule.
+            "warning": (
+                "Close-only, cost-free engine: no spread/commission/slippage, no "
+                "intrabar stops, and no scale-out or break-even. Results are "
+                "optimistic and do not reflect live behaviour. Use "
+                "`python -m backend.scripts.run_baseline` for decisions."
+            ),
         }
 
     def get_account_info(self):

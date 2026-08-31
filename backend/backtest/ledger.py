@@ -21,6 +21,12 @@ EXIT_TP = "tp"
 EXIT_SIGNAL = "signal"          # strategy exit, e.g. price returned to the mean
 EXIT_END_OF_DATA = "end_of_data"
 EXIT_RISK = "risk_halt"
+# The remainder of a scaled-out trade, stopped at its moved-to-entry stop. Kept
+# distinct from EXIT_SL because folding the two together would hide the whole
+# effect of the break-even rule: a scratch on the remainder and a full 1R loss
+# are the same "sl" in the census, and the exit-reason table is how this
+# strategy's behaviour is actually diagnosed.
+EXIT_BE = "be_stop"
 
 
 @dataclass
@@ -31,12 +37,26 @@ class TradeRecord:
     entry_time: datetime
     entry_index: int
     entry_price: float
-    volume: float
+    volume: float                       # volume OPENED; never reduced, so 1R and
+                                        # commission stay anchored to the original risk
     sl_price: float
     tp_price: float
     r_price: float                      # stop distance in price = 1R
     entry_reason: str = ""
     signal_strength: float = 0.0
+
+    # -- scale-out / break-even ------------------------------------------------
+    # A trade can now close in two pieces. `volume` above is what was opened;
+    # `remaining_volume` is what is still exposed after the partial.
+    remaining_volume: float = 0.0        # set to `volume` at open
+    be_trigger_price: float = 0.0        # absolute price that arms the rule; 0 = disabled
+    partial_fraction: float = 0.0        # intended proportion to scale out
+    partial_volume: float = 0.0          # lots closed at the trigger
+    partial_price: float = 0.0           # fill price of the partial leg
+    partial_pl: float = 0.0              # gross P&L banked on the partial leg
+    partial_index: Optional[int] = None
+    partial_time: Optional[datetime] = None
+    be_moved: bool = False               # stop has been pulled to entry
 
     exit_time: Optional[datetime] = None
     exit_index: Optional[int] = None
