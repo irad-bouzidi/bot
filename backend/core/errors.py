@@ -18,3 +18,13 @@ class BrokerError(BotError):
 
 class RiskRejected(BotError):
     pass
+
+
+class ConfigRejected(BotError):
+    """A settings change the bot refuses to apply, with the reason for the user.
+
+    Raised rather than returned so the message reaches the UI verbatim: a sizing
+    edit that silently does nothing (or silently does something else) is worse
+    than one that is refused, because `lot_size` is the only risk control this
+    bot has.
+    """

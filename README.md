@@ -31,9 +31,12 @@ This bot places **real market orders**. Read this section before running it.
   average winner while doing nothing for trades that run straight to the stop.
   A 3x3 sweep of trigger and size was monotonically worse than leaving it off.
   It is enabled because it was requested; disable it with
-  `--no-breakeven`, or `partial_fraction = 0` in `SYMBOL_CONFIG`.
-- **`lot_size` is 0.1, which risks ~$70 per gold trade** against the 70-pip stop,
-  with no equity-based sizing, no daily or weekly loss cap and no margin check.
+  `--no-breakeven`, `partial_fraction = 0` in `SYMBOL_CONFIG`, or a scale-out of
+  0 lots in the dashboard's Position sizing panel.
+- **`lot_size` defaults to 0.1, which risks ~$70 per gold trade** against the 70-pip
+  stop. It is editable from the dashboard — which shows the dollar risk as you type —
+  and persisted, but it still comes with no equity-based sizing, no daily or weekly
+  loss cap and no margin check.
   This configuration produced runs of 11-12 consecutive losses in backtest — about
   $840 — at roughly 4.4 trades per day. Note that "0.1 lots" means a completely
   different dollar risk on another instrument: the risk is set by the contract
@@ -88,7 +91,7 @@ without a terminal.
 
 ```
 backend/
-  main.py                       FastAPI app: /stats, /control, /backtest
+  main.py                       FastAPI app: /stats, /control, /settings, /backtest
   bot_manager.py                Live trading loop (MT5)
   core/types.py                 SymbolSpec, Signal, Side  (contract-accurate P&L)
   indicators/nadaraya_watson.py Vectorised envelope + naive reference
@@ -123,13 +126,21 @@ Strategy constants live at the top of `backend/bot_manager.py`:
 Per-symbol settings are in `SYMBOL_CONFIG` in the same file (`lot_size`,
 `sl_pips`, `tp_pips`, `pip`).
 
+`lot_size` and `partial_fraction` are also editable at runtime from the dashboard's
+**Position sizing** panel and from the Backtest page, and are persisted to
+`data/settings.json` so a restart does not quietly restore a size you lowered. Every
+other key is code-only. The panel takes **lots** (0.1 and 0.05); the scale-out is stored
+as the resulting share of the position, so it keeps meaning "half" if you later change
+the lot size. Edits are refused while the bot holds a position.
+
 Server settings come from the environment:
 
 | Variable | Default | Notes |
 |---|---|---|
-| `BOT_HOST` | `127.0.0.1` | **Do not expose this port** — `/control` has no auth |
+| `BOT_HOST` | `127.0.0.1` | **Do not expose this port** — `/control` and `/settings` have no auth |
 | `BOT_PORT` | `8000` | |
 | `BOT_ALLOWED_ORIGINS` | `http://localhost:3000,http://127.0.0.1:3000` | CORS allowlist |
+| `BOT_SETTINGS_FILE` | `data/settings.json` | Where runtime lot sizing is persisted |
 
 ---
 
@@ -215,8 +226,8 @@ python -m backend.main
 ```
 
 Serves on `http://127.0.0.1:8000`. Loopback-only by design: `POST /control`
-starts and stops live trading and has **no authentication**, so do not set
-`BOT_HOST=0.0.0.0` on an untrusted network.
+starts and stops live trading and `POST /settings` changes its position size, both
+with **no authentication**, so do not set `BOT_HOST=0.0.0.0` on an untrusted network.
 
 ### Step 4 — Start the frontend
 
@@ -256,8 +267,10 @@ Press **Stop** to halt. The bot finishes its current cycle within about a second
 
 - [ ] Ran on a demo account first
 - [ ] `BOT_HOST` is `127.0.0.1`
-- [ ] `lot_size` in `SYMBOL_CONFIG` is sized for your account — 0.1 risks ~$70
-      per gold trade, so a 12-loss streak is ~$840
+- [ ] `lot_size` is sized for your account — 0.1 risks ~$70 per gold trade, so a
+      12-loss streak is ~$840. Check it in the dashboard's Position sizing panel,
+      which shows the dollar risk; `data/settings.json` may hold a value that
+      differs from the `SYMBOL_CONFIG` default
 - [ ] You know the bot has no daily loss limit — monitor it
 - [ ] Backend log is visible; it is where order rejections appear
 

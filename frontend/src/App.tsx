@@ -47,14 +47,171 @@ const BotCardSkeleton = () => (
     <div className="performance-grid">
       <Skeleton /><Skeleton /><Skeleton /><Skeleton />
     </div>
+    <div className="sizing-section">
+      <Skeleton className="sizing-title-skeleton" />
+      <div className="sizing-grid">
+        <Skeleton className="sizing-field-skeleton" />
+        <Skeleton className="sizing-field-skeleton" />
+      </div>
+    </div>
     <div className="button-group">
       <Skeleton className="btn-skeleton" /><Skeleton className="btn-skeleton" />
     </div>
   </div>
 );
 
+
+// Editing this changes the size of REAL orders, so two things are on the card and
+// not buried: the dollar risk of whatever is currently typed, and the fact that the
+// backend refuses the change outright while a position is open (it would otherwise
+// re-scale a trade that is already running -- see BotManager.update_settings).
+//
+// Lots are what a trader types; the backend stores the scale-out as a SHARE of the
+// position, so the share is echoed back under the field rather than left implicit.
+const SizingEditor = ({ symbol, sizing, onSaved }: { symbol: string; sizing: any; onSaved: () => void }) => {
+  const [lot, setLot] = useState(String(sizing.lot_size));
+  const [scaleOut, setScaleOut] = useState(String(sizing.scale_out_lots));
+  const [dirty, setDirty] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
+
+  // The dashboard re-polls every 5s. Adopt the server's numbers only while the
+  // user is NOT mid-edit, or a poll rewrites the digits under their cursor.
+  useEffect(() => {
+    if (dirty) return;
+    setLot(String(sizing.lot_size));
+    setScaleOut(String(sizing.scale_out_lots));
+  }, [sizing.lot_size, sizing.scale_out_lots, dirty]);
+
+  const lotNum = parseFloat(lot);
+  const outNum = parseFloat(scaleOut);
+  const lotOk = isFinite(lotNum) && lotNum > 0;
+  const outOk = isFinite(outNum) && outNum >= 0 && (!lotOk || outNum < lotNum);
+  const share = lotOk && outOk && outNum > 0 ? (outNum / lotNum) * 100 : 0;
+  const locked = !!sizing.locked;
+  const triggerPrice = (sizing.be_trigger_pips || 0) * (sizing.pip || 0);
+
+  let problem: string | null = null;
+  if (locked) problem = `${sizing.open_positions} open position(s) — sizing is locked until this trade closes.`;
+  else if (!lotOk) problem = 'Lot size must be a positive number.';
+  else if (!isFinite(outNum) || outNum < 0) problem = 'Scale-out lots cannot be negative.';
+  else if (outNum >= lotNum) problem = 'Scale-out must be smaller than the lot size. Use 0 to turn it off.';
+
+  const save = async () => {
+    setBusy(true);
+    setMsg(null);
+    try {
+      const res = await fetch(`${API_BASE}/settings`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ symbol, lot_size: lotNum, scale_out_lots: outNum }),
+      });
+      const data = await res.json();
+      if (data.error) {
+        setMsg({ ok: false, text: data.error });
+        return;
+      }
+      // Show what was actually applied, not what was typed: the backend snaps to
+      // the broker's volume step, so 0.155 comes back as 0.16.
+      setLot(String(data.lot_size));
+      setScaleOut(String(data.scale_out_lots));
+      setDirty(false);
+      setMsg({ ok: true, text: data.notes?.length ? data.notes.join(' ') : 'Saved.' });
+      onSaved();
+    } catch (e) {
+      setMsg({ ok: false, text: 'Could not reach the backend.' });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const reset = () => {
+    setLot(String(sizing.lot_size));
+    setScaleOut(String(sizing.scale_out_lots));
+    setDirty(false);
+    setMsg(null);
+  };
+
+  const edit = (setter: (v: string) => void) => (e: React.ChangeEvent<HTMLInputElement>) => {
+    setter(e.target.value);
+    setDirty(true);
+    setMsg(null);
+  };
+
+  return (
+    <div className="sizing-section">
+      <div className="sizing-head">
+        <span className="sizing-title">Position sizing</span>
+        <span className={`sizing-risk ${lotOk ? '' : 'muted'}`}>
+          {lotOk ? `~$${(sizing.risk_per_lot * lotNum).toFixed(0)} at risk / trade` : '—'}
+        </span>
+      </div>
+
+      <div className="sizing-grid">
+        <label className="sizing-field">
+          <span>Lot size</span>
+          <input
+            type="number"
+            inputMode="decimal"
+            min={sizing.volume_min}
+            max={sizing.volume_max}
+            step={sizing.volume_step}
+            value={lot}
+            disabled={locked || busy}
+            onChange={edit(setLot)}
+          />
+        </label>
+        <label className="sizing-field">
+          <span>Scale-out lots</span>
+          <input
+            type="number"
+            inputMode="decimal"
+            min={0}
+            step={sizing.volume_step}
+            value={scaleOut}
+            disabled={locked || busy}
+            onChange={edit(setScaleOut)}
+          />
+        </label>
+      </div>
+
+      <p className="sizing-hint">
+        {outNum === 0 || !outOk ? (
+          <>Scale-out off — the whole position runs to the stop or the target.</>
+        ) : (
+          <>
+            <b>{share.toFixed(0)}%</b> banked at +{triggerPrice.toFixed(2)}, stop to break-even,{' '}
+            {(lotNum - outNum).toFixed(2)} runs on. Stored as a share, so it stays {share.toFixed(0)}%
+            if you change the lot size.
+          </>
+        )}
+      </p>
+      <p className="sizing-hint muted">
+        Broker min {sizing.volume_min} · step {sizing.volume_step}
+        {sizing.broker_limits ? '' : ' (terminal offline — defaults shown)'}
+        {sizing.splittable === false && outNum > 0
+          ? ` · ${lot} lots cannot be split here, so only the stop will move.`
+          : ''}
+      </p>
+
+      {problem && <p className="sizing-msg err">{problem}</p>}
+      {msg && <p className={`sizing-msg ${msg.ok ? 'ok' : 'err'}`}>{msg.text}</p>}
+
+      <div className="sizing-actions">
+        <button className="btn btn-save" onClick={save} disabled={!dirty || busy || !!problem}>
+          {busy ? 'Saving…' : 'Save sizing'}
+        </button>
+        <button className="btn btn-reset" onClick={reset} disabled={!dirty || busy}>
+          Reset
+        </button>
+      </div>
+    </div>
+  );
+};
+
 const Dashboard = () => {
   const [data, setData] = useState<any>(null);
+  const [settings, setSettings] = useState<any>({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [theme, setTheme] = useState<'light' | 'dark'>('light');
@@ -90,9 +247,25 @@ const Dashboard = () => {
     }
   };
 
+  const fetchSettings = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/settings`);
+      if (!res.ok) return;
+      setSettings(await res.json());
+    } catch (e) {
+      // Deliberately quiet: the /stats poll already reports a dead backend, and a
+      // second banner saying the same thing would just push the retry button off.
+      console.error('Failed to fetch settings', e);
+    }
+  };
+
   useEffect(() => {
-    fetchStats();
-    const interval = setInterval(fetchStats, 5000);
+    const poll = () => {
+      fetchStats();
+      fetchSettings();
+    };
+    poll();
+    const interval = setInterval(poll, 5000);
     return () => clearInterval(interval);
   }, []);
 
@@ -175,7 +348,7 @@ const Dashboard = () => {
         <div className="error-banner">
           <span>⚠️</span>
           <p>{error}</p>
-          <button className="btn btn-start" onClick={fetchStats}>Retry</button>
+          <button className="btn btn-start" onClick={() => { fetchStats(); fetchSettings(); }}>Retry</button>
         </div>
       </div>
     );
@@ -303,6 +476,14 @@ const Dashboard = () => {
                       <span className="perf-value">${stats.total_pl?.toFixed(2) || '0.00'}</span>
                     </div>
                   </div>
+
+                  {settings[symbol] && !settings[symbol].error && (
+                    <SizingEditor
+                      symbol={symbol}
+                      sizing={settings[symbol]}
+                      onSaved={fetchSettings}
+                    />
+                  )}
 
                   <div className="button-group">
                     <button 
