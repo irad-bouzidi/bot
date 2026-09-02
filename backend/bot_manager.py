@@ -50,8 +50,8 @@ def log(msg):
 # lot_size: position size
 # sl_pips/tp_pips: stop loss and take profit in pips
 # profit_mult: multiplier for P&L calculation (profit = price_diff * lot_size * profit_mult)
-# be_trigger_pips: profit distance at which the scale-out arms. Half the target in
-#   both cases -- see NWConfig.be_trigger_mode="tp_fraction", the same rule.
+# be_trigger_pips: profit distance at which the scale-out arms. Half the target --
+#   see NWConfig.be_trigger_mode="tp_fraction", the same rule.
 # partial_fraction: proportion of the position closed at that trigger. 0.5 of the
 #   0.1 default is 0.05 out and 0.05 left running to the target, which is what was
 #   asked for. It is a FRACTION, not a lot count, so it tracks lot_size instead of
@@ -65,15 +65,6 @@ SYMBOL_CONFIG = {
         "profit_mult": 100,
         "be_trigger_pips": 50,      # 5.00 in price -- half of the 100-pip target
         "partial_fraction": 0.5,    # 0.05 out at +5.00, 0.05 runs to the target
-    },
-    "BTCUSDm": {
-        "pip": 0.1,
-        "lot_size": 0.1,
-        "sl_pips": 700,
-        "tp_pips": 500,
-        "profit_mult": 1,
-        "be_trigger_pips": 250,     # 25.00 in price -- half of the 500-pip target
-        "partial_fraction": 0.5,
     },
 }
 

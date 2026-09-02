@@ -2,7 +2,7 @@ import React, { useState } from 'react';
 
 const API_BASE = 'http://localhost:8000';
 
-const SUPPORTED_SYMBOLS = ['XAUUSDm', 'BTCUSDm'];
+const SUPPORTED_SYMBOLS = ['XAUUSDm'];
 
 const BacktestPage = () => {
   const [params, setParams] = useState({

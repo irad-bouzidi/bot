@@ -25,8 +25,8 @@ npx concurrently "python -m backend.main" "npm start --prefix frontend"
 # Research (offline, no MT5)
 python -m backend.scripts.run_baseline --symbol XAUUSDm --compare-legacy
 # NB: --sl/--tp are PRICE units, while SYMBOL_CONFIG is in "pips" (pip = 0.1).
-# BTCUSDm's live 700/500 pips is --sl 70 --tp 50 here; XAUUSDm's 70/100 is the 7/10 default.
-python -m backend.scripts.run_baseline --symbol BTCUSDm --start 2025-09-01 --sl 70 --tp 50
+# XAUUSDm's live 70/100 pips is the 7/10 default here.
+python -m backend.scripts.run_baseline --symbol XAUUSDm --start 2025-09-01
 
 # Data capture (MT5 host only)
 python -m backend.data.snapshot --symbol XAUUSDm --start 2023-01-01
@@ -146,9 +146,9 @@ would silently become a different share of the position if the size changed.
 **Measured effect on cached data (central costs), and it is negative.** Gold, 2025-05
 onward, 9 settings swept: every one raises win rate and lowers expectancy versus the rule
 off — 45.9%→58% win rate, expectancy −0.071R→−0.117R, monotonically worse the earlier and
-larger the scale-out. At the shipped 0.1 lots / 0.5 out it is −0.071R→−0.102R. BTC the
-same (−0.30R→−0.48R). The rule clips winners while leaving straight-to-stop losers
-untouched. It is enabled because it was asked for, not because the data supports it;
+larger the scale-out. At the shipped 0.1 lots / 0.5 out it is −0.071R→−0.102R. The rule
+clips winners while leaving straight-to-stop losers untouched. It is enabled because it
+was asked for, not because the data supports it;
 `--no-breakeven`, or `be_trigger_mode="none"` / `partial_fraction=0` in `SYMBOL_CONFIG`,
 turns it off. Re-run the comparison before drawing any conclusion from a report that
 predates it.
@@ -169,12 +169,12 @@ an A/B — but do not read an average TP win as achievable.
 authentication**. `BOT_HOST` defaults to `127.0.0.1` for that reason; do not change the
 default or widen `BOT_ALLOWED_ORIGINS` unless asked. There is no equity-based sizing, no
 daily loss cap and no margin check — `lot_size` is a flat 0.1 in `SYMBOL_CONFIG`, so gold
-risks ~$70 a trade (a measured 11-12 loss streak is ~$840) and BTC ~$7 at the same
-nominal size, a 10x asymmetry from their contract sizes.
+risks ~$70 a trade (a measured 11-12 loss streak is ~$840).
 
-`BTCUSDm` is configured with a 700-point stop against a 500-point target (R:R 0.71), which
-has negative expectancy before costs; the README recommends leaving it stopped. Do not
-"fix" the numbers without a backtest showing the change works.
+`XAUUSDm` is the only configured symbol. Adding another means adding a `SYMBOL_CONFIG`
+entry *and* extending `SUPPORTED_SYMBOLS` in `frontend/src/BacktestPage.tsx`, and the
+per-trade dollar risk does not carry over: it comes from the contract size, not the
+nominal 0.1 lots. Do not add one without a backtest showing its R:R works.
 
 ## Working conventions
 

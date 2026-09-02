@@ -315,11 +315,15 @@ def test_zero_fraction_reproduces_the_old_behaviour_exactly():
 # --- the strategy emits the rule -------------------------------------------
 
 def test_nwconfig_tp_fraction_scales_the_trigger_with_the_target():
-    """The reason tp_fraction is the default: 5.00 on gold, 25.00 on BTC."""
+    """The reason tp_fraction is the default: the trigger tracks the target.
+
+    5.00 at the 10-point gold target, 25.00 at a 50-point one -- a hardcoded
+    distance would silently become a different share of a different target.
+    """
     gold = NWEnvelopeStrategy(NWConfig(sl_price=7.0, tp_price=10.0))
-    btc = NWEnvelopeStrategy(NWConfig(sl_price=70.0, tp_price=50.0))
+    wide = NWEnvelopeStrategy(NWConfig(sl_price=70.0, tp_price=50.0))
     assert gold._be_trigger_distance(7.0, 10.0) == pytest.approx(5.0)
-    assert btc._be_trigger_distance(70.0, 50.0) == pytest.approx(25.0)
+    assert wide._be_trigger_distance(70.0, 50.0) == pytest.approx(25.0)
 
 
 def test_be_trigger_modes():

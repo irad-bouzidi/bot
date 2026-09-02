@@ -5,7 +5,6 @@ you do research. Everything downstream (backtests, baseline, sweeps,
 walk-forward) then runs offline and reproducibly, with no terminal.
 
     python -m backend.data.snapshot --symbol XAUUSDm --start 2023-01-01
-    python -m backend.data.snapshot --symbol BTCUSDm --start 2023-01-01
     python -m backend.data.snapshot --list
     python -m backend.data.snapshot --symbol XAUUSDm --verify 2026-07
 

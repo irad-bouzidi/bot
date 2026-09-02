@@ -16,7 +16,8 @@ Entry/exit modes are explicit config rather than implicit behaviour:
 * `sl_mode="fixed"` is the original fixed-pip stop.
 * `sl_mode="band"` sets the stop from the band half-width, which makes the
   risk/reward structural instead of an accident of the instrument's price level.
-  That is how BTCUSDm ended up risking 700 points to make 500.
+  A fixed pip stop copied across instruments is how a config ends up risking
+  700 points to make 500.
 
 * `be_trigger_mode` / `partial_fraction` add a scale-out: at a set distance in
   profit, close part of the position and pull the stop to entry. Note what this
@@ -64,9 +65,9 @@ class NWConfig:
     #   "fixed"       trigger = be_trigger_price, in PRICE units
     #   "r"           trigger = be_trigger_r * sl_distance
     # tp_fraction is the default because it is the only mode that stays sane across
-    # symbols: 0.5 means "half way to target" whether the target is 10 or 50 price
-    # units, where a hardcoded 5.0 would be half the target on gold and a tenth of
-    # it on BTC.
+    # symbols and targets: 0.5 means "half way to target" whether the target is 10
+    # or 50 price units, where a hardcoded 5.0 would be half the target on gold and
+    # a tenth of it on a symbol quoted 10x higher.
     be_trigger_mode: str = "tp_fraction"
     be_trigger_tp_fraction: float = 0.5
     be_trigger_price: float = 5.0
