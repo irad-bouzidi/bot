@@ -1,0 +1,11 @@
+# The build stage runs `npm ci` itself, and a host node_modules/ is both huge
+# and possibly built for a different platform.
+node_modules
+build
+coverage
+
+# Not needed by the image, and copying the Dockerfile into its own context
+# invalidates layers whenever a comment in it changes.
+Dockerfile
+.dockerignore
+README.md

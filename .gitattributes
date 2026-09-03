@@ -1,0 +1,7 @@
+# core.autocrlf=true on a Windows dev box checks these out with CRLF, and a
+# `#!/bin/sh\r` shebang does not resolve inside a Linux container -- the kernel
+# looks for an interpreter literally named "/bin/sh\r". The frontend image's
+# ENTRYPOINT is a shell script, so that is not a warning in the log, it is a
+# container that cannot start.
+*.sh text eol=lf
+Dockerfile text eol=lf

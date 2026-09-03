@@ -21,13 +21,13 @@ from datetime import datetime
 HOST = os.environ.get("BOT_HOST", "127.0.0.1")
 PORT = int(os.environ.get("BOT_PORT", "8000"))
 
-# The containerised frontend is served by nginx on :3000 and the BROWSER still
-# calls this API on 127.0.0.1:8000 directly -- nginx only serves static files
-# and does NOT proxy to the backend. That is deliberate: proxying would need
-# this process reachable from the Docker bridge network, i.e. bound off
+# The containerised frontend is served as static files on :3000 and the BROWSER
+# still calls this API on 127.0.0.1:8000 directly -- that container serves the
+# page and does NOT proxy to the backend. That is deliberate: proxying would
+# need this process reachable from the Docker bridge network, i.e. bound off
 # loopback, which would put unauthenticated live-trading control on the host's
 # network interface. Adding the container's published origin to CORS costs
-# nothing by comparison. See docker/README.md.
+# nothing by comparison. See README.md, "Why nothing proxies the API".
 ALLOWED_ORIGINS = [
     o.strip()
     for o in os.environ.get(

@@ -2,7 +2,8 @@
 --
 -- Applied two ways, and both must stay equivalent:
 --   * `python -m backend.db.migrate` against any database, at any time;
---   * docker/db/init/ on the db container's FIRST boot only (Postgres ignores
+--   * /docker-entrypoint-initdb.d/ on the db container's FIRST boot only, where
+--     docker-compose.yml mounts THIS FILE (Postgres ignores
 --     that directory once a data volume exists), which is why every statement
 --     below is IF NOT EXISTS / idempotent rather than a one-shot script.
 --

@@ -11,7 +11,7 @@ pip install -r requirements-dev.txt      # pytest, pytest-cov
 npm install --prefix frontend
 
 # Containers + database (frontend and Postgres; the API stays on the MT5 host)
-docker compose -f docker/docker-compose.yml up -d
+docker compose up -d                     # docker-compose.yml is at the repo root
 python -m backend.db.migrate             # apply schema + import data/settings.json once
 python -m backend.db.migrate --check     # report connectivity/version, change nothing
 
@@ -29,7 +29,7 @@ python -m backend.main                   # FastAPI on 127.0.0.1:8000
 npm start --prefix frontend              # dashboard on localhost:3000 (dev server)
 npx concurrently "python -m backend.main" "npm start --prefix frontend"
 # or serve the built dashboard from its container instead of `npm start`:
-docker compose -f docker/docker-compose.yml up -d frontend
+docker compose up -d --build frontend
 
 # Research (offline, no MT5)
 python -m backend.scripts.run_baseline --symbol XAUUSDm --compare-legacy
@@ -55,8 +55,11 @@ python -m backend.data.snapshot --symbol XAUUSDm --verify 2026-07
 - `psycopg2-binary==2.9.9` for the same reason: it is the version with a verified
   cp38 Windows wheel. Building psycopg2 from source on the trading host needs a
   compiler and libpq that are not there. psycopg3 is not used.
-- The container build stage is `node:24-alpine`, matching the npm major that
-  produced `frontend/package-lock.json`. npm 10 (node:20) rejects that lock file.
+- The frontend image is `node:24-alpine` for both stages, matching the npm major
+  that produced `frontend/package-lock.json`. npm 10 (node:20) rejects that lock
+  file. The runtime stage keeps node rather than switching to a web server
+  because `serve` needs it and because the entrypoint uses node's
+  `JSON.stringify` to write `env.js` — see `frontend/docker-entrypoint.sh`.
 
 ## Architecture
 
@@ -65,18 +68,24 @@ nothing else does. `data/` (gitignored, but populated here) is the handoff — s
 the trading host, copy it over, and all research runs offline and reproducibly.
 
 **Three tiers now, not two.** The API and the bot threads run on the MT5 host;
-the dashboard and Postgres run in containers (`docker/`, both published to
-`127.0.0.1` only); the research stack runs anywhere and touches **neither** MT5
-nor Postgres. The last of those is load-bearing: `run_baseline`, the engine and
+the dashboard and Postgres run in containers (`docker-compose.yml` at the repo
+root, both published to `127.0.0.1` only); the research stack runs anywhere and
+touches **neither** MT5 nor Postgres. The last of those is load-bearing: `run_baseline`, the engine and
 the indicators must stay runnable with nothing but `data/`, so nothing under
 `backend/backtest/`, `backend/strategy/`, `backend/indicators/` or
 `backend/data/` may import `backend.db`.
 
 The backend is deliberately **not** containerised — it imports `MetaTrader5`.
-nginx serves the dashboard but does **not** proxy the API; the browser calls
-`127.0.0.1:8000` directly, so the API can stay bound to loopback. See
-`docker/README.md`, which explains why that is a safety decision rather than an
-omission.
+The frontend container serves the built bundle as **static files only** (`serve`,
+no nginx, no reverse proxy) and does **not** proxy the API; the browser calls
+`127.0.0.1:8000` directly, so the API can stay bound to loopback. See the
+README's "Why nothing proxies the API", which explains why that is a safety
+decision rather than an omission.
+
+The container layer is `docker-compose.yml` at the repo root plus three files
+in `frontend/`: `Dockerfile`, `serve.json` (SPA fallback, cache rules, security
+headers) and `docker-entrypoint.sh` (writes `env.js` from `BOT_API_BASE`, then
+`exec`s the server). There is no `docker/` directory.
 
 **MT5 import invariant.** Only two modules import `MetaTrader5`: `backend/bot_manager.py`
 (live loop, reads + writes) and `backend/data/mt5_source.py` (reads). Everything else must
@@ -337,6 +346,18 @@ the file store could only reject one on the way out, at the next load.
 The database is published on `127.0.0.1:5432` only, for the same reason
 `BOT_HOST` is loopback. `docker compose down -v` **deletes** the trade history
 and the stored lot size along with the volume.
+
+The compose project is pinned (`name: nw-bot`) and the volume is named
+explicitly (`nw-bot-db-data`) rather than left to the `<project>_<key>` default.
+Both exist because the default derives from the *directory name*, so moving or
+renaming a directory swaps in an empty database — and an empty
+`symbol_settings` is exactly the silent restore of the 0.1 `lot_size` default
+that `init_persistence` refuses to boot for. When this file lived in `docker/`
+the volume was `docker_db-data`; carry it over rather than starting fresh:
+
+```powershell
+docker run --rm -v docker_db-data:/from:ro -v nw-bot-db-data:/to alpine sh -c 'cd /from && tar cf - . | (cd /to && tar xf -)'
+```
 
 An edit is **refused while the bot holds a position**, under the same `_CONFIG_LOCK` that
 `open_trade()` holds across its `order_send`. This is not politeness:

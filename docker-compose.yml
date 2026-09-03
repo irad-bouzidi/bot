@@ -6,14 +6,24 @@
 # one CLAUDE.md already describes: MT5 and the API on the trading host, and
 # everything that does not need a terminal in a container.
 #
-#   docker compose -f docker/docker-compose.yml up -d
+#   docker compose up -d
 #   python -m backend.db.migrate          # once, from the repo root
 #   python -m backend.main                # on the MT5 host, as before
 #
-# The browser talks to nginx on :3000 for the page and DIRECTLY to the backend on
-# 127.0.0.1:8000 for the API. nginx does not proxy /api anywhere -- see
-# docker/nginx.conf and docker/README.md for why that is a safety decision and
-# not an omission.
+# The browser talks to the static server on :3000 for the page and DIRECTLY to
+# the backend on 127.0.0.1:8000 for the API. Nothing here proxies /api -- for a
+# proxy to reach the API the API would have to be bound off 127.0.0.1, and
+# POST /control starts live trading with real money with no authentication. See
+# README.md, "Why nothing proxies the API".
+
+# Pinned so the project -- and therefore the container and volume names -- does
+# not depend on the name of the directory this file happens to sit in. It did
+# before, which is why the data volume is called `nw-bot-db-data` explicitly
+# below: moving this file out of docker/ renamed the default project from
+# `docker` to `bot`, and a renamed project quietly comes up with an EMPTY
+# database. That is the silent restore of the 0.1 lot_size default that
+# init_persistence exists to refuse.
+name: nw-bot
 
 services:
   db:
@@ -36,14 +46,14 @@ services:
       - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
     volumes:
       - db-data:/var/lib/postgresql/data
-      # The REAL schema file, mounted rather than copied. A copy under docker/
-      # would drift from backend/db/schema.sql the first time a column changed,
-      # and the two paths that apply it have to stay identical.
+      # The REAL schema file, mounted rather than copied. A copy kept beside
+      # this file would drift from backend/db/schema.sql the first time a column
+      # changed, and the two paths that apply it have to stay identical.
       #
       # Runs ONLY on first boot -- Postgres skips this directory once the data
       # volume exists -- so `python -m backend.db.migrate` remains the path that
       # works every time. The schema is idempotent, so doing both is harmless.
-      - ../backend/db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - ./backend/db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-bot} -d ${POSTGRES_DB:-tradingbot}"]
       interval: 5s
@@ -53,13 +63,15 @@ services:
 
   frontend:
     build:
-      context: ..
-      dockerfile: docker/frontend.Dockerfile
+      # Context is frontend/ rather than the repo root: the image needs nothing
+      # else, and a root context would ship data/ -- gigabytes of bar cache --
+      # to the daemon on every build.
+      context: ./frontend
     container_name: nw-bot-frontend
     restart: unless-stopped
     environment:
       # Injected into the page at CONTAINER START, not baked in at build time --
-      # see docker/frontend-entrypoint.sh. A CRA build inlines every
+      # see frontend/docker-entrypoint.sh. A CRA build inlines every
       # REACT_APP_* value into the bundle, so a baked API base would need a
       # rebuild to point the dashboard at a different host.
       #
@@ -67,10 +79,17 @@ services:
       # is on the host's loopback, not on the container network.
       BOT_API_BASE: ${BOT_API_BASE:-http://127.0.0.1:8000}
     ports:
-      - "127.0.0.1:${FRONTEND_PORT:-3000}:80"
+      # Same port inside and out. The static server is unprivileged (:3000, as
+      # the `node` user), so there is no longer a :80 to map from.
+      - "127.0.0.1:${FRONTEND_PORT:-3000}:3000"
     depends_on:
       db:
         condition: service_healthy
 
 volumes:
   db-data:
+    # Named explicitly, NOT left to the `<project>_<key>` default. This volume
+    # holds the trade history and the stored lot_size; tying its name to the
+    # compose project name means moving or renaming a directory swaps in an
+    # empty database. It was `docker_db-data` when this file lived in docker/.
+    name: nw-bot-db-data
