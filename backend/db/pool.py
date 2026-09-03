@@ -23,7 +23,7 @@ import threading
 
 from backend.core.errors import DatabaseUnavailable
 
-# Matches docker/docker-compose.yml, which publishes Postgres on loopback only.
+# Matches docker-compose.yml, which publishes Postgres on loopback only.
 # Read from the environment on every call rather than captured at import, so a
 # test can point it at a scratch database with monkeypatch.setenv.
 DEFAULT_URL = "postgresql://bot:bot@127.0.0.1:5432/tradingbot"
@@ -33,7 +33,7 @@ ENV_VAR = "BOT_DATABASE_URL"
 # Named in every message that reports a connection or schema problem, so the
 # fix never has to be guessed -- the same contract DataUnavailable has, where
 # the error always carries the exact snapshot command to run.
-_HINT = ("Start Postgres (docker compose -f docker/docker-compose.yml up -d db) "
+_HINT = ("Start Postgres (docker compose up -d db) "
          "and apply the schema (python -m backend.db.migrate).")
 
 _pool = None

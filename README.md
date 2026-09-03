@@ -86,10 +86,11 @@ The handoff is the `data/` directory: snapshot once on the trading host, copy it
 to the dev box, and all research then runs offline and reproducibly.
 
 Two of the three pieces are **containerised** — the dashboard and Postgres
-(`docker/`). The backend is not, and cannot be: it imports `MetaTrader5`, which
-needs a logged-in Windows terminal. Both containers publish to `127.0.0.1` only,
-and nginx serves the dashboard without proxying the API, so the API stays on
-loopback — see [`docker/README.md`](docker/README.md).
+(`docker-compose.yml`, at the repo root). The backend is not, and cannot be: it
+imports `MetaTrader5`, which needs a logged-in Windows terminal. Both containers
+publish to `127.0.0.1` only, and the dashboard container serves static files
+without proxying the API, so the API stays on loopback — see
+[Containers](#-containers) below.
 
 **Postgres holds everything the UI can change, and every trade.** Position
 sizing (previously `data/settings.json`), the trade history folded from MT5's own
@@ -119,7 +120,10 @@ frontend/src/
   TradesPage.tsx                Persisted trade history
   api.ts                        The only place a URL is known
   usePreferences.ts             Dashboard state, persisted to Postgres
-docker/                         frontend (nginx) + db (postgres) compose stack
+docker-compose.yml              frontend + db (postgres) compose stack
+frontend/Dockerfile             CRA build → static `serve` (no nginx)
+frontend/serve.json             SPA fallback, cache rules, security headers
+frontend/docker-entrypoint.sh   writes env.js from BOT_API_BASE at start
 tests/                          pytest suite (runs with no MT5 and no Postgres)
 data/                           Bar cache + reports (gitignored)
 ```
@@ -162,12 +166,12 @@ Server settings come from the environment:
 | `BOT_HOST` | `127.0.0.1` | **Do not expose this port** — `/control` and `/settings` have no auth |
 | `BOT_PORT` | `8000` | |
 | `BOT_ALLOWED_ORIGINS` | `http://localhost:3000,http://127.0.0.1:3000` | CORS allowlist |
-| `BOT_DATABASE_URL` | `postgresql://bot:bot@127.0.0.1:5432/tradingbot` | Matches `docker/docker-compose.yml` |
+| `BOT_DATABASE_URL` | `postgresql://bot:bot@127.0.0.1:5432/tradingbot` | Matches `docker-compose.yml` |
 | `BOT_AUTO_RESUME` | `0` | Restart bots that were running before a shutdown. **Off by default** — see below |
 | `BOT_ACCOUNT_SNAPSHOT_SECONDS` | `60` | How stale a stored account reading may be before it is re-captured |
 | `BOT_SETTINGS_FILE` | `data/settings.json` | **No longer read.** Only `backend.db.migrate` uses it, to import once |
 
-Container settings live in `docker/.env` (copy `docker/.env.example`):
+Container settings live in `.env` at the repo root (copy `.env.example`):
 `POSTGRES_PASSWORD`, `POSTGRES_PORT`, `FRONTEND_PORT`, and `BOT_API_BASE` — the
 API URL injected into the page at container start.
 
@@ -199,6 +203,155 @@ at break-even is one row with `exit_count = 2`, not a win plus a flat.
 
 ---
 
+## 📦 Containers
+
+Two services, both in `docker-compose.yml` at the repo root. There is no
+`docker/` directory and no reverse proxy.
+
+```bash
+cp .env.example .env          # optional; the defaults work
+docker compose up -d
+python -m backend.db.migrate  # from the repo root, once
+python -m backend.main        # on the MT5 host, as before
+```
+
+| | Runs where | Published on |
+|---|---|---|
+| `db` (postgres:16-alpine) | container | `127.0.0.1:5432` |
+| `frontend` (node + `serve`) | container | `127.0.0.1:3000` |
+| API (`python -m backend.main`) | **host** — needs MT5 | `127.0.0.1:8000` |
+
+The backend is not here and cannot be: `backend/bot_manager.py` imports
+`MetaTrader5`, which is Windows-only and needs a logged-in terminal on the same
+machine. Containerising it would mean shipping a Windows image with a GUI
+trading terminal inside.
+
+### Why nothing proxies the API
+
+The browser loads the page from the frontend container on `:3000` and calls the
+API **directly** on `127.0.0.1:8000`. That container serves static files and
+nothing else — no `/api` route, no proxy, no nginx.
+
+A proxy would be the conventional layout, and it is the wrong one here. For the
+container to reach the API, the API would have to be reachable from the Docker
+bridge network — i.e. bound off `127.0.0.1` — and `POST /control` starts live
+trading with real money with no authentication at all, as does `POST /settings`
+for the size of the orders it sends. The loopback bind is the only thing
+protecting either. Adding the container's published origin to the backend's CORS
+list costs nothing by comparison, and `BOT_ALLOWED_ORIGINS` already defaults to
+including `:3000`.
+
+The cost is that the dashboard only works from a browser on the MT5 host — which
+is the constraint the loopback bind already imposed.
+
+Both published ports are bound to `127.0.0.1` for the same reason.
+`- "5432:5432"` would bind `0.0.0.0` and put the database holding `lot_size` on
+every interface behind a password that defaults to `bot`.
+
+### What the frontend container is
+
+`frontend/Dockerfile` builds the CRA bundle on `node:24-alpine` and serves it
+from a second `node:24-alpine` stage with `serve`, as the unprivileged `node`
+user on `:3000`. `frontend/serve.json` carries what an nginx config used to:
+
+| | |
+|---|---|
+| SPA fallback | unknown paths are client routes, so they resolve to `index.html` |
+| `static/**` | `public, max-age=31536000, immutable` — CRA hashes those filenames |
+| `index.html`, `env.js` | `no-store` — see below |
+| every response | `X-Frame-Options: DENY`, `nosniff`, `Referrer-Policy: no-referrer` |
+
+The page holds the start/stop controls for a live account, so nothing about it
+should be embeddable or content-sniffable. Unlike nginx's `add_header` — which
+*replaces* the inherited set rather than merging, so a server-level header
+silently reached no location that set its own `Cache-Control` — matching
+`headers` entries here merge, and the `**` rule genuinely applies to everything.
+
+`serve.json` is kept **outside** the served directory and passed with
+`--config`; `serve` would otherwise look for it at `<public>/serve.json` and also
+hand it out at `/serve.json`.
+
+### Why the API base is injected at runtime
+
+Create React App inlines every `REACT_APP_*` value into the bundle at build
+time, so an API URL chosen at build time can only be changed by rebuilding the
+image. Instead `frontend/docker-entrypoint.sh` writes `env.js` from
+`BOT_API_BASE` on every container start and `exec`s the server, `index.html`
+loads it before the bundle, and `frontend/src/api.ts` reads
+`window.__BOT_CONFIG__.apiBase`. `frontend/public/env.js` is the dev default for
+`npm start`.
+
+`env.js` and `index.html` are served `no-store`: a cached `env.js` would pin the
+dashboard to a previous `BOT_API_BASE` and it would silently poll the wrong host.
+
+The literal is written with node's `JSON.stringify`, not by escaping characters
+by hand. The previous version used `sed 's/\\/\\\\/g; s/"/\\"/g'`, which
+busybox sed rejects outright — *"bad option in substitution expression"* — so
+`env.js` was never actually rewritten and `BOT_API_BASE` did nothing. It only
+looked like it worked because the dev default happens to be the same URL.
+
+### The schema
+
+`docker-compose.yml` mounts `./backend/db/schema.sql` into
+`/docker-entrypoint-initdb.d`, so a **fresh** database gets the schema on first
+boot. It is mounted rather than copied, because a copy would drift from the real
+file the first time a column changed.
+
+Postgres ignores that directory once the data volume exists, so
+`python -m backend.db.migrate` is the path that works every time. It is
+idempotent — every statement in `schema.sql` is `IF NOT EXISTS` — so running
+both is harmless. `migrate` also:
+
+- imports `data/settings.json` into `symbol_settings` **once**, so a lot size you
+  lowered on purpose is not lost in the move to Postgres. A re-run leaves the
+  database value alone rather than restoring the file's;
+- seeds a row for any configured symbol that has none, so `/settings` never has
+  to answer "no row" — the fallback for which would be the 0.1 code default.
+
+`python -m backend.db.migrate --check` reports connectivity and schema version
+and changes nothing.
+
+### Data, and the volume name
+
+Postgres data lives in the named volume **`nw-bot-db-data`**. The compose
+project name is pinned (`name: nw-bot`) and the volume is named explicitly
+rather than left to the `<project>_<key>` default, because that default derives
+from the *directory name* — so moving or renaming a directory silently brings
+the stack up against an empty database, which is the silent restore of the 0.1
+`lot_size` default that the backend refuses to boot for.
+
+When the compose file lived in `docker/`, the volume was `docker_db-data`. Carry
+it over rather than starting fresh:
+
+```powershell
+docker run --rm -v docker_db-data:/from:ro -v nw-bot-db-data:/to alpine sh -c 'cd /from && tar cf - . | (cd /to && tar xf -)'
+```
+
+The volume survives `docker compose down`. `docker compose down -v` **deletes
+it**, including the trade history and the stored lot size.
+
+```powershell
+# back it up first
+docker exec nw-bot-db pg_dump -U bot tradingbot > backup.sql
+```
+
+### Node version
+
+Both stages are `node:24-alpine`, matching the npm major that produced
+`frontend/package-lock.json` (lockfileVersion 3, npm 11). `node:20` ships npm
+10, which reads the same lock file and rejects it — *"Missing: yaml@2.9.0 from
+lock file"* — because the two majors resolve that transitive dependency
+differently. `npm ci` is worth keeping over `npm install` for a container build,
+so the image moved rather than the guarantee.
+
+Shell scripts are pinned to LF in `.gitattributes`. With `core.autocrlf=true` on
+a Windows checkout, a `#!/bin/sh
+` shebang does not resolve inside a Linux
+container, and the frontend image's `ENTRYPOINT` is a shell script — so that is
+not a warning in a log, it is a container that cannot start.
+
+---
+
 ## 🧪 Development
 
 ```bash
@@ -210,7 +363,7 @@ npm test --prefix frontend            # dashboard tests
 
 `tests/test_db_repository.py` exercises the SQL against a real server and
 **skips itself** when none answers, so the default suite stays offline. To run
-it: `docker compose -f docker/docker-compose.yml up -d db` then
+it: `docker compose up -d db` then
 `python -m backend.db.migrate`. It works in a throwaway schema, so it cannot
 touch the lot size the bot actually trades.
 
@@ -273,7 +426,7 @@ npm install --prefix frontend
 ### Step 2 — Start Postgres and apply the schema
 
 ```bash
-docker compose -f docker/docker-compose.yml up -d
+docker compose up -d
 python -m backend.db.migrate
 ```
 
@@ -318,8 +471,9 @@ development with hot reload, use the dev server instead:
 npm start --prefix frontend
 ```
 
-Either way the **browser** calls the API on `127.0.0.1:8000` directly; nginx
-does not proxy it. That is what lets the API stay bound to loopback.
+Either way the **browser** calls the API on `127.0.0.1:8000` directly; nothing
+proxies it. That is what lets the API stay bound to loopback — see
+[Containers](#-containers).
 
 Or run backend and dev server together:
 

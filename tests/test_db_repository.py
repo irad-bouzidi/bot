@@ -3,7 +3,7 @@
 `python -m pytest` must keep passing with no server running (CLAUDE.md), so
 every test here is behind a module-level skip. To run them:
 
-    docker compose -f docker/docker-compose.yml up -d db
+    docker compose up -d db
     python -m backend.db.migrate
     python -m pytest tests/test_db_repository.py
 
@@ -29,8 +29,8 @@ from backend.db import pool, repository as repo
 
 if not pool.ping():
     pytest.skip(
-        "No Postgres at %s. Start it with `docker compose -f "
-        "docker/docker-compose.yml up -d db`." % pool.redact(pool.database_url()),
+        "No Postgres at %s. Start it with `docker compose up -d db`."
+        % pool.redact(pool.database_url()),
         allow_module_level=True,
     )
 

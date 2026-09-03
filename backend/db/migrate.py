@@ -5,7 +5,8 @@
     python -m backend.db.migrate --skip-legacy   # apply schema only
 
 Idempotent: safe to run against a live database, and safe to run twice. Also
-runs on the `db` container's first boot via docker/db/init -- Postgres ignores
+runs on the `db` container's first boot via the schema.sql mounted into
+/docker-entrypoint-initdb.d by docker-compose.yml -- Postgres ignores
 that directory once a data volume exists, which is why re-runnability here is
 the primary path rather than a convenience.
 
