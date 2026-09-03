@@ -1,0 +1,76 @@
+# Frontend + Postgres. The BACKEND IS NOT HERE, and cannot be.
+#
+# `backend/bot_manager.py` imports MetaTrader5, which is Windows-only and needs a
+# logged-in terminal on the same machine. Containerising it would mean shipping
+# a Windows container with a GUI trading terminal inside it. So the split is the
+# one CLAUDE.md already describes: MT5 and the API on the trading host, and
+# everything that does not need a terminal in a container.
+#
+#   docker compose -f docker/docker-compose.yml up -d
+#   python -m backend.db.migrate          # once, from the repo root
+#   python -m backend.main                # on the MT5 host, as before
+#
+# The browser talks to nginx on :3000 for the page and DIRECTLY to the backend on
+# 127.0.0.1:8000 for the API. nginx does not proxy /api anywhere -- see
+# docker/nginx.conf and docker/README.md for why that is a safety decision and
+# not an omission.
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: nw-bot-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-tradingbot}
+      POSTGRES_USER: ${POSTGRES_USER:-bot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-bot}
+      # Postgres reads this at initdb time only. UTC because deal timestamps
+      # are stored as UTC (see _deal_rows) and the trade fold orders by them.
+      PGTZ: UTC
+      TZ: UTC
+    ports:
+      # 127.0.0.1 ON PURPOSE. `- "5432:5432"` binds 0.0.0.0 and would put the
+      # database holding `lot_size` -- the only risk control this bot has -- on
+      # every interface, behind a password that defaults to "bot". Same posture
+      # as BOT_HOST, for the same reason.
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - db-data:/var/lib/postgresql/data
+      # The REAL schema file, mounted rather than copied. A copy under docker/
+      # would drift from backend/db/schema.sql the first time a column changed,
+      # and the two paths that apply it have to stay identical.
+      #
+      # Runs ONLY on first boot -- Postgres skips this directory once the data
+      # volume exists -- so `python -m backend.db.migrate` remains the path that
+      # works every time. The schema is idempotent, so doing both is harmless.
+      - ../backend/db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-bot} -d ${POSTGRES_DB:-tradingbot}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  frontend:
+    build:
+      context: ..
+      dockerfile: docker/frontend.Dockerfile
+    container_name: nw-bot-frontend
+    restart: unless-stopped
+    environment:
+      # Injected into the page at CONTAINER START, not baked in at build time --
+      # see docker/frontend-entrypoint.sh. A CRA build inlines every
+      # REACT_APP_* value into the bundle, so a baked API base would need a
+      # rebuild to point the dashboard at a different host.
+      #
+      # This is the URL THE BROWSER uses. It stays 127.0.0.1 because the backend
+      # is on the host's loopback, not on the container network.
+      BOT_API_BASE: ${BOT_API_BASE:-http://127.0.0.1:8000}
+    ports:
+      - "127.0.0.1:${FRONTEND_PORT:-3000}:80"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  db-data:

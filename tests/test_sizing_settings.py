@@ -8,15 +8,20 @@ Two things are pinned here:
   * `simulate_legacy` with the scale-out OFF still reproducing the original
     close-only engine trade for trade, so the rule that was added to POST
     /backtest can be shown to have changed nothing except what it was meant to.
-"""
 
-import json
+The persistence tests below moved from a JSON file to Postgres but pin the same
+guarantee -- the store can change the two editable numbers and nothing else --
+plus one deliberate CHANGE: an unreachable store now refuses the boot instead of
+falling back to the code default. None of them need a running server; the SQL
+itself is covered by tests/test_db_repository.py, which skips without one.
+"""
 
 import numpy as np
 import pandas as pd
 import pytest
 
-from backend.core.errors import ConfigRejected
+from backend.core.errors import ConfigRejected, DatabaseUnavailable
+from backend.db import repository as repo
 from tests.fixtures.synthetic import make_ohlc
 
 mt5 = pytest.importorskip(
@@ -88,53 +93,124 @@ def test_split_lots_snaps_to_the_volume_step():
 
 
 # ---------------------------------------------------------------------------
-# persistence
+# persistence -- now Postgres, previously data/settings.json
 # ---------------------------------------------------------------------------
 
-def test_saved_settings_round_trip(tmp_path, monkeypatch):
-    monkeypatch.setattr(bm, "SETTINGS_FILE", str(tmp_path / "settings.json"))
-    monkeypatch.setitem(bm.SYMBOL_CONFIG["XAUUSDm"], "lot_size", 0.03)
-    monkeypatch.setitem(bm.SYMBOL_CONFIG["XAUUSDm"], "partial_fraction", 0.25)
-    bm._save_settings()
+class _FakeCursor(object):
+    """Enough of a psycopg2 dict cursor to test the narrowness of the SELECT.
 
-    saved = json.loads((tmp_path / "settings.json").read_text())
-    assert saved == {"XAUUSDm": {"lot_size": 0.03, "partial_fraction": 0.25}}
+    A real Postgres is not needed to answer the questions these tests ask --
+    "which columns does it read?" and "what does it do with a value the
+    validator refuses?" -- and requiring one would mean the suite no longer
+    runs offline, which CLAUDE.md pins.
 
+    tests/test_db_repository.py covers the SQL itself against a real server,
+    and skips when there is not one.
+    """
+
+    def __init__(self, rows):
+        self.rows = rows
+        self.sql = None
+        self.params = None
+
+    def execute(self, sql, params=None):
+        self.sql = sql
+        self.params = params
+
+    def fetchall(self):
+        return list(self.rows)
+
+    def fetchone(self):
+        return self.rows[0] if self.rows else None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _stub_cursor(monkeypatch, rows):
+    cur = _FakeCursor(rows)
+    monkeypatch.setattr(repo, "cursor", lambda: cur)
+    return cur
+
+
+def test_the_store_is_only_asked_for_the_two_editable_columns(monkeypatch):
+    """The narrowness is in the SELECT, not only in the caller.
+
+    A row must never be able to introduce a symbol or move a stop. The old
+    settings.json enforced that in `_load_settings`; a database needs it
+    enforced at the query too, because psql, a migration and anything else
+    holding the DSN can write rows the UI never could.
+    """
+    cur = _stub_cursor(monkeypatch, [])
+
+    repo.load_settings(["XAUUSDm"])
+
+    sql = cur.sql.lower()
+    assert "lot_size" in sql and "partial_fraction" in sql
+    # Nothing that would let the store reach a stop, a target or the P&L
+    # multiplier.
+    for forbidden in ("sl_pips", "tp_pips", "profit_mult", "be_trigger_pips", "pip"):
+        assert forbidden not in sql
+    assert "select *" not in sql
+    # And only the symbols the caller named.
+    assert cur.params == (["XAUUSDm"],)
+
+
+def test_load_settings_ignores_unknown_symbols_and_uneditable_keys(monkeypatch):
+    """Even handed a hostile payload, only the two numbers move.
+
+    Belt and braces with the test above: that one pins the query, this one pins
+    what happens if the query ever came back with more than it asked for.
+    """
     monkeypatch.setitem(bm.SYMBOL_CONFIG["XAUUSDm"], "lot_size", 0.1)
     monkeypatch.setitem(bm.SYMBOL_CONFIG["XAUUSDm"], "partial_fraction", 0.5)
-    bm._load_settings()
-    assert bm.SYMBOL_CONFIG["XAUUSDm"]["lot_size"] == 0.03
-    assert bm.SYMBOL_CONFIG["XAUUSDm"]["partial_fraction"] == 0.25
-
-
-def test_settings_file_cannot_introduce_a_symbol_or_move_a_stop(tmp_path, monkeypatch):
-    """A file on disk gets to change the two editable numbers and nothing else.
-
-    Anything wider would let a stray settings.json widen a stop or add an
-    unbacktested symbol, neither of which the UI can do.
-    """
-    path = tmp_path / "settings.json"
-    path.write_text(json.dumps({
+    monkeypatch.setattr(repo, "load_settings", lambda *a, **k: {
         "XAUUSDm": {"lot_size": 0.02, "sl_pips": 5, "profit_mult": 999},
         "EURUSDm": {"lot_size": 5.0},
-    }))
-    monkeypatch.setattr(bm, "SETTINGS_FILE", str(path))
-    monkeypatch.setitem(bm.SYMBOL_CONFIG["XAUUSDm"], "lot_size", 0.1)
+    })
 
     bm._load_settings()
 
     assert bm.SYMBOL_CONFIG["XAUUSDm"]["lot_size"] == 0.02      # editable
+    assert bm.SYMBOL_CONFIG["XAUUSDm"]["partial_fraction"] == 0.5
     assert bm.SYMBOL_CONFIG["XAUUSDm"]["sl_pips"] == 70         # not editable
     assert bm.SYMBOL_CONFIG["XAUUSDm"]["profit_mult"] == 100    # not editable
     assert "EURUSDm" not in bm.SYMBOL_CONFIG
 
 
-def test_out_of_range_saved_values_are_ignored_not_applied(tmp_path, monkeypatch):
-    path = tmp_path / "settings.json"
-    path.write_text(json.dumps({"XAUUSDm": {"lot_size": -1.0, "partial_fraction": 1.0}}))
-    monkeypatch.setattr(bm, "SETTINGS_FILE", str(path))
+@pytest.mark.parametrize("stored,key", [
+    ({"lot_size": -1.0, "partial_fraction": 0.5}, "lot_size"),
+    ({"lot_size": 0.1, "partial_fraction": 1.0}, "partial_fraction"),
+    ({"lot_size": 0.0, "partial_fraction": 0.5}, "lot_size"),
+])
+def test_out_of_range_stored_values_are_dropped_not_returned(monkeypatch, stored, key):
+    """A value the validator refuses does not reach SYMBOL_CONFIG.
+
+    The CHECK constraints in schema.sql refuse these on the way IN, which the
+    file store could not do -- but a database that predates a constraint, or one
+    restored from an older dump, can still hold one. So the read validates too.
+    """
+    row = {"symbol": "XAUUSDm"}
+    row.update(stored)
+    _stub_cursor(monkeypatch, [row])
+    rejected = []
+
+    loaded = repo.load_settings(["XAUUSDm"], validate=bm._validated,
+                                on_reject=lambda sym, k, exc: rejected.append(k))
+
+    assert key not in loaded.get("XAUUSDm", {})
+    assert rejected == [key]
+
+
+def test_a_bad_row_leaves_the_code_default_standing(monkeypatch):
     monkeypatch.setitem(bm.SYMBOL_CONFIG["XAUUSDm"], "lot_size", 0.1)
     monkeypatch.setitem(bm.SYMBOL_CONFIG["XAUUSDm"], "partial_fraction", 0.5)
+    _stub_cursor(monkeypatch, [
+        {"symbol": "XAUUSDm", "lot_size": -1.0, "partial_fraction": 1.0},
+    ])
 
     bm._load_settings()
 
@@ -142,15 +218,94 @@ def test_out_of_range_saved_values_are_ignored_not_applied(tmp_path, monkeypatch
     assert bm.SYMBOL_CONFIG["XAUUSDm"]["partial_fraction"] == 0.5
 
 
-def test_corrupt_settings_file_falls_back_to_the_defaults(tmp_path, monkeypatch):
-    path = tmp_path / "settings.json"
-    path.write_text("{not json")
-    monkeypatch.setattr(bm, "SETTINGS_FILE", str(path))
-    monkeypatch.setitem(bm.SYMBOL_CONFIG["XAUUSDm"], "lot_size", 0.1)
+def test_an_unreachable_store_refuses_the_boot_rather_than_trading_the_default(monkeypatch):
+    """The behaviour change from the file store, pinned deliberately.
 
-    bm._load_settings()  # must not raise -- a bad file cannot stop the API booting
+    A corrupt settings.json fell back to the code defaults so the API could
+    still boot. That is the wrong trade now and it was arguably always the wrong
+    trade: `lot_size` is the only risk control this bot has, so falling back
+    means quietly restoring ~$70/trade for someone who had lowered it. An
+    unreachable store must stop the boot, not be papered over.
+    """
+    monkeypatch.setitem(bm.SYMBOL_CONFIG["XAUUSDm"], "lot_size", 0.02)
+
+    def boom():
+        raise DatabaseUnavailable("connection refused")
+
+    monkeypatch.setattr(repo, "schema_version", boom)
+
+    with pytest.raises(DatabaseUnavailable):
+        bm.init_persistence()
+
+    # And it did not helpfully "reset" anything on the way out.
+    assert bm.SYMBOL_CONFIG["XAUUSDm"]["lot_size"] == 0.02
+
+
+def test_a_settings_edit_that_the_store_refuses_is_not_applied_in_memory(monkeypatch):
+    """A size the database would not take must not be traded anyway.
+
+    Writing SYMBOL_CONFIG first and persisting second would leave the process
+    trading a value that vanishes on restart -- the silent-restore failure from
+    the other direction, and harder to notice because the dashboard would show
+    the number it accepted.
+    """
+    monkeypatch.setitem(bm.SYMBOL_CONFIG["XAUUSDm"], "lot_size", 0.1)
+    monkeypatch.setitem(bm.SYMBOL_CONFIG["XAUUSDm"], "partial_fraction", 0.5)
+    monkeypatch.setattr(bm, "bot_positions", lambda symbol: [])
+    monkeypatch.setattr(bm, "_volume_limits", lambda symbol: (0.01, 100.0, 0.01, False))
+
+    def boom(*a, **k):
+        raise DatabaseUnavailable("connection refused")
+
+    monkeypatch.setattr(repo, "save_settings", boom)
+    manager = bm.BotManager.__new__(bm.BotManager)   # no MT5 initialize()
+
+    with pytest.raises(DatabaseUnavailable):
+        manager.update_settings("XAUUSDm", lot_size=0.5, scale_out_lots=0.25)
 
     assert bm.SYMBOL_CONFIG["XAUUSDm"]["lot_size"] == 0.1
+    assert bm.SYMBOL_CONFIG["XAUUSDm"]["partial_fraction"] == 0.5
+
+
+def test_a_settings_edit_stores_what_it_applies(monkeypatch):
+    """The value written to SYMBOL_CONFIG is the value the store returned.
+
+    Not the value that was typed: the store is the authority, and reading the
+    write back is what keeps the two from diverging.
+    """
+    monkeypatch.setitem(bm.SYMBOL_CONFIG["XAUUSDm"], "lot_size", 0.1)
+    monkeypatch.setitem(bm.SYMBOL_CONFIG["XAUUSDm"], "partial_fraction", 0.5)
+    monkeypatch.setattr(bm, "bot_positions", lambda symbol: [])
+    monkeypatch.setattr(bm, "_volume_limits", lambda symbol: (0.01, 100.0, 0.01, False))
+    written = {}
+
+    def fake_save(symbol, lot, fraction, source=None, notes=None):
+        written["args"] = (symbol, lot, fraction, source)
+        return {"lot_size": lot, "partial_fraction": fraction}
+
+    monkeypatch.setattr(repo, "save_settings", fake_save)
+    manager = bm.BotManager.__new__(bm.BotManager)
+
+    result = manager.update_settings("XAUUSDm", lot_size=0.2, scale_out_lots=0.05)
+
+    assert written["args"] == ("XAUUSDm", 0.2, 0.25, "api")
+    assert bm.SYMBOL_CONFIG["XAUUSDm"]["lot_size"] == 0.2
+    # 0.05 of 0.2 is a QUARTER, and a quarter is what is stored -- not the 0.05.
+    assert bm.SYMBOL_CONFIG["XAUUSDm"]["partial_fraction"] == 0.25
+    assert result["scale_out_lots"] == 0.05
+
+
+def test_an_edit_is_still_refused_while_a_position_is_open(monkeypatch):
+    """Unchanged by the move to Postgres, and checked here because it is the one
+    rule that stops manage_position() scaling a trade out twice."""
+    monkeypatch.setattr(bm, "bot_positions", lambda symbol: [object()])
+    monkeypatch.setattr(bm, "_volume_limits", lambda symbol: (0.01, 100.0, 0.01, False))
+    monkeypatch.setattr(repo, "save_settings",
+                        lambda *a, **k: pytest.fail("must not write while a position is open"))
+    manager = bm.BotManager.__new__(bm.BotManager)
+
+    with pytest.raises(ConfigRejected):
+        manager.update_settings("XAUUSDm", lot_size=0.5, scale_out_lots=0.25)
 
 
 # ---------------------------------------------------------------------------
