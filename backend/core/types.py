@@ -30,9 +30,9 @@ class SignalType(enum.Enum):
 class SymbolSpec:
     """Contract specification, captured from MT5 `symbol_info`.
 
-    This replaces the hand-rolled `profit_mult` constant (100 for XAU, 1 for BTC),
-    which was a hardcoded copy of `trade_contract_size` that silently breaks on a
-    broker or symbol change and cannot express a non-USD quote currency.
+    This replaces the hand-rolled `profit_mult` constant (100 for XAU), which was
+    a hardcoded copy of `trade_contract_size` that silently breaks on a broker or
+    symbol change and cannot express a non-USD quote currency.
     """
 
     name: str

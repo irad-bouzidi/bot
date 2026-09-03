@@ -570,6 +570,151 @@ select:focus-visible,
   color: var(--bg-color);
 }
 
+/* Position sizing */
+.sizing-section {
+  margin-bottom: 20px;
+  padding: 14px;
+  background: var(--secondary-bg);
+  border: 1px solid var(--border-color);
+}
+
+.sizing-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.sizing-title {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+/* The dollar figure is deliberately loud: lot_size is the only risk control this
+   bot has, so the cost of the number in the box belongs next to the box. */
+.sizing-risk {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--danger-color);
+  white-space: nowrap;
+}
+
+.sizing-risk.muted { color: var(--text-muted); }
+
+.sizing-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.sizing-field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+}
+
+.sizing-field > span {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.sizing-field input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 8px 10px;
+  border: 1px solid var(--border-color);
+  background: var(--card-bg);
+  color: var(--text-main);
+  font-family: var(--font-mono);
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
+  transition: border-color 0.15s;
+}
+
+.sizing-field input:focus {
+  outline: none;
+  border-color: var(--accent-color);
+}
+
+.sizing-field input:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.sizing-hint {
+  margin: 0 0 8px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+.sizing-hint b { color: var(--text-main); }
+.sizing-hint.muted { opacity: 0.7; }
+
+.sizing-msg {
+  margin: 0 0 10px;
+  padding: 7px 10px;
+  background: var(--card-bg);
+  border-left: 3px solid var(--border-color);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.sizing-msg.err {
+  color: var(--danger-color);
+  border-left-color: var(--danger-color);
+}
+
+.sizing-msg.ok {
+  color: var(--success-color);
+  border-left-color: var(--success-color);
+}
+
+.sizing-actions {
+  display: flex;
+  gap: 1px;
+  background: var(--border-color);
+  border: 1px solid var(--border-color);
+}
+
+.sizing-actions .btn {
+  padding: 9px;
+  font-size: 12px;
+}
+
+.btn-save {
+  color: var(--accent-color);
+}
+.btn-save:hover:not(:disabled) {
+  background: var(--accent-color);
+  color: var(--bg-color);
+}
+
+.btn-reset {
+  color: var(--text-muted);
+}
+.btn-reset:hover:not(:disabled) {
+  background: var(--border-color);
+  color: var(--text-main);
+}
+
+.sizing-title-skeleton { height: 14px; width: 120px; margin-bottom: 12px; }
+.sizing-field-skeleton { height: 46px; }
+
 /* ---------------------------------------------------------------------- */
 /* Backtest                                                               */
 /* ---------------------------------------------------------------------- */
@@ -642,6 +787,24 @@ select:focus-visible,
 .form-group select:focus {
   outline: none;
   border-color: var(--accent-color);
+}
+
+.field-hint {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+.result-note {
+  margin: 20px 0 0;
+  padding: 12px 14px;
+  background: var(--secondary-bg);
+  border-left: 3px solid var(--danger-color);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--text-muted);
 }
 
 .preset-group {
@@ -773,4 +936,6 @@ select:focus-visible,
 
 @media (max-width: 420px) {
   .results-grid { grid-template-columns: 1fr; }
+  .sizing-grid { grid-template-columns: 1fr; }
+  .sizing-head { flex-direction: column; gap: 4px; }
 }

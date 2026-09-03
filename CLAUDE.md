@@ -25,8 +25,8 @@ npx concurrently "python -m backend.main" "npm start --prefix frontend"
 # Research (offline, no MT5)
 python -m backend.scripts.run_baseline --symbol XAUUSDm --compare-legacy
 # NB: --sl/--tp are PRICE units, while SYMBOL_CONFIG is in "pips" (pip = 0.1).
-# BTCUSDm's live 700/500 pips is --sl 70 --tp 50 here; XAUUSDm's 70/100 is the 7/10 default.
-python -m backend.scripts.run_baseline --symbol BTCUSDm --start 2025-09-01 --sl 70 --tp 50
+# XAUUSDm's live 70/100 pips is the 7/10 default here.
+python -m backend.scripts.run_baseline --symbol XAUUSDm --start 2025-09-01
 
 # Data capture (MT5 host only)
 python -m backend.data.snapshot --symbol XAUUSDm --start 2023-01-01
@@ -66,10 +66,11 @@ This is the most important thing to understand before editing.
 |---|---|---|
 | Strategy rules | inlined in `TradingBot.run` (`bot_manager.py`) | `backend/strategy/nw_envelope.py` |
 | Scale-out / break-even | `TradingBot.manage_position` | engine rule 9 (`_resolve_bar`) |
-| Backtest | `BotManager.run_backtest` — close-only, cost-free, **no scale-out** | `backend/backtest/engine.py` — next-bar-open fills, intrabar stops, cost model |
+| Backtest | `BotManager.run_backtest` → `simulate_legacy` — close-only, cost-free, scale-out modelled at the trigger level | `backend/backtest/engine.py` — next-bar-open fills, intrabar stops, cost model |
 | Data | `mt5.copy_rates_*` direct | `MarketData` / `CachedMarketData` over `data/` |
 | P&L | `price_diff * lot_size * profit_mult` | `SymbolSpec.pl()` from real tick value |
 | Config | `SYMBOL_CONFIG` dict, pips | `NWConfig` + `BacktestConfig`, price units |
+| Sizing | `SYMBOL_CONFIG["lot_size"]` / `"partial_fraction"`, editable via `POST /settings` | `BacktestConfig.volume` / `NWConfig.partial_fraction`, CLI flags |
 
 `POST /backtest` (used by the frontend Backtest page) still runs the **legacy** engine, so
 its numbers are systematically optimistic and do not match `run_baseline`. The research
@@ -77,6 +78,18 @@ stack is the honest one; `BacktestConfig(legacy_mode=True)` reproduces the old b
 inside the new engine purely for regression comparison (`run_baseline --compare-legacy`
 prints the overstatement). When changing strategy behaviour, expect to change it in
 **both** places, or say clearly that you did not.
+
+Two caveats on the legacy engine, both new:
+
+- `simulate_legacy` now models the scale-out (banked at the trigger *level*, resolved
+  before the exits), because the Backtest page lets you set the two lot numbers and a
+  backtest that sized differently from live could not answer the question being asked.
+  **Every `POST /backtest` number moved as a result** unless the scale-out is off.
+  `tests/test_sizing_settings.py` pins `partial_fraction=0` against a verbatim copy of
+  the pre-change loop, so the engine with the rule off is provably unchanged.
+- `BacktestConfig(legacy_mode=True)` skips the whole intrabar block, scale-out included,
+  so `--compare-legacy` and `POST /backtest` now agree only when `partial_fraction=0`.
+  Do not read one as a check on the other.
 
 ### Research stack seams
 
@@ -141,17 +154,20 @@ At `be_trigger_pips` in profit (default: half the target), `partial_fraction` of
 position closes and the stop moves to entry. One rule, expressed as a distance and a
 *fraction* in both paths — `SYMBOL_CONFIG` live, `NWConfig.be_trigger_mode` in the
 strategy. Never express it as a lot count: 0.05 is 50% of the current 0.1 lot_size and
-would silently become a different share of the position if the size changed.
+would silently become a different share of the position if the size changed. The
+dashboard edits it in **lots** because that is what a trader types; `scale_out_fraction()`
+is the single boundary that converts, and the resulting percentage is echoed back to the
+form so a re-scale is visible rather than silent. Do not add a second conversion.
 
 **Measured effect on cached data (central costs), and it is negative.** Gold, 2025-05
 onward, 9 settings swept: every one raises win rate and lowers expectancy versus the rule
 off — 45.9%→58% win rate, expectancy −0.071R→−0.117R, monotonically worse the earlier and
-larger the scale-out. At the shipped 0.1 lots / 0.5 out it is −0.071R→−0.102R. BTC the
-same (−0.30R→−0.48R). The rule clips winners while leaving straight-to-stop losers
-untouched. It is enabled because it was asked for, not because the data supports it;
-`--no-breakeven`, or `be_trigger_mode="none"` / `partial_fraction=0` in `SYMBOL_CONFIG`,
-turns it off. Re-run the comparison before drawing any conclusion from a report that
-predates it.
+larger the scale-out. At the shipped 0.1 lots / 0.5 out it is −0.071R→−0.102R. The rule
+clips winners while leaving straight-to-stop losers untouched. It is enabled because it
+was asked for, not because the data supports it;
+`--no-breakeven`, `be_trigger_mode="none"` / `partial_fraction=0` in `SYMBOL_CONFIG`,
+or a scale-out of **0 lots** in the dashboard's Position sizing panel, turns it off.
+Re-run the comparison before drawing any conclusion from a report that predates it.
 
 Of the trades that do scale out, the remainder reaches the target 55% of the time,
 break-even 32%, and the centre-line exit 13% — so the mean-reversion exit intercepts the
@@ -166,15 +182,31 @@ an A/B — but do not read an average TP win as achievable.
 ## Safety
 
 `POST /control` starts and stops **live trading with real money and has no
-authentication**. `BOT_HOST` defaults to `127.0.0.1` for that reason; do not change the
-default or widen `BOT_ALLOWED_ORIGINS` unless asked. There is no equity-based sizing, no
-daily loss cap and no margin check — `lot_size` is a flat 0.1 in `SYMBOL_CONFIG`, so gold
-risks ~$70 a trade (a measured 11-12 loss streak is ~$840) and BTC ~$7 at the same
-nominal size, a 10x asymmetry from their contract sizes.
+authentication**, and `POST /settings` changes the size of the orders it sends with just
+as little. `BOT_HOST` defaults to `127.0.0.1` for that reason; do not change the default
+or widen `BOT_ALLOWED_ORIGINS` unless asked. There is no equity-based sizing, no daily
+loss cap and no margin check — `lot_size` defaults to 0.1, so gold risks ~$70 a trade (a
+measured 11-12 loss streak is ~$840). The dashboard shows that dollar figure next to the
+field precisely because the lot size is the only risk control there is.
 
-`BTCUSDm` is configured with a 700-point stop against a 500-point target (R:R 0.71), which
-has negative expectancy before costs; the README recommends leaving it stopped. Do not
-"fix" the numbers without a backtest showing the change works.
+`lot_size` and `partial_fraction` are the **only** two keys `POST /settings` can touch,
+and the only two persisted to `data/settings.json` (override with `BOT_SETTINGS_FILE`).
+They are persisted because silently restoring 0.1 on restart would undo a size someone
+lowered on purpose. `_load_settings()` ignores anything else in that file — it must never
+be able to introduce a symbol or move a stop.
+
+An edit is **refused while the bot holds a position**, under the same `_CONFIG_LOCK` that
+`open_trade()` holds across its `order_send`. This is not politeness:
+`manage_position()` decides "has the scale-out already fired?" by comparing the
+position's volume against `lot_size`, so lowering the size mid-trade makes an
+already-reduced position look untouched and scales it out twice. Remembering the size
+per ticket instead would need exactly the cross-restart state that S7 was written to
+avoid.
+
+`XAUUSDm` is the only configured symbol. Adding another means adding a `SYMBOL_CONFIG`
+entry *and* extending `SUPPORTED_SYMBOLS` in `frontend/src/BacktestPage.tsx`, and the
+per-trade dollar risk does not carry over: it comes from the contract size, not the
+nominal 0.1 lots. Do not add one without a backtest showing its R:R works.
 
 ## Working conventions
 
