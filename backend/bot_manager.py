@@ -1,7 +1,6 @@
 import MetaTrader5 as mt5
 import pandas as pd
 import numpy as np
-import json
 import math
 import os
 import time
@@ -9,7 +8,9 @@ import threading
 from datetime import datetime, timedelta
 from typing import Dict
 
-from backend.core.errors import ConfigRejected
+from backend.core.errors import ConfigRejected, DatabaseUnavailable
+from backend.db import pool as db_pool
+from backend.db import repository as repo
 from backend.indicators.nadaraya_watson import nw_envelope, nw_warmup_bars
 
 # Constants
@@ -85,7 +86,12 @@ SUPPORTED_SYMBOLS = list(SYMBOL_CONFIG.keys())
 EDITABLE_KEYS = ("lot_size", "partial_fraction")
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SETTINGS_FILE = os.environ.get(
+
+# Where the sizing USED to live. Kept only so init_persistence() can report a
+# file that was never imported; nothing reads it for values any more --
+# `python -m backend.db.migrate` copies it into Postgres once. It is not
+# deleted, so checking out the previous commit still finds the chosen size.
+LEGACY_SETTINGS_FILE = os.environ.get(
     "BOT_SETTINGS_FILE", os.path.join(_REPO_ROOT, "data", "settings.json"))
 
 # Guards every read-modify-write of SYMBOL_CONFIG. open_trade() holds it across the
@@ -132,52 +138,104 @@ def _validated(key, value):
 
 
 def _load_settings():
-    """Apply persisted sizing over SYMBOL_CONFIG at import time.
+    """Apply the persisted sizing over SYMBOL_CONFIG.
 
-    Deliberately narrow: only EDITABLE_KEYS, only for symbols already defined in
-    code, and only values that survive validation. A file on disk must never be
-    able to introduce a symbol or move a stop -- it can only change the two numbers
-    the UI is allowed to change.
+    Deliberately narrow, and no less so for being a database rather than a
+    file: only EDITABLE_KEYS, only for symbols already defined in code, and
+    only values that survive `_validated`. A row must never be able to
+    introduce a symbol or move a stop -- and unlike the old settings.json, a
+    database is writable by psql, by a migration, and by anything else holding
+    the DSN, so the narrowness carries more weight here rather than less.
+
+    Called by init_persistence(), NOT at import: importing this module must not
+    require a reachable Postgres, or `pytest` and every offline research script
+    would need one.
+    """
+    def _reject(symbol, key, exc):
+        log("settings: ignoring %s.%s -- %s" % (symbol, key, exc))
+
+    loaded = repo.load_settings(list(SYMBOL_CONFIG), validate=_validated,
+                               on_reject=_reject)
+    with _CONFIG_LOCK:
+        for symbol, values in loaded.items():
+            cfg = SYMBOL_CONFIG.get(symbol)
+            if cfg is None:
+                continue
+            for key in EDITABLE_KEYS:
+                if key in values:
+                    cfg[key] = values[key]
+            log("settings: %s loaded lot_size=%g partial_fraction=%g"
+                % (symbol, cfg["lot_size"], cfg.get("partial_fraction", 0.0)))
+    return loaded
+
+
+def _save_settings(symbol, notes=None):
+    """Persist one symbol's EDITABLE_KEYS. Call with _CONFIG_LOCK held.
+
+    Takes a symbol now, where the file version rewrote the whole document. The
+    write is a single statement that also appends the audit row, so a
+    concurrent save cannot interleave -- the equivalent of the old
+    write-then-rename, moved into the transaction where it belongs.
+    """
+    cfg = SYMBOL_CONFIG[symbol]
+    return repo.save_settings(symbol, cfg["lot_size"],
+                              cfg.get("partial_fraction", 0.0),
+                              source="api", notes=notes)
+
+
+def _persist(what, fn, *args, **kwargs):
+    """Best-effort DB write from inside the live loop. Never raises.
+
+    A Postgres outage must NOT stop a bot that is holding a position. The size
+    it trades with is already in SYMBOL_CONFIG in memory, so an outage costs
+    the record and nothing else; halting would leave a real position running
+    with nothing to fire its scale-out or move its stop to break-even, which is
+    strictly worse than a gap in the history. The gap is reported instead --
+    through GET /health and the returned False.
     """
     try:
-        with open(SETTINGS_FILE) as fh:
-            saved = json.load(fh)
-    except (IOError, OSError):
-        return
-    except ValueError:
-        log("settings: %s is not valid JSON; using the defaults" % SETTINGS_FILE)
-        return
-    if not isinstance(saved, dict):
-        return
-    for symbol, values in saved.items():
-        cfg = SYMBOL_CONFIG.get(symbol)
-        if cfg is None or not isinstance(values, dict):
+        fn(*args, **kwargs)
+        return True
+    except Exception as exc:
+        log("db: could not %s -- %r" % (what, exc))
+        return False
+
+
+def init_persistence(require_schema=True):
+    """Connect to Postgres, check the schema, and adopt the stored sizing.
+
+    Called once from the FastAPI startup hook, and it is allowed to FAIL THE
+    BOOT. That is the point: `lot_size` is the only risk control this bot has,
+    and starting with the 0.1 code default because the database was unreachable
+    would restore ~$70/trade of exposure for someone who had deliberately
+    lowered it. The old settings file went to the trouble of a
+    write-then-rename to avoid exactly that; degrading to the default here
+    would give it away.
+    """
+    if require_schema:
+        version = repo.schema_version()
+        if version <= 0 or not repo.tables_present():
+            raise DatabaseUnavailable(
+                "Postgres at %s has no schema (version %d). Run: "
+                "python -m backend.db.migrate"
+                % (db_pool.redact(db_pool.database_url()), version))
+    repo.ensure_bot_rows(list(SYMBOL_CONFIG))
+    loaded = _load_settings()
+    for symbol in SYMBOL_CONFIG:
+        if symbol in loaded:
             continue
-        for key in EDITABLE_KEYS:
-            if key not in values:
-                continue
-            try:
-                cfg[key] = _validated(key, values[key])
-            except (ConfigRejected, TypeError, ValueError) as exc:
-                log("settings: ignoring %s.%s -- %s" % (symbol, key, exc))
-        log("settings: %s loaded lot_size=%g partial_fraction=%g"
-            % (symbol, cfg["lot_size"], cfg.get("partial_fraction", 0.0)))
-
-
-def _save_settings():
-    """Persist EDITABLE_KEYS. Call with _CONFIG_LOCK held."""
-    payload = dict((symbol, dict((k, cfg[k]) for k in EDITABLE_KEYS if k in cfg))
-                   for symbol, cfg in SYMBOL_CONFIG.items())
-    folder = os.path.dirname(SETTINGS_FILE)
-    if folder and not os.path.isdir(folder):
-        os.makedirs(folder)
-    # Write-then-rename: a crash partway through must not leave a truncated file,
-    # because _load_settings() would then fall back to the 0.1 default and silently
-    # undo a size that was lowered on purpose.
-    tmp = SETTINGS_FILE + ".tmp"
-    with open(tmp, "w") as fh:
-        json.dump(payload, fh, indent=2, sort_keys=True)
-    os.replace(tmp, SETTINGS_FILE)
+        # A configured symbol with no row would fall back to the code default
+        # on every read, which is the silent restore this whole path exists to
+        # prevent. Write the default down once, explicitly, so what the bot
+        # will trade is a stored decision rather than an absence.
+        with _CONFIG_LOCK:
+            _save_settings(symbol, notes="seeded from SYMBOL_CONFIG on first boot")
+        log("settings: %s had no stored row; seeded the code default" % symbol)
+    if os.path.isfile(LEGACY_SETTINGS_FILE):
+        log("settings: %s is no longer read; Postgres is the store "
+            "(python -m backend.db.migrate imports it once)"
+            % LEGACY_SETTINGS_FILE)
+    return loaded
 
 
 def _volume_limits(symbol):
@@ -237,7 +295,110 @@ def bot_positions(symbol):
     return [p for p in positions if p.magic == MAGIC_NUMBER]
 
 
-_load_settings()
+def _finite(value):
+    """A float for Postgres, or None if it is NaN/inf.
+
+    numpy's NaN adapts to the SQL literal NaN, which a DOUBLE PRECISION column
+    accepts -- so an un-guarded band would be STORED as NaN and read back out
+    to the dashboard as a number that compares False against every price. The
+    NaN case is already handled explicitly a few lines later; this keeps it
+    from being persisted in the meantime.
+    """
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _deal_entry_kind(value):
+    """mt5.DEAL_ENTRY_* -> the string stored in deals.entry_kind.
+
+    Mapped to names rather than stored as the raw integer so the SQL fold reads
+    as `entry_kind = 'in'`. The constants are looked up with getattr because
+    DEAL_ENTRY_OUT_BY is absent on some MetaTrader5 package versions, and an
+    AttributeError at import would take the whole live loop down.
+    """
+    for name, label in (("DEAL_ENTRY_IN", "in"),
+                        ("DEAL_ENTRY_OUT", "out"),
+                        ("DEAL_ENTRY_INOUT", "inout"),
+                        ("DEAL_ENTRY_OUT_BY", "out_by"),
+                        ("DEAL_ENTRY_STATE", "state")):
+        constant = getattr(mt5, name, None)
+        if constant is not None and value == constant:
+            return label
+    return "other"
+
+
+def _deal_type_name(value):
+    """mt5.DEAL_TYPE_* -> 'buy' / 'sell' / 'other'.
+
+    Only the entry deal's value is ever interpreted (a long's exit deal is a
+    sell, so reading side off an exit would invert every trade); balance,
+    credit and commission deals fall through to 'other' and are excluded from
+    the fold by having no position of their own.
+    """
+    if value == getattr(mt5, "DEAL_TYPE_BUY", -1):
+        return "buy"
+    if value == getattr(mt5, "DEAL_TYPE_SELL", -2):
+        return "sell"
+    return "other"
+
+
+def _deal_rows(history, symbol):
+    """MT5 deal objects -> rows for `deals`, restricted to THIS bot's positions.
+
+    S1 again, in the reporting path: history_deals_get returns every deal on
+    the symbol whatever opened it, and storing the lot would put the user's
+    manual trades on the bot's card and in its win rate.
+
+    Filtering by magic alone is not enough. A position closed by its own SL or
+    TP produces a deal generated by the broker's stop order, and its magic is
+    not guaranteed to carry the opening order's. So the pass is two-stage:
+    collect the position ids that have at least one deal bearing MAGIC_NUMBER,
+    then keep every deal on those positions. Without that, an SL-closed trade
+    would keep its entry and lose its exit -- and would sit in `trades`
+    permanently open, with the loss never counted.
+    """
+    ours = set()
+    for deal in history:
+        position_id = getattr(deal, "position_id", 0) or 0
+        if position_id and getattr(deal, "magic", 0) == MAGIC_NUMBER:
+            ours.add(position_id)
+
+    rows = []
+    for deal in history:
+        position_id = getattr(deal, "position_id", 0) or 0
+        if position_id not in ours:
+            continue
+        rows.append({
+            "ticket": int(deal.ticket),
+            "order_ticket": int(getattr(deal, "order", 0) or 0) or None,
+            "position_id": int(position_id),
+            "symbol": getattr(deal, "symbol", "") or symbol,
+            "magic": int(getattr(deal, "magic", 0) or 0),
+            "entry_kind": _deal_entry_kind(getattr(deal, "entry", None)),
+            "deal_type": _deal_type_name(getattr(deal, "type", None)),
+            "volume": float(getattr(deal, "volume", 0.0) or 0.0),
+            "price": float(getattr(deal, "price", 0.0) or 0.0),
+            "profit": float(getattr(deal, "profit", 0.0) or 0.0),
+            "commission": float(getattr(deal, "commission", 0.0) or 0.0),
+            "swap": float(getattr(deal, "swap", 0.0) or 0.0),
+            "fee": float(getattr(deal, "fee", 0.0) or 0.0),
+            "comment": getattr(deal, "comment", None) or None,
+            # MT5 reports deal times as a UNIX timestamp in the SERVER's clock.
+            # Stored as UTC so two hosts in different timezones agree on the
+            # ordering the trade fold depends on.
+            "dealt_at": datetime.utcfromtimestamp(int(getattr(deal, "time", 0) or 0)),
+        })
+    return rows
+
+
+# NOTE: no _load_settings() here any more. It needs Postgres, and importing this
+# module must not: `pytest`, the research scripts and `python -m backend.db.migrate`
+# all import their way past this line with no database running. The API calls
+# init_persistence() from its startup hook instead, where a failure can refuse
+# the boot rather than silently trade the code default.
 
 class TradingBot(threading.Thread):
     def __init__(self, symbol: str):
@@ -251,24 +412,56 @@ class TradingBot(threading.Thread):
         self.config = SYMBOL_CONFIG.get(symbol, SYMBOL_CONFIG["XAUUSDm"])
         self.running = False
         self._stop_event = threading.Event()
-        self._last_bar_time = None    # S4: last CLOSED bar already acted on
-        self._last_entry_bar = None   # S4: bar time of the most recent entry
-        self.stats = {
-            "last_close": 0.0,
-            "out": 0.0,
-            "upper": 0.0,
-            "lower": 0.0,
-            "status": "Stopped",
-            "trades_opened": 0,
-            "wins": 0,
-            "losses": 0,
-            "total_pl": 0.0,
-            "max_drawdown": 0.0
-        }
+
+        # S4: the once-per-closed-bar and COOLDOWN_BARS guards. Still held in
+        # memory because that is the hot path, but SEEDED FROM and WRITTEN
+        # THROUGH TO `bot_state` (see _load_bar_marks / _mark_bar).
+        #
+        # As instance attributes alone they started at None on every thread, so
+        # pressing Stop then Start cleared the cooldown and the bot could enter
+        # again on the very bar it had just entered on -- the repeat-fire S4
+        # exists to prevent, reachable from the dashboard's own buttons.
+        #
+        # Memory stays the working copy on purpose: if Postgres goes down the
+        # guards keep working for the life of the process, so an outage costs
+        # the durability and not the guard.
+        self._last_bar_time = None
+        self._last_entry_bar = None
+
+        # NOTE: there is no self.stats dict any more. Wins, losses, P&L and the
+        # trade count are SELECTs over `trades` (repo.trade_stats), which is
+        # folded from the raw MT5 deals -- derived, never accumulated, so a
+        # restart or a re-scanned history window cannot drift them. The
+        # envelope reading goes to `bot_snapshots` each cycle.
 
     def stop(self):
         self.running = False
         self._stop_event.set()
+
+    # ---- persisted per-bot state ---------------------------------------------
+
+    def _load_bar_marks(self):
+        """Adopt the stored S4 guards. Called once, as the thread starts."""
+        try:
+            last_bar, last_entry = repo.get_bar_marks(self.symbol)
+        except Exception as exc:
+            log("%s: could not read the stored bar marks -- %r" % (self.symbol, exc))
+            return
+        self._last_bar_time = last_bar
+        self._last_entry_bar = last_entry
+        if last_bar is not None or last_entry is not None:
+            log("%s: resumed bar marks last_bar=%s last_entry=%s"
+                % (self.symbol, last_bar, last_entry))
+
+    def _mark_bar(self, last_bar_time=None, last_entry_bar=None):
+        """Set a guard in memory and write it through. Best-effort on the write."""
+        if last_bar_time is not None:
+            self._last_bar_time = last_bar_time
+        if last_entry_bar is not None:
+            self._last_entry_bar = last_entry_bar
+        _persist("mark bars for %s" % self.symbol, repo.set_bar_marks,
+                 self.symbol, last_bar_time=last_bar_time,
+                 last_entry_bar=last_entry_bar)
 
     def calculate_envelope(self, df):
         """Delegates to the shared, vectorised indicator.
@@ -407,8 +600,24 @@ class TradingBot(threading.Thread):
             }
             if self._send(request, "%s entry" % action) is None:
                 return False
-        self.stats["trades_opened"] += 1
         log("%s: opened %s @ %.5f sl=%.5f tp=%.5f" % (self.symbol, action, price, sl, tp))
+        # The trade count is no longer incremented here. It was a counter on the
+        # thread, so it reset on every restart and counted an entry the broker
+        # might reject downstream; it is now COUNT(*) over `trades`, folded from
+        # the deals the broker actually reports.
+        #
+        # Reconciling here just brings the row forward -- the deal may not be in
+        # history yet, in which case the once-a-minute pass picks it up. The open
+        # position already shows on the card either way, from positions_get.
+        #
+        # Wrapped, and OUTSIDE the _CONFIG_LOCK, because the order has already
+        # gone through: reporting must never be able to fail an entry that the
+        # broker accepted, nor hold the sizing lock across an IPC history scan.
+        try:
+            self.reconcile_trades()
+        except Exception as exc:
+            log("%s: entry placed, but the history refresh failed -- %r"
+                % (self.symbol, exc))
         return True
 
     def close_position(self, position):
@@ -573,35 +782,76 @@ class TradingBot(threading.Thread):
                 log("%s: #%s stop moved to break-even %.5f"
                     % (self.symbol, position.ticket, entry))
 
-    def update_performance_stats(self):
-        """Calculates P&L, Wins, Losses from MT5 History."""
-        # Get history for the last 365 days
-        from_date = datetime.now() - timedelta(days=365)
-        history = mt5.history_deals_get(from_date, datetime.now(), group=f"*{self.symbol}*")
-        
-        if history is None or len(history) == 0:
-            return
+    def reconcile_trades(self, full=False):
+        """Copy this bot's MT5 deals into Postgres and re-fold them into trades.
 
-        # Filter by magic number to only count this bot's trades
-        bot_deals = [d for d in history if d.magic == MAGIC_NUMBER]
-        
-        total_pl = 0.0
-        wins = 0
-        losses = 0
-        
-        for deal in bot_deals:
-            # We only care about the closing deals (entry deals have 0 profit usually)
-            if deal.entry == mt5.DEAL_ENTRY_OUT:
-                profit = deal.profit
-                total_pl += profit
-                if profit > 0:
-                    wins += 1
-                elif profit < 0:
-                    losses += 1
+        Replaces update_performance_stats(), which summed P&L into an in-memory
+        dict on every pass. Two things change.
 
-        self.stats["total_pl"] = total_pl
-        self.stats["wins"] = wins
-        self.stats["losses"] = losses
+        **The window shrinks.** It scanned a full 365 days over IPC every time.
+        Here the default window starts a little before the newest stored deal,
+        because MT5 credits `swap` and `commission` to a deal after the fact and
+        an upsert has to be able to correct a row it has already seen. `full=True`
+        re-scans the whole year, which is what the first run after this change
+        does to backfill the history that was never stored.
+
+        **The unit becomes the position, not the closing deal.** The old loop
+        counted every DEAL_ENTRY_OUT as its own win or loss, so a trade that
+        scaled out and then stopped at break-even booked one win plus one flat --
+        two outcomes for one trade, the win rate lifted by the scale-out and no
+        loss recorded against it. That flattered exactly the rule the cached
+        gold data measures as NEGATIVE for expectancy (see CLAUDE.md). The fold
+        into `trades` groups by position_id, so one trade is one outcome decided
+        on net profit.
+        """
+        now = datetime.now()
+        from_date = now - timedelta(days=365)
+        if not full:
+            try:
+                newest = repo.latest_deal_time(self.symbol)
+            except Exception as exc:
+                log("%s: could not read the stored deal history -- %r"
+                    % (self.symbol, exc))
+                return False
+            if newest is not None:
+                # Overlap the window rather than resuming exactly at the newest
+                # deal: `swap` lands on a deal later, and the deal that closes a
+                # position can be timestamped before one already stored for
+                # another. A day of re-read costs nothing -- the upsert is keyed
+                # on the broker's own deal ticket.
+                candidate = newest.replace(tzinfo=None) - timedelta(days=1)
+                from_date = max(from_date, candidate)
+
+        history = mt5.history_deals_get(from_date, now, group="*%s*" % self.symbol)
+        if history is None:
+            log("%s: history_deals_get returned None (%s)"
+                % (self.symbol, mt5.last_error()))
+            return False
+
+        rows = _deal_rows(history, self.symbol)
+        if not rows:
+            return True
+        ok = _persist("store %d deals for %s" % (len(rows), self.symbol),
+                      repo.upsert_deals, rows)
+        if not ok:
+            return False
+        return _persist("rebuild trades for %s" % self.symbol,
+                        repo.rebuild_trades, self.symbol)
+
+    def _reconcile_quietly(self, full=False):
+        """reconcile_trades() that can only log. Never raises.
+
+        The live loop calls this instead of reconcile_trades() directly, so that
+        no failure in the REPORTING path -- a database blip, an MT5 history call
+        that throws -- can stop or delay the part of this thread that manages
+        real positions. `reconcile_trades` itself already returns False for the
+        failures it anticipates; this covers the ones it does not.
+        """
+        try:
+            return self.reconcile_trades(full=full)
+        except Exception as exc:
+            log("%s: trade history refresh failed -- %r" % (self.symbol, exc))
+            return False
 
     def _sleep(self, seconds):
         """Responsive sleep: wakes immediately on stop()."""
@@ -612,8 +862,22 @@ class TradingBot(threading.Thread):
 
     def run(self):
         self.running = True
-        self.stats["status"] = "Running"
-        last_stats_refresh = 0.0
+        # The S4 guards come back from `bot_state` BEFORE the first cycle, so a
+        # Stop/Start (or a process restart) resumes the cooldown instead of
+        # clearing it and re-entering on the bar it just entered on.
+        self._load_bar_marks()
+        _persist("mark %s running" % self.symbol, repo.set_snapshot_status,
+                 self.symbol, "Running", None)
+        # Backfill on the first pass: nothing before this change stored a deal,
+        # so the first reconcile has to read the whole year to build a history
+        # that the once-a-minute incremental pass then just keeps current.
+        #
+        # This runs BEFORE the while loop, so an exception here would kill the
+        # thread outright and the bot would never trade -- the same class of
+        # failure as reporting "Running" and never trading, just inverted.
+        # Reporting does not get to do that.
+        self._reconcile_quietly(full=True)
+        last_stats_refresh = time.time()
 
         while not self._stop_event.is_set():
             try:
@@ -633,8 +897,14 @@ class TradingBot(threading.Thread):
                 df = df.iloc[:-1].reset_index(drop=True)
 
                 if len(df) < MIN_USABLE_BARS:
-                    log("%s: only %d closed bars, need %d for a valid envelope; "
-                        "not trading" % (self.symbol, len(df), MIN_USABLE_BARS))
+                    # Reported on the card, not just in the log. All-NaN bands
+                    # compare False against every price, so this is the state in
+                    # which the bot says "Running" and never trades.
+                    short = ("only %d closed bars, need %d for a valid envelope"
+                             % (len(df), MIN_USABLE_BARS))
+                    log("%s: %s; not trading" % (self.symbol, short))
+                    _persist("record warm-up shortfall for %s" % self.symbol,
+                             repo.set_snapshot_status, self.symbol, "Running", short)
                     self._sleep(30)
                     continue
 
@@ -645,26 +915,46 @@ class TradingBot(threading.Thread):
                 upper = upper_arr[-1]
                 lower = lower_arr[-1]
 
-                self.stats.update({
-                    "last_close": current_close,
-                    "out": out_arr,
-                    "upper": upper_arr,
-                    "lower": lower_arr,
-                })
+                # Fetched ONCE per cycle and reused below. The snapshot wants
+                # the count and rule S7 wants the positions themselves; two
+                # calls would be two round trips over IPC on the signal path,
+                # which is the cost update_performance_stats() was throttled to
+                # once a minute to avoid.
+                positions = self.bot_positions()   # S1: this bot's positions only
 
-                # Refresh P&L at most once a minute. This is a 365-day history scan
-                # over IPC; it does not belong in the signal path on every tick.
+                # The latest reading goes to `bot_snapshots` instead of a dict on
+                # this thread. Only the last value of each array is stored: the
+                # dashboard reads one number per band, and get_bot_stats() used
+                # to carry the whole 1200-element array out of the thread just to
+                # take [-1] off it.
+                _persist("snapshot %s" % self.symbol, repo.save_snapshot,
+                         self.symbol, "Running",
+                         last_close=float(current_close),
+                         nw_out=_finite(out), nw_upper=_finite(upper),
+                         nw_lower=_finite(lower),
+                         bar_time=bar_time, open_positions=len(positions),
+                         detail=None)
+
+                # Reconcile at most once a minute. Cheaper than the 365-day scan
+                # it replaces -- the window now starts near the newest stored
+                # deal -- but it is still IPC and still does not belong in the
+                # signal path on every cycle.
                 now = time.time()
                 if now - last_stats_refresh >= 60:
-                    self.update_performance_stats()
+                    # Quietly: a reporting hiccup must not cost a trading cycle.
+                    # Unwrapped, it would fall to the loop's own handler, which
+                    # sleeps 10s and starts over -- so a database blip would
+                    # delay the scale-out check as well as the history.
+                    self._reconcile_quietly()
                     last_stats_refresh = now
 
                 if np.isnan(out) or np.isnan(upper) or np.isnan(lower):
                     log("%s: envelope is NaN, skipping this bar" % self.symbol)
+                    _persist("record NaN envelope for %s" % self.symbol,
+                             repo.set_snapshot_status, self.symbol, "Running",
+                             "envelope is NaN -- not trading this bar")
                     self._sleep(15)
                     continue
-
-                positions = self.bot_positions()   # S1: this bot's positions only
 
                 # S7: position MANAGEMENT runs every cycle, not once per bar. The
                 # break-even trigger is an intrabar event, so gating it on a new bar
@@ -697,10 +987,10 @@ class TradingBot(threading.Thread):
                         pass  # still inside the post-entry cooldown
                     elif current_close < lower:
                         if self.open_trade("BUY"):
-                            self._last_entry_bar = bar_time
+                            self._mark_bar(last_entry_bar=bar_time)
                     elif current_close > upper:
                         if self.open_trade("SELL"):
-                            self._last_entry_bar = bar_time
+                            self._mark_bar(last_entry_bar=bar_time)
                 else:
                     for pos in positions:
                         if pos.type == mt5.POSITION_TYPE_BUY and current_close >= out:
@@ -708,14 +998,23 @@ class TradingBot(threading.Thread):
                         elif pos.type == mt5.POSITION_TYPE_SELL and current_close <= out:
                             self.close_position(pos)
 
-                self._last_bar_time = bar_time
+                self._mark_bar(last_bar_time=bar_time)
                 self._sleep(15)
 
             except Exception as e:
                 log("Bot Error (%s): %r" % (self.symbol, e))
+                # Surfaced on the card as well as the log. A thread that keeps
+                # looping on the same exception previously showed a healthy
+                # "Running" with the reason visible only to whoever was tailing
+                # stdout.
+                _persist("record error for %s" % self.symbol,
+                         repo.set_bot_error, self.symbol, repr(e))
+                _persist("record error status for %s" % self.symbol,
+                         repo.set_snapshot_status, self.symbol, "Running", repr(e))
                 self._sleep(10)
 
-        self.stats["status"] = "Stopped"
+        _persist("mark %s stopped" % self.symbol, repo.set_snapshot_status,
+                 self.symbol, "Stopped", None)
         self.running = False
 
 
@@ -864,34 +1163,103 @@ def simulate_legacy(df, outs, uppers, lowers, config, initial_balance,
     }
 
 
+# Auto-resume is OFF by default, and that is a safety decision rather than an
+# oversight. `bot_state.desired_state` records what the user last asked for so a
+# restart can SHOW that a bot was running, but starting live trading with real
+# money because a process came back up is not something an unauthenticated API
+# should decide on its own -- see the Safety section of CLAUDE.md. The dashboard
+# surfaces the disagreement and offers the button; a human presses it. Set
+# BOT_AUTO_RESUME=1 to opt in.
+AUTO_RESUME = os.environ.get("BOT_AUTO_RESUME", "0").strip().lower() in ("1", "true", "yes")
+
+
 class BotManager:
     def __init__(self):
         self.bots: Dict[str, TradingBot] = {}
         if not mt5.initialize():
             log("MT5 Init Failed: %s" % (mt5.last_error(),))
 
+    # ---- control ------------------------------------------------------------
+
     def start_bot(self, symbol: str):
+        """Start the thread, and record that a start was ASKED FOR.
+
+        The control event is written whether the answer was yes or no: POST
+        /control has no authentication, so what it was asked to do is worth
+        recording even when it was refused.
+        """
         if symbol.upper() not in [s.upper() for s in SUPPORTED_SYMBOLS]:
-            log("Bot only supports: %s. Received: %s" % (", ".join(SUPPORTED_SYMBOLS), symbol))
-            return
+            detail = ("Bot only supports: %s. Received: %s"
+                      % (", ".join(SUPPORTED_SYMBOLS), symbol))
+            log(detail)
+            _persist("log control event", repo.record_control_event,
+                     symbol, "start", False, detail)
+            return False
 
         if symbol in self.bots and self.bots[symbol].is_alive():
-            return
+            _persist("log control event", repo.record_control_event,
+                     symbol, "start", True, "already running")
+            return True
 
-        old_stats = dict(self.bots[symbol].stats) if symbol in self.bots else None
+        # No stats hand-off across the thread replacement any more. It existed to
+        # carry an in-memory counter onto the new thread; the counters now live in
+        # `trades` and `bot_snapshots`, which the new thread reads for itself.
+        # Losing that dance also loses the defect it papered over: the trade count
+        # was per-process, so it disagreed with the broker's own history after any
+        # restart, and "never hide losing trades" cannot survive a counter that
+        # resets.
+        _persist("record desired state", repo.set_desired_state, symbol, "running")
         self.bots[symbol] = TradingBot(symbol)
-        if old_stats:
-            old_stats.pop("status", None)  # never resurrect a stale status
-            self.bots[symbol].stats.update(old_stats)
-        
         self.bots[symbol].start()
-        
+        _persist("log control event", repo.record_control_event,
+                 symbol, "start", True, None)
+        return True
+
     def stop_bot(self, symbol: str):
+        _persist("record desired state", repo.set_desired_state, symbol, "stopped")
         if symbol in self.bots:
             self.bots[symbol].stop()
+            _persist("log control event", repo.record_control_event,
+                     symbol, "stop", True, None)
+            return True
+        # Still a real outcome: desired_state is now 'stopped', which is what a
+        # restart reads, so the press was not a no-op even with no thread to stop.
+        _persist("log control event", repo.record_control_event,
+                 symbol, "stop", True, "no running thread")
+        return True
+
+    def resume_desired_bots(self):
+        """Restart the bots that were running before the process went down.
+
+        Gated on AUTO_RESUME. With it off -- the default -- this only logs what
+        it declined to do, and the disagreement between `desired_state` and the
+        live status is reported by /stats for the dashboard to act on.
+        """
+        try:
+            states = repo.get_bot_states()
+        except Exception as exc:
+            log("db: could not read the desired bot states -- %r" % exc)
+            return []
+        wanted = [sym for sym, row in states.items()
+                  if row.get("desired_state") == "running" and sym in SYMBOL_CONFIG]
+        if not wanted:
+            return []
+        if not AUTO_RESUME:
+            log("startup: %s was running before shutdown; NOT auto-started "
+                "(set BOT_AUTO_RESUME=1 to change that)" % ", ".join(sorted(wanted)))
+            return []
+        for symbol in sorted(wanted):
+            log("startup: BOT_AUTO_RESUME is set -- restarting %s" % symbol)
+            self.start_bot(symbol)
+        return sorted(wanted)
 
     def stop_all(self):
-        """S6: stop every bot and join briefly, so shutdown cannot hang."""
+        """S6: stop every bot and join briefly, so shutdown cannot hang.
+
+        Deliberately does NOT write desired_state='stopped'. A process going
+        down is not the user changing their mind, and overwriting the desired
+        state here would erase the one fact a restart needs.
+        """
         for symbol, bot in list(self.bots.items()):
             bot.stop()
         for symbol, bot in list(self.bots.items()):
@@ -901,15 +1269,100 @@ class BotManager:
                     log("%s: bot thread did not stop within 5s" % symbol)
         mt5.shutdown()
 
+    # ---- reporting ----------------------------------------------------------
+
     def get_bot_stats(self, symbol: str):
-        if symbol in self.bots:
-            stats = self.bots[symbol].stats.copy()
-            # Convert numpy arrays to latest scalar values for JSON serialization
-            for key in ["out", "upper", "lower"]:
-                if isinstance(stats[key], np.ndarray):
-                    stats[key] = float(stats[key][-1]) if len(stats[key]) > 0 else 0.0
-            return stats
-        return {"status": "Stopped"}
+        """Everything the dashboard card shows, read from Postgres.
+
+        Nothing here is accumulated in this process. `status` is the LIVE thread
+        state and `desired_state` is what was last asked for; both are returned
+        because they can legitimately disagree -- a crashed thread used to keep
+        reporting the "Running" its own stats dict still held.
+        """
+        bot = self.bots.get(symbol)
+        alive = bool(bot is not None and bot.is_alive())
+        out = {
+            "symbol": symbol,
+            "status": "Running" if alive else "Stopped",
+            "last_close": 0.0,
+            "out": 0.0,
+            "upper": 0.0,
+            "lower": 0.0,
+            "trades_opened": 0,
+            "wins": 0,
+            "losses": 0,
+            "total_pl": 0.0,
+            "max_drawdown": 0.0,
+            "desired_state": "stopped",
+            "persisted": False,
+        }
+        try:
+            snapshot = repo.get_snapshots().get(symbol)
+            state = repo.get_bot_state(symbol) or {}
+            stats = repo.trade_stats(symbol)
+        except Exception as exc:
+            # Report the outage rather than serving zeros, which are
+            # indistinguishable from a healthy bot that has never traded.
+            out["error"] = "Trade history unavailable: %s" % exc
+            return out
+
+        if snapshot:
+            out.update({
+                # The bands persist across a stop, so a stopped card shows where
+                # the envelope actually was instead of 0.00.
+                "last_close": snapshot.get("last_close") or 0.0,
+                "out": snapshot.get("nw_out") or 0.0,
+                "upper": snapshot.get("nw_upper") or 0.0,
+                "lower": snapshot.get("nw_lower") or 0.0,
+                "bar_time": snapshot.get("bar_time"),
+                "open_positions": snapshot.get("open_positions") or 0,
+                "detail": snapshot.get("detail"),
+                "updated_at": snapshot.get("updated_at"),
+            })
+        out.update({
+            "trades_opened": stats["trades_total"],
+            "trades_open": stats["trades_open"],
+            "trades_closed": stats["trades_closed"],
+            "wins": stats["wins"],
+            "losses": stats["losses"],
+            "breakeven": stats["breakeven"],
+            "scaled_out": stats["scaled_out"],
+            "win_rate": stats["win_rate"],
+            "total_pl": stats["total_pl"],
+            "gross_pl": stats["gross_pl"],
+            "costs": stats["costs"],
+            "avg_win": stats["avg_win"],
+            "avg_loss": stats["avg_loss"],
+            # Realised, closed-trade drawdown in account currency -- see
+            # repo.trade_stats. The stat this replaces was initialised to 0.0
+            # and never written to at all.
+            "max_drawdown": stats["max_drawdown"],
+            "last_closed_at": stats["last_closed_at"],
+            "desired_state": state.get("desired_state", "stopped"),
+            "last_error": state.get("last_error"),
+            "last_bar_time": state.get("last_bar_time"),
+            "last_entry_bar": state.get("last_entry_bar"),
+            "persisted": True,
+        })
+        return out
+
+    def reconcile_all(self, full=False):
+        """Refresh the stored trade history for every configured symbol.
+
+        Called at boot, so the dashboard has a history before any bot is
+        started. The old code only ever learned about trades from a running
+        thread, so a fresh process reported zero trades until someone pressed
+        Start -- on an account that may have been trading for a year.
+        """
+        done = {}
+        for symbol in SUPPORTED_SYMBOLS:
+            bot = self.bots.get(symbol) or TradingBot(symbol)
+            try:
+                done[symbol] = bot.reconcile_trades(full=full)
+            except Exception as exc:
+                log("%s: reconcile failed -- %r" % (symbol, exc))
+                done[symbol] = False
+        return done
 
     # ---- sizing -------------------------------------------------------------
 
@@ -1024,9 +1477,18 @@ class BotManager:
                         notes.append("Scale-out will fill %g lots -- the volume step "
                                      "is %g." % (fills, step))
 
-            cfg["lot_size"] = new_lot
-            cfg["partial_fraction"] = new_fraction
-            _save_settings()
+            # The write happens BEFORE SYMBOL_CONFIG is updated, and is allowed
+            # to raise. Postgres now holds the sizing, so an in-memory value
+            # that the database refused would be traded for the rest of the
+            # process and then vanish on restart -- the same silent-restore
+            # failure from the other direction. Refuse the edit visibly instead:
+            # the caller turns DatabaseUnavailable into a message on the form,
+            # exactly as it does ConfigRejected.
+            _persist_settings = repo.save_settings(
+                symbol, new_lot, new_fraction, source="api",
+                notes=notes or None)
+            cfg["lot_size"] = _persist_settings["lot_size"]
+            cfg["partial_fraction"] = _persist_settings["partial_fraction"]
 
         log("%s: sizing set to lot_size=%g partial_fraction=%.4f (%g lots out)"
             % (symbol, new_lot, new_fraction, new_lot * new_fraction))
@@ -1065,14 +1527,75 @@ class BotManager:
         return simulate_legacy(df, outs, uppers, lowers, config, initial_balance,
                                volume_min=vol_min, volume_step=step)
 
+    # ---- account ------------------------------------------------------------
+
+    # How stale a stored account snapshot may be before it is re-captured. The
+    # period profits behind it are four history_deals_get() calls over IPC and
+    # the dashboard polls every 5 SECONDS, so the un-throttled version ran ~2880
+    # year-long history scans an hour. That is the same mistake
+    # update_performance_stats() was throttled to once a minute to avoid,
+    # repeated in the account panel.
+    ACCOUNT_SNAPSHOT_MAX_AGE = float(os.environ.get("BOT_ACCOUNT_SNAPSHOT_SECONDS", "60"))
+
     def get_account_info(self):
+        """The account panel, served from `account_snapshots`.
+
+        A fresh reading is captured at most once a minute; every other call
+        reads the stored row back. The rows also accumulate into an equity
+        curve, which nothing in the live path recorded before.
+
+        `time_profits` stays ACCOUNT-WIDE -- every deal, any magic -- because
+        that is what this panel has always shown. The bot's own figures come
+        from `trades` and are its positions only (S1); mixing the two would
+        answer neither question.
+        """
+        try:
+            age = repo.account_snapshot_age_seconds()
+        except Exception as exc:
+            # No stored row to fall back on, so read MT5 directly rather than
+            # showing an empty panel.
+            log("db: could not read the account snapshot age -- %r" % exc)
+            age = None
+            captured = self._capture_account_snapshot(persist=False)
+            return captured or {}
+
+        if age is None or age >= self.ACCOUNT_SNAPSHOT_MAX_AGE:
+            captured = self._capture_account_snapshot(persist=True)
+            if captured is not None:
+                return captured
+
+        try:
+            row = repo.latest_account_snapshot()
+        except Exception as exc:
+            log("db: could not read the account snapshot -- %r" % exc)
+            return {}
+        if row is None:
+            return {}
+        return {
+            "balance": row.get("balance") or 0.0,
+            "equity": row.get("equity") or 0.0,
+            "profit": row.get("profit") or 0.0,
+            "leverage": row.get("leverage") or 0,
+            "margin": row.get("margin") or 0.0,
+            "drawdown": row.get("drawdown_pct") or 0.0,
+            "time_profits": dict(row.get("period_profits") or {}),
+            "captured_at": row.get("captured_at"),
+            "stale": False,
+        }
+
+    def _capture_account_snapshot(self, persist=True):
+        """Read MT5 once and (optionally) store the result. None if MT5 is down.
+
+        Returning None rather than zeros matters: a balance of 0 with an equity
+        of 0 renders as a real, empty account, while None lets the caller fall
+        back to the last stored reading and say when it was taken.
+        """
         acc = mt5.account_info()
-        if acc is None: return {}
-        
-        # Convert named tuple to dict
-        acc_dict = acc._asdict() if hasattr(acc, '_asdict') else dict(acc)
-        
-        # Calculate time-based profits
+        if acc is None:
+            log("account: account_info() returned None (%s)" % (mt5.last_error(),))
+            return None
+        acc_dict = acc._asdict() if hasattr(acc, "_asdict") else dict(acc)
+
         now = datetime.now()
         time_frames = {
             "daily": now - timedelta(days=1),
@@ -1080,21 +1603,54 @@ class BotManager:
             "monthly": now - timedelta(days=30),
             "yearly": now - timedelta(days=365),
         }
-        
         profits = {}
         for label, start_date in time_frames.items():
             history = mt5.history_deals_get(start_date, now)
             if history:
-                profits[label] = sum(d.profit for d in history if d.entry == mt5.DEAL_ENTRY_OUT)
+                # Costs included. The old sum was `d.profit` alone, which reports
+                # the gross and calls it profit -- commission and swap are real
+                # money and are already signed negative by MT5.
+                profits[label] = sum(
+                    d.profit + getattr(d, "commission", 0.0) + getattr(d, "swap", 0.0)
+                    + getattr(d, "fee", 0.0)
+                    for d in history if d.entry == mt5.DEAL_ENTRY_OUT)
             else:
                 profits[label] = 0.0
 
-        return {
-            "balance": acc_dict.get("balance", 0),
-            "equity": acc_dict.get("equity", 0),
-            "profit": acc_dict.get("profit", 0),
-            "leverage": acc_dict.get("leverage", 0),
-            "margin": acc_dict.get("margin", 0),
-            "drawdown": ((acc_dict.get("balance", 0) - acc_dict.get("equity", 0)) / acc_dict.get("balance", 1) * 100) if acc_dict.get("balance", 0) != 0 else 0,
-            "time_profits": profits
+        balance = float(acc_dict.get("balance", 0) or 0)
+        equity = float(acc_dict.get("equity", 0) or 0)
+        values = {
+            "login": acc_dict.get("login"),
+            "currency": acc_dict.get("currency"),
+            "balance": balance,
+            "equity": equity,
+            "profit": float(acc_dict.get("profit", 0) or 0),
+            "margin": float(acc_dict.get("margin", 0) or 0),
+            "margin_free": float(acc_dict.get("margin_free", 0) or 0),
+            "leverage": acc_dict.get("leverage"),
+            "drawdown_pct": ((balance - equity) / balance * 100.0) if balance else 0.0,
         }
+
+        captured_at = now
+        if persist:
+            try:
+                stored = repo.save_account_snapshot(values, profits)
+                captured_at = stored.get("captured_at", now)
+            except Exception as exc:
+                log("db: could not store the account snapshot -- %r" % exc)
+
+        return {
+            "balance": values["balance"],
+            "equity": values["equity"],
+            "profit": values["profit"],
+            "leverage": values["leverage"] or 0,
+            "margin": values["margin"],
+            "drawdown": values["drawdown_pct"],
+            "time_profits": profits,
+            "captured_at": captured_at,
+            "stale": False,
+        }
+
+    def equity_curve(self, limit=500):
+        """Balance/equity samples, oldest first, for charting."""
+        return repo.account_equity_curve(limit=limit)

@@ -80,10 +80,22 @@ logged-in terminal, but nothing else does.
 | Runs on the **dev box** (no MT5) | Runs on the **MT5 host** |
 |---|---|
 | All code, the full test suite | `snapshot` CLI → produces `data/` |
-| Backtests, baseline reports, sweeps | The live bot |
+| Backtests, baseline reports, sweeps | The live bot + the API |
 
 The handoff is the `data/` directory: snapshot once on the trading host, copy it
 to the dev box, and all research then runs offline and reproducibly.
+
+Two of the three pieces are **containerised** — the dashboard and Postgres
+(`docker/`). The backend is not, and cannot be: it imports `MetaTrader5`, which
+needs a logged-in Windows terminal. Both containers publish to `127.0.0.1` only,
+and nginx serves the dashboard without proxying the API, so the API stays on
+loopback — see [`docker/README.md`](docker/README.md).
+
+**Postgres holds everything the UI can change, and every trade.** Position
+sizing (previously `data/settings.json`), the trade history folded from MT5's own
+deals, every backtest run with its inputs, bot run state, and the dashboard's
+theme and form values (previously `localStorage`). The bar cache stays in
+`data/*.csv.gz`: the research stack must keep running with no database at all.
 
 Exactly two modules import `MetaTrader5` — `backend/data/mt5_source.py` (reads)
 and `backend/execution/` (writes). Everything else is importable and testable
@@ -91,16 +103,24 @@ without a terminal.
 
 ```
 backend/
-  main.py                       FastAPI app: /stats, /control, /settings, /backtest
+  main.py                       FastAPI app: /stats /control /settings /backtest
+                                /trades /backtests /preferences /health /equity
   bot_manager.py                Live trading loop (MT5)
   core/types.py                 SymbolSpec, Signal, Side  (contract-accurate P&L)
+  db/                           Postgres: pool, schema.sql, repository, migrate CLI
   indicators/nadaraya_watson.py Vectorised envelope + naive reference
   strategy/nw_envelope.py       The strategy — shared by live and backtest
   data/                         MarketData abstraction, csv.gz cache, snapshot CLI
   backtest/                     Engine, cost model, trade ledger, metrics
   scripts/run_baseline.py       Baseline performance report
-frontend/                       React dashboard + backtest page
-tests/                          pytest suite (runs with no MT5)
+frontend/src/
+  App.tsx                       Dashboard
+  BacktestPage.tsx              Backtester + stored run history
+  TradesPage.tsx                Persisted trade history
+  api.ts                        The only place a URL is known
+  usePreferences.ts             Dashboard state, persisted to Postgres
+docker/                         frontend (nginx) + db (postgres) compose stack
+tests/                          pytest suite (runs with no MT5 and no Postgres)
 data/                           Bar cache + reports (gitignored)
 ```
 
@@ -127,11 +147,13 @@ Per-symbol settings are in `SYMBOL_CONFIG` in the same file (`lot_size`,
 `sl_pips`, `tp_pips`, `pip`).
 
 `lot_size` and `partial_fraction` are also editable at runtime from the dashboard's
-**Position sizing** panel and from the Backtest page, and are persisted to
-`data/settings.json` so a restart does not quietly restore a size you lowered. Every
+**Position sizing** panel and from the Backtest page, and are persisted to the
+`symbol_settings` table so a restart does not quietly restore a size you lowered. Every
 other key is code-only. The panel takes **lots** (0.1 and 0.05); the scale-out is stored
 as the resulting share of the position, so it keeps meaning "half" if you later change
-the lot size. Edits are refused while the bot holds a position.
+the lot size. Edits are refused while the bot holds a position — and refused, rather
+than applied in memory, if the database will not accept them. Every change is
+appended to `settings_audit`, which the dashboard shows under **Show sizing history**.
 
 Server settings come from the environment:
 
@@ -140,7 +162,40 @@ Server settings come from the environment:
 | `BOT_HOST` | `127.0.0.1` | **Do not expose this port** — `/control` and `/settings` have no auth |
 | `BOT_PORT` | `8000` | |
 | `BOT_ALLOWED_ORIGINS` | `http://localhost:3000,http://127.0.0.1:3000` | CORS allowlist |
-| `BOT_SETTINGS_FILE` | `data/settings.json` | Where runtime lot sizing is persisted |
+| `BOT_DATABASE_URL` | `postgresql://bot:bot@127.0.0.1:5432/tradingbot` | Matches `docker/docker-compose.yml` |
+| `BOT_AUTO_RESUME` | `0` | Restart bots that were running before a shutdown. **Off by default** — see below |
+| `BOT_ACCOUNT_SNAPSHOT_SECONDS` | `60` | How stale a stored account reading may be before it is re-captured |
+| `BOT_SETTINGS_FILE` | `data/settings.json` | **No longer read.** Only `backend.db.migrate` uses it, to import once |
+
+Container settings live in `docker/.env` (copy `docker/.env.example`):
+`POSTGRES_PASSWORD`, `POSTGRES_PORT`, `FRONTEND_PORT`, and `BOT_API_BASE` — the
+API URL injected into the page at container start.
+
+### Auto-resume is off by default
+
+`bot_state.desired_state` records what you last asked for, so after a restart the
+dashboard can tell you a bot *was* running and offer to start it again. It does
+not start it for you: bringing live trading back up with real money because a
+process restarted is not a decision an unauthenticated API should make on its
+own. `/stats` returns the live thread status and the desired state separately —
+collapsing them into one word is how a dead bot comes to report "Running".
+
+### What is stored
+
+| Table | Holds |
+|---|---|
+| `symbol_settings` + `settings_audit` | position sizing, and every change to it |
+| `deals` / `trades` | MT5's raw deals, and one row per **position** folded from them |
+| `bot_state` / `control_events` | desired run state, the per-bar entry guards, every start/stop press |
+| `bot_snapshots` | the latest envelope reading per symbol |
+| `backtest_runs` | every backtest, inputs and outputs, failures included |
+| `ui_preferences` | theme, active view, backtest form values |
+| `account_snapshots` | throttled account readings, which accumulate an equity curve |
+
+Trade statistics are **queries** over `trades`, never counters — so a restart, a
+double poll, or a re-scanned history window cannot make them drift. One trade is
+one outcome, decided on net profit: a trade that banks a scale-out and then stops
+at break-even is one row with `exit_count = 2`, not a win plus a flat.
 
 ---
 
@@ -149,8 +204,15 @@ Server settings come from the environment:
 ```bash
 pip install -r requirements.txt
 pip install -r requirements-dev.txt
-python -m pytest                      # works without MetaTrader 5 installed
+python -m pytest                      # no MetaTrader 5 and no Postgres needed
+npm test --prefix frontend            # dashboard tests
 ```
+
+`tests/test_db_repository.py` exercises the SQL against a real server and
+**skips itself** when none answers, so the default suite stays offline. To run
+it: `docker compose -f docker/docker-compose.yml up -d db` then
+`python -m backend.db.migrate`. It works in a throwaway schema, so it cannot
+touch the lot size the bot actually trades.
 
 The suite covers indicator parity against the original loop, a no-look-ahead
 property test, warm-up handling, cost accounting, and the engine's intrabar and
@@ -199,6 +261,7 @@ engine so you can see how much it was overstating results.
    since `XAUUSD` and `XAUUSDm` are different symbols.
 4. The symbol visible in MT5's **Market Watch** (right-click → Show All).
 5. **Algo Trading enabled** in the terminal (the toolbar button must be green).
+6. **Docker**, for Postgres and the dashboard container.
 
 ### Step 1 — Install
 
@@ -207,10 +270,27 @@ pip install -r requirements.txt
 npm install --prefix frontend
 ```
 
-### Step 2 — Verify the setup
+### Step 2 — Start Postgres and apply the schema
+
+```bash
+docker compose -f docker/docker-compose.yml up -d
+python -m backend.db.migrate
+```
+
+The backend **will not start** without a reachable, migrated database, and that
+is deliberate: `lot_size` lives there and it is the only risk control this bot
+has, so falling back to the 0.1 default because the database was down would
+quietly restore ~$70/trade for someone who had lowered it on purpose.
+
+`migrate` imports an existing `data/settings.json` **once** so a size you chose
+is carried over, then leaves the database value alone on every later run.
+`python -m backend.db.migrate --check` reports status without changing anything.
+
+### Step 3 — Verify the setup
 
 ```bash
 python -m pytest                                     # should pass
+python -m backend.db.migrate --check                 # schema version 1
 python -m backend.data.snapshot --symbol XAUUSDm --spec-only
 ```
 
@@ -219,7 +299,7 @@ real contract specification — contract size, tick value, minimum stop distance
 allowed filling modes, and the server-to-UTC offset. If it fails here, the bot
 will not trade either.
 
-### Step 3 — Start the backend
+### Step 4 — Start the backend
 
 ```bash
 python -m backend.main
@@ -229,27 +309,31 @@ Serves on `http://127.0.0.1:8000`. Loopback-only by design: `POST /control`
 starts and stops live trading and `POST /settings` changes its position size, both
 with **no authentication**, so do not set `BOT_HOST=0.0.0.0` on an untrusted network.
 
-### Step 4 — Start the frontend
+### Step 5 — Open the dashboard
+
+The container from Step 2 already serves it on `http://localhost:3000`. For
+development with hot reload, use the dev server instead:
 
 ```bash
 npm start --prefix frontend
 ```
 
-Opens `http://localhost:3000`.
+Either way the **browser** calls the API on `127.0.0.1:8000` directly; nginx
+does not proxy it. That is what lets the API stay bound to loopback.
 
-Or run both in one terminal:
+Or run backend and dev server together:
 
 ```bash
 npx concurrently "python -m backend.main" "npm start --prefix frontend"
 ```
 
-### Step 5 — Test before risking capital
+### Step 6 — Test before risking capital
 
 Point MT5 at a **demo account** and run the dashboard against it first. Confirm
 that trades open and close as expected, and watch the backend log — every
 rejected order now prints its retcode and the broker's comment.
 
-### Step 6 — Start trading
+### Step 7 — Start trading
 
 Press **Start** on the dashboard for the symbol you want. The bot will:
 

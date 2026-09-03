@@ -1,12 +1,31 @@
-import React, { useState, useEffect } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import './App.css';
 import BacktestPage from './BacktestPage';
-
-const API_BASE = 'http://localhost:8000';
+import TradesPage from './TradesPage';
+import {
+  ApiError,
+  Health,
+  SettingsChange,
+  controlBot,
+  getHealth,
+  getSettings,
+  getSettingsHistory,
+  getStats,
+  saveSizing,
+} from './api';
+import { usePreferences } from './usePreferences';
 
 const Skeleton = ({ className = '' }: { className?: string }) => (
   <div className={`skeleton ${className}`} />
 );
+
+type View = 'dashboard' | 'backtest' | 'trades';
+const VIEWS: View[] = ['dashboard', 'backtest', 'trades'];
+const VIEW_LABELS: Record<View, string> = {
+  dashboard: 'Dashboard',
+  backtest: 'Backtest',
+  trades: 'Trades',
+};
 
 // Signature device: a stylized Nadaraya-Watson kernel-regression envelope —
 // the exact smoothed mean + upper/lower bands these bots trade against.
@@ -60,6 +79,104 @@ const BotCardSkeleton = () => (
   </div>
 );
 
+// The backend refuses to boot without Postgres -- it holds `lot_size`, the only
+// risk control this bot has. But the database can go down AFTER boot, and then
+// /stats answers with an `error` per bot instead of numbers. Say which of the
+// two is broken and print the command that fixes it, rather than leaving the
+// dashboard to show a plausible-looking flat, never-traded bot.
+const DatabaseBanner = ({ health }: { health: Health | null }) => {
+  if (!health || (health.database.reachable && health.database.tables_present)) return null;
+  const { reachable, url, migrate_command, schema_version } = health.database;
+  return (
+    <div className="error-banner db-banner">
+      <span>🗄️</span>
+      <div>
+        <p>
+          {!reachable
+            ? `Postgres at ${url} is not reachable. Nothing is being persisted — trade history, sizing changes and preferences are all being dropped.`
+            : `Postgres is reachable but the schema is incomplete (version ${schema_version}).`}
+        </p>
+        <code className="db-banner-cmd">{migrate_command}</code>
+      </div>
+    </div>
+  );
+};
+
+// The bot was running when the process went down and has not been restarted.
+// Reported rather than acted on: restarting live trading with real money because
+// a process came back up is not something an unauthenticated API should decide
+// on its own, so the disagreement is surfaced and a human presses the button.
+const ResumeNotice = ({
+  symbol,
+  onStart,
+}: {
+  symbol: string;
+  onStart: () => void;
+}) => (
+  <div className="resume-notice">
+    <span>
+      <b>{symbol}</b> was running before the last shutdown and was not
+      auto-started.
+    </span>
+    <button className="btn btn-start btn-inline" onClick={onStart}>
+      Start again
+    </button>
+  </div>
+);
+
+const SizingHistory = ({ symbol }: { symbol: string }) => {
+  const [rows, setRows] = useState<SettingsChange[] | null>(null);
+  const [open, setOpen] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = async () => {
+    try {
+      const res = await getSettingsHistory(symbol, 10);
+      setRows(res.history);
+    } catch (e: any) {
+      setError(e?.message || 'Could not load the sizing history.');
+    }
+  };
+
+  const toggle = () => {
+    const next = !open;
+    setOpen(next);
+    if (next && rows === null) load();
+  };
+
+  return (
+    <div className="sizing-history">
+      <button className="link-btn" onClick={toggle}>
+        {open ? 'Hide' : 'Show'} sizing history
+      </button>
+      {open && (
+        <>
+          {error && <p className="sizing-msg err">{error}</p>}
+          {rows && !rows.length && <p className="sizing-hint muted">No changes recorded.</p>}
+          {rows && rows.length > 0 && (
+            <ul className="history-list">
+              {rows.map(r => (
+                <li key={r.id}>
+                  <span className="history-when">
+                    {new Date(r.created_at).toISOString().slice(0, 16).replace('T', ' ')}
+                  </span>
+                  <span>
+                    {r.prev_lot_size !== null && r.prev_lot_size !== r.lot_size
+                      ? `${r.prev_lot_size} → ${r.lot_size} lots`
+                      : `${r.lot_size} lots`}
+                    {' · '}
+                    {(r.partial_fraction * 100).toFixed(0)}% scale-out
+                  </span>
+                  <span className="history-source">{r.source}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </>
+      )}
+    </div>
+  );
+};
 
 // Editing this changes the size of REAL orders, so two things are on the card and
 // not buried: the dollar risk of whatever is currently typed, and the fact that the
@@ -101,16 +218,7 @@ const SizingEditor = ({ symbol, sizing, onSaved }: { symbol: string; sizing: any
     setBusy(true);
     setMsg(null);
     try {
-      const res = await fetch(`${API_BASE}/settings`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ symbol, lot_size: lotNum, scale_out_lots: outNum }),
-      });
-      const data = await res.json();
-      if (data.error) {
-        setMsg({ ok: false, text: data.error });
-        return;
-      }
+      const data = await saveSizing(symbol, lotNum, outNum);
       // Show what was actually applied, not what was typed: the backend snaps to
       // the broker's volume step, so 0.155 comes back as 0.16.
       setLot(String(data.lot_size));
@@ -118,8 +226,11 @@ const SizingEditor = ({ symbol, sizing, onSaved }: { symbol: string; sizing: any
       setDirty(false);
       setMsg({ ok: true, text: data.notes?.length ? data.notes.join(' ') : 'Saved.' });
       onSaved();
-    } catch (e) {
-      setMsg({ ok: false, text: 'Could not reach the backend.' });
+    } catch (e: any) {
+      // Covers the refusal cases as well as a dead backend: /settings answers
+      // 200 with an { error } body when the edit is rejected, and api.ts turns
+      // that into a throw so both land here with the server's own words.
+      setMsg({ ok: false, text: e instanceof ApiError ? e.message : 'Could not reach the backend.' });
     } finally {
       setBusy(false);
     }
@@ -205,6 +316,8 @@ const SizingEditor = ({ symbol, sizing, onSaved }: { symbol: string; sizing: any
           Reset
         </button>
       </div>
+
+      <SizingHistory symbol={symbol} />
     </div>
   );
 };
@@ -212,52 +325,59 @@ const SizingEditor = ({ symbol, sizing, onSaved }: { symbol: string; sizing: any
 const Dashboard = () => {
   const [data, setData] = useState<any>(null);
   const [settings, setSettings] = useState<any>({});
+  const [health, setHealth] = useState<Health | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [theme, setTheme] = useState<'light' | 'dark'>('light');
-  const [view, setView] = useState<'dashboard' | 'backtest'>('dashboard');
 
+  // Theme and the active view come from Postgres now, not localStorage. Nothing
+  // the user chooses in this dashboard lives only in the browser.
+  const prefs = usePreferences();
+  const theme: 'light' | 'dark' = prefs.get<string>('theme', 'light') === 'dark' ? 'dark' : 'light';
+  const storedView = prefs.get<View>('view', 'dashboard');
+  const view: View = VIEWS.includes(storedView) ? storedView : 'dashboard';
+
+  // Applied as an effect rather than in the click handler, so the stored value
+  // is what paints on load -- the click only writes the preference.
   useEffect(() => {
-    const savedTheme = localStorage.getItem('theme') as 'light' | 'dark';
-    if (savedTheme) {
-      setTheme(savedTheme);
-      document.documentElement.setAttribute('data-theme', savedTheme);
-    }
-  }, []);
+    document.documentElement.setAttribute('data-theme', theme);
+  }, [theme]);
 
-  const toggleTheme = () => {
-    const newTheme = theme === 'light' ? 'dark' : 'light';
-    setTheme(newTheme);
-    document.documentElement.setAttribute('data-theme', newTheme);
-    localStorage.setItem('theme', newTheme);
-  };
+  const toggleTheme = () => prefs.update({ theme: theme === 'light' ? 'dark' : 'light' });
+  const setView = (next: View) => prefs.update({ view: next });
 
-  const fetchStats = async () => {
+  const fetchStats = useCallback(async () => {
     try {
-      const res = await fetch(`${API_BASE}/stats`);
-      if (!res.ok) throw new Error('Failed to fetch stats');
-      const json = await res.json();
+      const json = await getStats();
       setData(json);
       setError(null);
-    } catch (e) {
-      console.error("Failed to fetch stats", e);
+    } catch (e: any) {
+      console.error('Failed to fetch stats', e);
       setError('Failed to load dashboard data. Please check if the backend is running.');
     } finally {
       setLoading(false);
     }
-  };
+  }, []);
 
-  const fetchSettings = async () => {
+  const fetchSettings = useCallback(async () => {
     try {
-      const res = await fetch(`${API_BASE}/settings`);
-      if (!res.ok) return;
-      setSettings(await res.json());
+      setSettings(await getSettings());
     } catch (e) {
       // Deliberately quiet: the /stats poll already reports a dead backend, and a
       // second banner saying the same thing would just push the retry button off.
       console.error('Failed to fetch settings', e);
     }
-  };
+  }, []);
+
+  const fetchHealth = useCallback(async () => {
+    try {
+      setHealth(await getHealth());
+    } catch (e) {
+      // /health failing means the backend is down, which the /stats banner
+      // already says. Leave the last known value so the database banner does
+      // not flicker on one dropped poll.
+      console.error('Failed to fetch health', e);
+    }
+  }, []);
 
   useEffect(() => {
     const poll = () => {
@@ -265,42 +385,67 @@ const Dashboard = () => {
       fetchSettings();
     };
     poll();
+    fetchHealth();
     const interval = setInterval(poll, 5000);
-    return () => clearInterval(interval);
-  }, []);
+    // Health changes on the timescale of someone starting a container, not of a
+    // price tick, so it gets its own slower poll instead of riding the 5s one.
+    const healthInterval = setInterval(fetchHealth, 30000);
+    return () => {
+      clearInterval(interval);
+      clearInterval(healthInterval);
+    };
+  }, [fetchStats, fetchSettings, fetchHealth]);
 
-  const controlBot = async (symbol: string, action: 'start' | 'stop') => {
+  const control = async (symbol: string, action: 'start' | 'stop') => {
     try {
-      await fetch(`${API_BASE}/control`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ symbol, action }),
-      });
+      await controlBot(symbol, action);
       fetchStats();
     } catch (e) {
       console.error(`Failed to ${action} ${symbol}`, e);
     }
   };
 
-  if (loading) {
+  const header = (interactive: boolean) => (
+    <header className="dashboard-header">
+      <div className="header-left">
+        <div className="brand">
+          <span className="brand-mark">NW</span>
+          <div className="brand-text">
+            <h1>Nadaraya-Watson Desk</h1>
+            <span className="brand-sub">Kernel-regression execution terminal</span>
+          </div>
+        </div>
+        <nav className="nav-links">
+          {VIEWS.map(v => (
+            <button
+              key={v}
+              className={`nav-btn ${view === v ? 'active' : ''}`}
+              onClick={() => setView(v)}
+              disabled={!interactive}
+            >
+              {VIEW_LABELS[v]}
+            </button>
+          ))}
+        </nav>
+      </div>
+      {interactive ? (
+        <label className="theme-switch" title={theme === 'light' ? 'Switch to dark mode' : 'Switch to light mode'}>
+          <input type="checkbox" checked={theme === 'dark'} onChange={toggleTheme} />
+          <span className="switch-slider"></span>
+        </label>
+      ) : (
+        <Skeleton className="theme-toggle-skeleton" />
+      )}
+    </header>
+  );
+
+  // `prefs.ready` is part of the gate on purpose: rendering before the stored
+  // theme and view arrive would paint the defaults and then snap to the saved
+  // ones. The skeleton already existed for the /stats fetch; this reuses it.
+  if (loading || !prefs.ready) {
     return (
       <div className="dashboard-container">
-        <header className="dashboard-header">
-          <div className="header-left">
-            <div className="brand">
-              <span className="brand-mark">NW</span>
-              <div className="brand-text">
-                <h1>Nadaraya-Watson Desk</h1>
-                <span className="brand-sub">Kernel-regression execution terminal</span>
-              </div>
-            </div>
-            <nav className="nav-links">
-              <button className="nav-btn active" disabled>Dashboard</button>
-              <button className="nav-btn" disabled>Backtest</button>
-            </nav>
-          </div>
-          <Skeleton className="theme-toggle-skeleton" />
-        </header>
+        {header(false)}
         <EnvelopeCurve />
         <div className="stats-grid">
           {[...Array(4)].map((_, i) => <StatCardSkeleton key={i} />)}
@@ -321,85 +466,50 @@ const Dashboard = () => {
   if (error) {
     return (
       <div className="dashboard-container">
-        <header className="dashboard-header">
-          <div className="header-left">
-            <div className="brand">
-              <span className="brand-mark">NW</span>
-              <div className="brand-text">
-                <h1>Nadaraya-Watson Desk</h1>
-                <span className="brand-sub">Kernel-regression execution terminal</span>
-              </div>
-            </div>
-            <nav className="nav-links">
-              <button className={`nav-btn ${view === 'dashboard' ? 'active' : ''}`} onClick={() => setView('dashboard')}>Dashboard</button>
-              <button className={`nav-btn ${view === 'backtest' ? 'active' : ''}`} onClick={() => setView('backtest')}>Backtest</button>
-            </nav>
-          </div>
-          <label className="theme-switch" title={theme === 'light' ? 'Switch to dark mode' : 'Switch to light mode'}>
-            <input
-              type="checkbox"
-              checked={theme === 'dark'}
-              onChange={toggleTheme}
-            />
-            <span className="switch-slider"></span>
-          </label>
-        </header>
+        {header(true)}
         <EnvelopeCurve />
         <div className="error-banner">
           <span>⚠️</span>
           <p>{error}</p>
-          <button className="btn btn-start" onClick={() => { fetchStats(); fetchSettings(); }}>Retry</button>
+          <button className="btn btn-start" onClick={() => { fetchStats(); fetchSettings(); fetchHealth(); }}>
+            Retry
+          </button>
         </div>
       </div>
     );
   }
 
+  const symbols = Object.keys(data?.bots || {});
+  const primarySymbol = symbols[0];
+
   return (
     <div className="dashboard-container">
-      <header className="dashboard-header">
-        <div className="header-left">
-          <div className="brand">
-            <span className="brand-mark">NW</span>
-            <div className="brand-text">
-              <h1>Nadaraya-Watson Desk</h1>
-              <span className="brand-sub">Kernel-regression execution terminal</span>
-            </div>
-          </div>
-          <nav className="nav-links">
-            <button 
-              className={`nav-btn ${view === 'dashboard' ? 'active' : ''}`} 
-              onClick={() => setView('dashboard')}
-            >
-              Dashboard
-            </button>
-            <button 
-              className={`nav-btn ${view === 'backtest' ? 'active' : ''}`} 
-              onClick={() => setView('backtest')}
-            >
-              Backtest
-            </button>
-          </nav>
-        </div>
-        <label className="theme-switch" title={theme === 'light' ? 'Switch to dark mode' : 'Switch to light mode'}>
-          <input 
-            type="checkbox" 
-            checked={theme === 'dark'} 
-            onChange={toggleTheme} 
-          />
-          <span className="switch-slider"></span>
-        </label>
-      </header>
+      {header(true)}
       <EnvelopeCurve />
 
+      <DatabaseBanner health={health} />
+      {prefs.ready && !prefs.available && (
+        <div className="error-banner db-banner">
+          <span>💾</span>
+          <p>
+            Your dashboard preferences are not being saved
+            {prefs.error ? ` — ${prefs.error}` : '.'}
+          </p>
+        </div>
+      )}
+
       {view === 'backtest' ? (
-        <BacktestPage />
+        <BacktestPage prefs={prefs} />
+      ) : view === 'trades' ? (
+        <TradesPage symbol={primarySymbol} />
       ) : (
         <>
           {/* Account Overview */}
           <p className="eyebrow">Account Overview</p>
           <div className="stats-grid">
             {data?.account && Object.entries(data.account).map(([key, val]: any) => {
-              if (key === 'time_profits') return null;
+              // captured_at and stale describe the snapshot, not the account.
+              if (key === 'time_profits' || key === 'captured_at' || key === 'stale') return null;
               const displayValue = typeof val === 'number' ? val.toLocaleString(undefined, { maximumFractionDigits: 2 }) : val;
               return (
                 <div key={key} className="stat-card">
@@ -409,6 +519,14 @@ const Dashboard = () => {
               );
             })}
           </div>
+          {data?.account?.captured_at && (
+            <p className="snapshot-note">
+              Account snapshot taken{' '}
+              {new Date(data.account.captured_at).toISOString().slice(0, 19).replace('T', ' ')} UTC —
+              refreshed at most once a minute, because the period profits behind it are
+              four year-long history scans over IPC.
+            </p>
+          )}
 
           {/* Time-based Profits */}
           <div className="profit-section">
@@ -437,6 +555,15 @@ const Dashboard = () => {
                     </span>
                   </div>
 
+                  {/* Both are reported because they can legitimately disagree --
+                      the process restarted, or the thread crashed. A single word
+                      is how a dead bot came to report "Running". */}
+                  {stats.desired_state === 'running' && stats.status !== 'Running' && (
+                    <ResumeNotice symbol={symbol} onStart={() => control(symbol, 'start')} />
+                  )}
+                  {stats.error && <p className="sizing-msg err">{stats.error}</p>}
+                  {stats.detail && <p className="sizing-msg warn">{stats.detail}</p>}
+
                   {/* Indicator Stats */}
                   <div className="indicator-grid">
                     <div className="indicator-item">
@@ -457,7 +584,9 @@ const Dashboard = () => {
                     </div>
                   </div>
 
-                  {/* Performance Stats */}
+                  {/* Performance Stats. Wins/losses are per POSITION and decided
+                      on net profit -- the old per-closing-deal count booked a
+                      scale-out as its own win. */}
                   <div className="performance-grid">
                     <div className="perf-item">
                       <span className="perf-label">Total Trades</span>
@@ -476,6 +605,37 @@ const Dashboard = () => {
                       <span className="perf-value">${stats.total_pl?.toFixed(2) || '0.00'}</span>
                     </div>
                   </div>
+                  <div className="performance-grid secondary">
+                    <div className="perf-item">
+                      <span className="perf-label">Win rate</span>
+                      <span className="perf-value">
+                        {stats.win_rate !== undefined ? `${stats.win_rate.toFixed(1)}%` : '—'}
+                      </span>
+                    </div>
+                    <div className="perf-item">
+                      <span className="perf-label" title="Trades that closed exactly flat — the designed outcome of the break-even stop">
+                        Break-even
+                      </span>
+                      <span className="perf-value">{stats.breakeven ?? 0}</span>
+                    </div>
+                    <div className="perf-item">
+                      <span className="perf-label" title="Trades where the scale-out fired">Scaled out</span>
+                      <span className="perf-value">{stats.scaled_out ?? 0}</span>
+                    </div>
+                    <div className="perf-item danger">
+                      <span className="perf-label" title="Deepest peak-to-trough of the closed-trade equity curve, in account currency">
+                        Max DD
+                      </span>
+                      <span className="perf-value">${(stats.max_drawdown ?? 0).toFixed(2)}</span>
+                    </div>
+                  </div>
+                  {stats.costs !== undefined && stats.trades_closed > 0 && (
+                    <p className="perf-note">
+                      Net of ${Math.abs(stats.costs).toFixed(2)} in commission and swap
+                      across {stats.trades_closed} closed trade{stats.trades_closed === 1 ? '' : 's'}
+                      {stats.trades_open ? ` · ${stats.trades_open} open` : ''}
+                    </p>
+                  )}
 
                   {settings[symbol] && !settings[symbol].error && (
                     <SizingEditor
@@ -486,15 +646,15 @@ const Dashboard = () => {
                   )}
 
                   <div className="button-group">
-                    <button 
-                      onClick={() => controlBot(symbol, 'start')}
+                    <button
+                      onClick={() => control(symbol, 'start')}
                       disabled={stats.status === 'Running'}
                       className="btn btn-start"
                     >
                       Start
                     </button>
-                    <button 
-                      onClick={() => controlBot(symbol, 'stop')}
+                    <button
+                      onClick={() => control(symbol, 'stop')}
                       disabled={stats.status === 'Stopped'}
                       className="btn btn-stop"
                     >

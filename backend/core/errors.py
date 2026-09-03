@@ -28,3 +28,16 @@ class ConfigRejected(BotError):
     than one that is refused, because `lot_size` is the only risk control this
     bot has.
     """
+
+
+class DatabaseUnavailable(BotError):
+    """Postgres is configured but not reachable, or the schema is not applied.
+
+    Raised rather than swallowed for the same reason as ConfigRejected: the
+    database now holds `lot_size`, and `lot_size` is the only risk control this
+    bot has. A missing row must never silently resolve to the 0.1 default in
+    code, because that would restore ~$70/trade of exposure for someone who had
+    deliberately lowered it -- which is the exact failure the old
+    write-then-rename settings file existed to prevent. Every message carries
+    the command to run.
+    """

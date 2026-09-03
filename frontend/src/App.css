@@ -939,3 +939,422 @@ select:focus-visible,
   .sizing-grid { grid-template-columns: 1fr; }
   .sizing-head { flex-direction: column; gap: 4px; }
 }
+
+/* ===========================================================================
+   Persistence-era additions
+   ---------------------------------------------------------------------------
+   Postgres backs everything the user can change, so the UI gained three kinds
+   of surface: tables of stored history (trades, backtest runs, sizing
+   changes), banners for the store being unavailable, and the desired-vs-actual
+   bot state notice. All of them reuse the existing tokens -- there is no new
+   colour here, because a new palette entry would have to be defined for both
+   themes and none of these is a new semantic.
+   =========================================================================== */
+
+/* ---- store-unavailable banners ------------------------------------------ */
+
+.db-banner {
+  align-items: flex-start;
+}
+
+.db-banner > div {
+  flex: 1;
+}
+
+.db-banner p {
+  margin: 0 0 6px;
+}
+
+.db-banner-cmd {
+  display: inline-block;
+  padding: 3px 8px;
+  border-radius: 3px;
+  background: var(--secondary-bg);
+  border: 1px solid var(--border-color);
+  color: var(--text-main);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  user-select: all;
+}
+
+.snapshot-note,
+.perf-note {
+  margin: 8px 0 0;
+  color: var(--text-muted);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+/* ---- desired-vs-actual bot state ---------------------------------------- */
+
+/* The bot was running before the process went down. Deliberately a prompt and
+   not an action: auto-resuming live trading is opt-in (BOT_AUTO_RESUME). */
+.resume-notice {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0 0 14px;
+  padding: 10px 12px;
+  border: 1px solid var(--accent-color);
+  border-left: 3px solid var(--accent-color);
+  border-radius: 3px;
+  background: var(--card-bg-raised);
+  color: var(--text-main);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.btn-inline {
+  padding: 5px 12px;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.sizing-msg.warn {
+  color: var(--accent-color-strong);
+}
+
+.performance-grid.secondary {
+  margin-top: -6px;
+  opacity: 0.9;
+}
+
+/* ---- inline link-style buttons ------------------------------------------ */
+
+.link-btn {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent-color);
+  font-family: inherit;
+  font-size: 11.5px;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+.link-btn:hover {
+  color: var(--accent-color-strong);
+}
+
+.link-btn.danger {
+  color: var(--danger-color);
+}
+
+/* ---- sizing history ----------------------------------------------------- */
+
+.sizing-history {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border-color);
+}
+
+.history-list {
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+  font-size: 11.5px;
+}
+
+.history-list li {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 10px;
+  padding: 4px 0;
+  border-bottom: 1px dashed var(--border-color);
+  color: var(--text-main);
+}
+
+.history-list li:last-child {
+  border-bottom: 0;
+}
+
+.history-when,
+.history-source {
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+}
+
+/* ---- shared table styling ----------------------------------------------- */
+
+/* Wide tables scroll inside their own box. Letting the page scroll sideways
+   instead would take the whole dashboard with it. */
+.table-scroll {
+  overflow-x: auto;
+  margin-top: 14px;
+  border: 1px solid var(--border-color);
+  border-radius: 3px;
+}
+
+.trade-table,
+.deal-table,
+.runs-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.trade-table th,
+.deal-table th,
+.runs-table th {
+  padding: 9px 10px;
+  border-bottom: 1px solid var(--border-color);
+  background: var(--card-bg-raised);
+  color: var(--text-muted);
+  font-family: var(--font-display);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.09em;
+  text-align: left;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.trade-table td,
+.deal-table td,
+.runs-table td {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border-color);
+  color: var(--text-main);
+  white-space: nowrap;
+}
+
+.trade-table tbody tr:last-child td,
+.runs-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.trade-table .num,
+.deal-table .num,
+.runs-table .num {
+  text-align: right;
+  font-family: var(--font-mono);
+}
+
+.trade-table .mono,
+.deal-table .mono,
+.runs-table .mono {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+
+.trade-table .strong {
+  font-weight: 600;
+}
+
+.trade-table .positive,
+.deal-table .positive,
+.runs-table .positive {
+  color: var(--success-color);
+}
+
+.trade-table .negative,
+.deal-table .negative,
+.runs-table .negative {
+  color: var(--danger-color);
+}
+
+.trade-row,
+.run-row {
+  cursor: pointer;
+}
+
+.trade-row:hover,
+.run-row:hover,
+.trade-row.expanded {
+  background: var(--card-bg-raised);
+}
+
+/* ---- trades page -------------------------------------------------------- */
+
+/* Matches .backtest-container: the two pages are siblings in the same nav and
+   should not sit differently on the page. (An `animation: fadeIn` here would
+   have been silent -- there is no such keyframe in this stylesheet.) */
+.trades-container {
+  display: flex;
+  justify-content: center;
+  padding: 8px 0 20px;
+}
+
+/* Same frame as .backtest-card, but wider: this one holds an 11-column table
+   and 820px would put every row into horizontal scroll. */
+.trades-card {
+  background: var(--card-bg);
+  padding: 30px 32px;
+  border: 1px solid var(--border-color);
+  border-top: 2px solid var(--accent-color);
+  width: 100%;
+  max-width: 1180px;
+}
+
+.trades-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.trades-card h2 {
+  margin: 4px 0 6px;
+  font-family: var(--font-display);
+  font-size: 22px;
+  color: var(--text-main);
+}
+
+.trades-sub {
+  margin: 0;
+  max-width: 62ch;
+  color: var(--text-muted);
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+
+.trades-filters {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 18px;
+  flex-wrap: wrap;
+}
+
+.trades-count {
+  margin-left: auto;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+}
+
+.side-badge {
+  display: inline-block;
+  padding: 2px 7px;
+  border-radius: 2px;
+  border: 1px solid var(--border-color);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.side-badge.long {
+  border-color: var(--success-color);
+  color: var(--success-color);
+}
+
+.side-badge.short {
+  border-color: var(--danger-color);
+  color: var(--danger-color);
+}
+
+.trade-status {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.trade-status.open {
+  color: var(--accent-color);
+}
+
+.trade-status.closed {
+  color: var(--text-muted);
+}
+
+/* exit_count > 1 is the scale-out having fired. Flagged per trade because the
+   rule is measured negative for expectancy, so its footprint should be visible
+   in the history and not only in an aggregate. */
+.scaled-flag {
+  margin-left: 5px;
+  color: var(--accent-color);
+  font-size: 9px;
+  vertical-align: middle;
+}
+
+.trade-detail-row td {
+  padding: 0;
+  background: var(--bg-color);
+}
+
+.trade-detail-row .deal-table {
+  font-size: 11.5px;
+}
+
+.trade-detail-msg {
+  margin: 0;
+  padding: 12px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.trade-detail-msg.err {
+  color: var(--danger-color);
+}
+
+.deal-comment {
+  max-width: 24ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.pager {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  margin-top: 16px;
+}
+
+.pager-label {
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+}
+
+/* ---- backtest run history ----------------------------------------------- */
+
+.run-history {
+  margin-top: 30px;
+  padding-top: 22px;
+  border-top: 1px solid var(--border-color);
+}
+
+.run-history h3 {
+  margin: 0 0 8px;
+  font-family: var(--font-display);
+  font-size: 15px;
+  letter-spacing: 0.03em;
+  color: var(--text-main);
+  text-transform: uppercase;
+}
+
+.run-history code {
+  padding: 1px 5px;
+  border-radius: 2px;
+  background: var(--secondary-bg);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.run-failed {
+  color: var(--danger-color);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  cursor: help;
+}
+
+@media (max-width: 720px) {
+  .trades-card {
+    padding: 18px 14px;
+  }
+
+  .history-list li {
+    grid-template-columns: 1fr;
+    gap: 2px;
+  }
+}

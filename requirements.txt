@@ -7,3 +7,8 @@ numpy==1.24.4
 fastapi
 uvicorn
 python-multipart
+# Postgres driver. -binary ships wheels for cp38 on Windows, which matters:
+# building psycopg2 from source on the trading host needs a compiler and
+# libpq that are not there. psycopg3 is not used -- 2.9 is what has a verified
+# 3.8 wheel, and the pool this project needs (ThreadedConnectionPool) is in it.
+psycopg2-binary==2.9.9
