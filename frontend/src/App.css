@@ -1414,6 +1414,17 @@ select:focus-visible,
   color: var(--bg-color);
 }
 
+/* "All assets" is a shortcut for the chips beside it, not a symbol of its own,
+   so it reads as a different KIND of control rather than a third instrument. */
+.symbol-chip.all {
+  font-style: italic;
+  letter-spacing: 0.02em;
+}
+
+.symbol-chip.all:not(.active) {
+  color: var(--accent-color);
+}
+
 .sizing-rows {
   display: flex;
   flex-direction: column;

@@ -264,3 +264,57 @@ test('the last selected symbol cannot be unselected', async () => {
 
   expect(screen.getByRole('button', { name: 'XAUUSDm', pressed: true })).toBeInTheDocument();
 });
+
+test('"All assets" selects every symbol in one click', async () => {
+  const fetchMock = mockApi({ theme: 'light', view: 'backtest' });
+  global.fetch = fetchMock as any;
+
+  render(<App />);
+
+  const all = await screen.findByRole('button', { name: 'All assets' });
+  // Not active while only gold is selected -- it reflects the selection rather
+  // than acting as a third instrument.
+  expect(all).toHaveAttribute('aria-pressed', 'false');
+
+  fireEvent.click(all);
+
+  await waitFor(() =>
+    expect(screen.getByRole('button', { name: 'All assets' })).toHaveAttribute(
+      'aria-pressed',
+      'true',
+    ),
+  );
+  expect(screen.getByRole('button', { name: 'BTCUSDm', pressed: true })).toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole('button', { name: 'Last Month' }));
+  fireEvent.click(screen.getByRole('button', { name: /run combined backtest/i }));
+
+  await waitFor(() => {
+    const call = fetchMock.mock.calls.find(
+      ([url, init]: any) => String(url).includes('/backtest') && init?.method === 'POST',
+    );
+    expect(JSON.parse((call as any)[1].body).symbols).toEqual(['XAUUSDm', 'BTCUSDm']);
+  });
+});
+
+test('a failed symbol fetch says so instead of quietly showing one symbol', async () => {
+  // The fallback list is one symbol. Swallowing the error renders as "this bot
+  // only trades gold" -- a plausible page with no sign that anything is missing.
+  const fetchMock = mockApi({ theme: 'light', view: 'backtest' });
+  // mockApi's routes are chosen from the URL alone, so `init` is not forwarded --
+  // passing it is a type error that `react-scripts test` (babel, no type-check)
+  // does not see but `npm run build` does, which is how it reached the container.
+  global.fetch = jest.fn((input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.includes('/settings') && !url.includes('/settings/history')) {
+      return Promise.reject(new TypeError('Failed to fetch'));
+    }
+    return fetchMock(input);
+  }) as any;
+
+  render(<App />);
+
+  expect(
+    await screen.findByText(/the symbol list comes from the backend/i),
+  ).toBeInTheDocument();
+});

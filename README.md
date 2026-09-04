@@ -538,8 +538,12 @@ Point MT5 at a **demo account** and run the dashboard against it first. Confirm
 that trades open and close as expected, and watch the backend log — every
 rejected order now prints its retcode and the broker's comment.
 
-The **Backtest** page takes one symbol, the other, or **both at once**. Both at
-once means both replayed onto a *single* account in close-time order, so the
+The **Backtest** page takes one symbol, the other, or **all of them at once** —
+the symbol chips toggle individually and **All assets** selects every configured
+symbol in one click. The list is read from `/settings`, so it always matches
+`SYMBOL_CONFIG`; if that request fails the page says so rather than quietly
+offering gold alone. All at once means every selected symbol replayed onto a
+*single* account in close-time order, so the
 combined drawdown is the merged equity curve's — not the two per-symbol figures
 added together, which would be wrong in both directions. The per-symbol
 breakdown under the results shows each symbol run alone for comparison. Sizing is

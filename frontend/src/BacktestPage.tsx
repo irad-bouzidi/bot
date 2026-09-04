@@ -110,6 +110,7 @@ const BacktestPage = ({ prefs }: { prefs: PreferencesState }) => {
   const [sizing, setSizing] = useState<Record<string, any>>({});
   const [runs, setRuns] = useState<BacktestRun[]>([]);
   const [historyError, setHistoryError] = useState<string | null>(null);
+  const [symbolsError, setSymbolsError] = useState<string | null>(null);
 
   // One writer for both local state and the stored preference, so no field can
   // be changed without being persisted.
@@ -137,6 +138,10 @@ const BacktestPage = ({ prefs }: { prefs: PreferencesState }) => {
   // Live sizing for every configured symbol, fetched once. It also decides which
   // symbols this form offers, so it is not tied to the current selection the way
   // the single-symbol version was.
+  //
+  // A failure here is REPORTED, not swallowed. The fallback list is one symbol,
+  // so a silently-failed fetch renders as "this bot only trades gold" -- a
+  // plausible, wrong page with nothing on it to suggest anything went missing.
   useEffect(() => {
     let cancelled = false;
     (async () => {
@@ -144,8 +149,14 @@ const BacktestPage = ({ prefs }: { prefs: PreferencesState }) => {
         const all = await getSettings();
         if (cancelled) return;
         setSizing(all);
-      } catch (e) {
-        // Leave the defaults in place; the run itself will report a dead backend.
+        setSymbolsError(null);
+      } catch (e: any) {
+        if (cancelled) return;
+        setSymbolsError(
+          `${e?.message || 'Could not reach the backend.'} Showing ${FALLBACK_SYMBOLS.join(
+            ', ',
+          )} only — the symbol list comes from the backend.`,
+        );
       }
     })();
     return () => {
@@ -230,6 +241,8 @@ const BacktestPage = ({ prefs }: { prefs: PreferencesState }) => {
     };
   });
 
+  const allSelected = available.length > 1 && available.every(s => form.symbols.includes(s));
+
   const toggleSymbol = (symbol: string) => {
     const has = form.symbols.includes(symbol);
     // Never empty: a run with no symbol is not a shorter run, it is no run, and
@@ -239,6 +252,15 @@ const BacktestPage = ({ prefs }: { prefs: PreferencesState }) => {
       ? form.symbols.filter(s => s !== symbol)
       : [...available.filter(s => form.symbols.includes(s) || s === symbol)];
     patch({ symbols: next });
+  };
+
+  // One click for "every asset, on one account" -- the common case, and awkward
+  // to reach by toggling chips once there are more than two. Deliberately
+  // one-way: clicking it while everything is already selected does nothing,
+  // because the opposite of "all" here would be "none", which is not a run.
+  const selectAll = () => {
+    if (allSelected) return;
+    patch({ symbols: [...available] });
   };
 
   const setLot = (symbol: string, value: string) =>
@@ -361,6 +383,16 @@ const BacktestPage = ({ prefs }: { prefs: PreferencesState }) => {
         <div className="symbol-picker">
           <span className="symbol-picker-label">Symbols</span>
           <div className="symbol-chips">
+            {available.length > 1 && (
+              <button
+                type="button"
+                className={`symbol-chip all ${allSelected ? 'active' : ''}`}
+                onClick={selectAll}
+                aria-pressed={allSelected}
+              >
+                All assets
+              </button>
+            )}
             {available.map(s => (
               <button
                 key={s}
@@ -373,15 +405,16 @@ const BacktestPage = ({ prefs }: { prefs: PreferencesState }) => {
               </button>
             ))}
           </div>
+          {symbolsError && <p className="sizing-msg err">{symbolsError}</p>}
           <span className="field-hint">
             {form.symbols.length > 1 ? (
               <>
-                Combined: both symbols are replayed onto <b>one</b> ${form.initial_balance}{' '}
-                account in close-time order, so the drawdown is the merged curve's — not
-                the two added together.
+                Combined: {form.symbols.join(' + ')} are replayed onto <b>one</b> $
+                {form.initial_balance} account in close-time order, so the drawdown is the
+                merged curve's — not the per-symbol ones added together.
               </>
             ) : (
-              'Pick more than one to backtest them together on a single account.'
+              `Pick more than one — or “All assets” — to backtest them together on a single account.`
             )}
           </span>
         </div>

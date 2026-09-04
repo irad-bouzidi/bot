@@ -153,6 +153,12 @@ is returned or stored. Win/loss counts *do* add up, and `win_rate`'s denominator
 Sizing is per symbol because a lot is not a comparable unit across symbols. `run_baseline`
 deliberately has no combined mode; run it twice.
 
+The Backtest page's symbol chips come from `/settings`, so they always match
+`SYMBOL_CONFIG` -- there is no second list to keep in step. **All assets** selects every
+one of them. A failed `/settings` fetch is reported on the form instead of swallowed: the
+fallback list is a single symbol, so swallowing it renders as "this bot only trades gold",
+a plausible page with nothing on it to suggest anything is missing.
+
 Storage: `backtest_runs` gains `symbols TEXT[]` and `sizing JSONB` (schema version 2).
 `symbol` stays as the label (`"XAUUSDm + BTCUSDm"`), and `list_backtests(symbol=...)`
 matches on the array too, so a combined run appears under either symbol's filter -- it is
