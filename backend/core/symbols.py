@@ -43,6 +43,11 @@ reintroduce it there.)
 #                     position when the size changes. EDITABLE at runtime, but
 #                     only ever via scale_out_fraction(): the UI speaks lots,
 #                     this dict does not.
+# `news_currencies`   whose economic calendar blacks this symbol out. An
+#                     explicit tuple rather than three letters sliced out of the
+#                     ticker: "XAUUSDm"[3:6] happens to give USD, but gold's
+#                     drivers are not defined by its quote currency and the next
+#                     symbol added would inherit the wrong answer silently.
 SYMBOL_CONFIG = {
     "XAUUSDm": {
         "pip": 0.1,
@@ -52,6 +57,7 @@ SYMBOL_CONFIG = {
         "profit_mult": 100,         # 100 oz per lot
         "be_trigger_pips": 50,      # 5.00 in price -- half of the 100-pip target
         "partial_fraction": 0.5,    # 0.05 out at +5.00, 0.05 runs to the target
+        "news_currencies": ("USD",),
     },
     # Same shape as gold, one pip = $1. A long at 80500 therefore targets 81500,
     # stops at 79800, and banks half at 81000 with the stop pulled to 80500 --
@@ -69,6 +75,11 @@ SYMBOL_CONFIG = {
         "profit_mult": 1,           # 1 BTC per lot
         "be_trigger_pips": 500,     # 500.00 in price -- half of the target
         "partial_fraction": 0.5,    # 0.05 out at +500, 0.05 runs to the target
+        # Bitcoin trades through the weekend and has no calendar of its own, but
+        # it is quoted in dollars and moves on US rates prints, so it takes the
+        # same USD blackout as gold. Not a claim that the two react alike --
+        # just that the releases worth standing aside for are the same ones.
+        "news_currencies": ("USD",),
     },
 }
 
@@ -80,6 +91,17 @@ SUPPORTED_SYMBOLS = list(SYMBOL_CONFIG.keys())
 # their exposure must not have 0.1 -- and ~$70 a trade -- quietly restored by a
 # restart.
 EDITABLE_KEYS = ("lot_size", "partial_fraction")
+
+# News blackout defaults. NOT in EDITABLE_KEYS and NOT per-symbol: `_validated()`
+# takes floats only and `symbol_settings` is two DOUBLE PRECISION columns with
+# CHECK constraints, so an impact list or a window would need a schema
+# migration. They are read from the environment instead
+# (BOT_NEWS_BEFORE_MIN / BOT_NEWS_AFTER_MIN / BOT_NEWS_IMPACTS) -- see
+# `backend/live/news_feed.py`. The values here are the defaults those fall back
+# to, and the ones the research path uses when a calendar is supplied.
+NEWS_BEFORE_MINUTES = 30.0
+NEWS_AFTER_MINUTES = 30.0
+NEWS_IMPACTS = ("high", "medium")
 
 
 def is_supported(symbol):
@@ -110,3 +132,16 @@ def price_levels(symbol):
             if cfg.get("tp_pips") else 0.0),
         "risk_per_lot": cfg["sl_pips"] * pip * cfg["profit_mult"],
     }
+
+
+def news_currencies_for(symbol):
+    # type: (str) -> tuple
+    """Whose calendar blacks this symbol out.
+
+    Returns an empty tuple for a symbol with no entry, and the caller must read
+    that as "no news filtering for this symbol" -- NOT as "block on every
+    currency". An unconfigured symbol cannot reach the live path at all
+    (`TradingBot.__init__` refuses it), so this only softens the research path,
+    where over-blocking would quietly delete trades from a backtest.
+    """
+    return tuple(SYMBOL_CONFIG.get(symbol, {}).get("news_currencies", ()))

@@ -27,6 +27,21 @@ EXIT_RISK = "risk_halt"
 # are the same "sl" in the census, and the exit-reason table is how this
 # strategy's behaviour is actually diagnosed.
 EXIT_BE = "be_stop"
+# A position closed because it was inside a news blackout window, NOT because
+# price came back to the mean. Distinct from EXIT_SIGNAL for exactly the reason
+# EXIT_BE is distinct from EXIT_SL: the exit-reason table is how this strategy
+# is diagnosed, and a rule that closes trades has to be visible in it or its
+# cost cannot be measured. `Trading Bot.md` requires that measurement for any
+# change to which trades exist.
+EXIT_NEWS = "news_blackout"
+
+# Strategy exit reasons (`Signal.reason`) that earn their own exit_reason label.
+# Everything else folds into EXIT_SIGNAL, which is what every existing reason
+# did before this map existed -- so "cross_center" still reports as "signal" and
+# stored reports stay comparable.
+SIGNAL_EXIT_REASONS = {
+    "news_blackout": EXIT_NEWS,
+}
 
 
 @dataclass

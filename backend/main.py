@@ -159,6 +159,16 @@ def health():
             complete = repo.tables_present()
         except Exception as exc:
             log("health: schema check failed -- %r" % exc)
+    # S9: the news feed fails CLOSED, so an unreachable provider stops entries.
+    # That makes this the endpoint an operator checks to tell "blocked by a real
+    # release" from "the feed is broken" -- the two look identical on the bot
+    # card. Wrapped because this endpoint promises never to raise, exactly as
+    # the schema check above is.
+    try:
+        news = manager.news.status()
+    except Exception as exc:
+        log("health: news status failed -- %r" % exc)
+        news = {"enabled": None, "error": repr(exc)}
     return {
         "database": {
             "url": db_pool.redact(db_pool.database_url()),
@@ -169,6 +179,7 @@ def health():
         },
         "auto_resume": AUTO_RESUME,
         "symbols": SUPPORTED_SYMBOLS,
+        "news": news,
     }
 
 @app.get("/stats")

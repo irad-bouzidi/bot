@@ -113,6 +113,61 @@ def test_the_research_stack_does_not_import_the_database(package):
         "backend/%s must stay runnable with no database: %s" % (package, offenders))
 
 
+# The same offline guarantee, one step further. `backend/core/news.py` holds the
+# news blackout's window arithmetic and is reachable from NWEnvelopeStrategy, so
+# a network import there would make a BACKTEST fail during a provider outage --
+# and a backtest that cannot run without the internet is not reproducible. The
+# fetching lives in backend/live/news_feed.py, which only bot_manager imports.
+NETWORK_MODULES = ("urllib", "http", "socket", "requests", "httpx", "ssl",
+                   "ftplib", "telnetlib", "xmlrpc")
+
+
+@pytest.mark.parametrize("package", RESEARCH_PACKAGES)
+def test_the_research_stack_does_not_import_the_network(package):
+    directory = os.path.join(REPO_ROOT, "backend", package)
+    if not os.path.isdir(directory):
+        pytest.skip("no backend/%s" % package)
+    offenders = []
+    for path in _python_files(directory):
+        for name, lineno, _node in _imported_names(path):
+            if name.split(".")[0] in NETWORK_MODULES:
+                offenders.append("%s:%d imports %s"
+                                 % (os.path.relpath(path, REPO_ROOT), lineno, name))
+    assert not offenders, (
+        "backend/%s must stay runnable offline; put network code in "
+        "backend/live/: %s" % (package, offenders))
+
+
+def test_the_news_feed_is_the_only_networked_module():
+    """Pins WHERE the one network dependency is allowed to live.
+
+    If the fetcher is ever moved or a second one appears, this fails and points
+    at it -- rather than the move being discovered as a backtest that needs the
+    internet, or as a research import that drags a socket into the offline path.
+    """
+    networked = []
+    backend_dir = os.path.join(REPO_ROOT, "backend")
+    for path in _python_files(backend_dir):
+        for name, _lineno, _node in _imported_names(path):
+            if name.split(".")[0] in NETWORK_MODULES:
+                networked.append(os.path.relpath(path, REPO_ROOT).replace("\\", "/"))
+                break
+    assert sorted(set(networked)) == ["backend/live/news_feed.py"], (
+        "exactly one module may reach the network: %s" % sorted(set(networked)))
+
+
+def test_the_news_core_imports_no_database_or_terminal():
+    """`backend/core/news.py` is shared by the live bot and the backtest."""
+    path = os.path.join(REPO_ROOT, "backend", "core", "news.py")
+    banned = []
+    for name, lineno, _node in _imported_names(path):
+        head = name.split(".")[0]
+        if head in NETWORK_MODULES or head == "MetaTrader5" \
+                or name == "backend.db" or name.startswith("backend.db."):
+            banned.append("line %d imports %s" % (lineno, name))
+    assert not banned, "backend/core/news.py must stay pure: %s" % banned
+
+
 def test_the_db_package_imports_with_neither_driver_nor_server():
     """The end-to-end version of the two source checks above.
 

@@ -41,7 +41,8 @@ import pandas as pd
 
 from backend.backtest.costs import CostConfig, CostModel
 from backend.backtest.ledger import (
-    EXIT_BE, EXIT_END_OF_DATA, EXIT_SIGNAL, EXIT_SL, EXIT_TP, TradeRecord,
+    EXIT_BE, EXIT_END_OF_DATA, EXIT_SIGNAL, EXIT_SL, EXIT_TP,
+    SIGNAL_EXIT_REASONS, TradeRecord,
     session_of, to_frame,
 )
 from backend.core.types import PositionView, Side, SignalType, SymbolSpec
@@ -283,7 +284,12 @@ class BacktestEngine:
                 pending = None
                 if sig.type is SignalType.EXIT and open_trade is not None:
                     px = self.costs.exit_fill(position.side, o[i], spec, spr[i])
-                    balance += self._close(open_trade, px, i, idx[i], EXIT_SIGNAL, spec)
+                    # Most strategy exits report as EXIT_SIGNAL; a few carry
+                    # their own label so the exit-reason breakdown can price
+                    # them separately. Unknown reasons fold into EXIT_SIGNAL,
+                    # which is what every reason did before the map existed.
+                    reason = SIGNAL_EXIT_REASONS.get(sig.reason, EXIT_SIGNAL)
+                    balance += self._close(open_trade, px, i, idx[i], reason, spec)
                     trades.append(open_trade)
                     open_trade, position = None, None
                 elif sig.type in (SignalType.ENTER_LONG, SignalType.ENTER_SHORT) \

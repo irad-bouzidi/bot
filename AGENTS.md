@@ -11,6 +11,9 @@
 - Baseline (offline, one symbol per run): `python -m backend.scripts.run_baseline --symbol XAUUSDm`
   / `--symbol BTCUSDm`. `--sl`/`--tp` default from the symbol's own config.
 - Snapshot bars (MT5 host): `python -m backend.data.snapshot --symbol BTCUSDm --start 2025-09-01`
+- News calendar (the only networked command): `python -m backend.live.news_feed --fetch`
+  Verify it BEFORE starting a bot -- the blackout fails closed, so a dead feed shows up as
+  a bot that refuses to trade. `--news-file data/news` on `run_baseline` replays with it.
 
 ## Project Architecture
 - **Backend**: Python/FastAPI located in `backend/`. Manages MT5 trading bot logic.
@@ -23,6 +26,12 @@
   dashboard preferences. All SQL is in `backend/db/repository.py`; the schema is
   `backend/db/schema.sql`. The research stack (`backtest/`, `strategy/`, `indicators/`,
   `data/`) must never import `backend.db`.
+- **News blackout (S9)**: no entries and an immediate flatten within 30 min either side of
+  a high/medium USD release. Window arithmetic in `backend/core/news.py` (stdlib only,
+  shared with the backtest); the ForexFactory fetch in `backend/live/news_feed.py`, the
+  only module in `backend/` allowed to import a network library. Wall-clock rule -- uses
+  the host's UTC clock, never `bar_time`, which is broker-server time. Fails closed, and
+  never flattens on an unknown calendar. Off with `BOT_NEWS_ENABLED=0`.
 - **Symbols**: `XAUUSDm` and `BTCUSDm`, both defined in `backend/core/symbols.py`
   (`SYMBOL_CONFIG`) — the one MT5-free, database-free copy that the live loop,
   `backend.db.migrate` and the research scripts all read. Geometry is in pip
