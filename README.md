@@ -68,6 +68,11 @@ against that mean, scaled by `MULT`.
   position is closed and the stop is pulled to entry, so the remainder runs at
   no risk. Measured on cached data this *lowers* expectancy (see below); it is
   configuration, not a recommendation.
+- **News blackout** — from 30 minutes before to 30 minutes after a high or
+  medium impact release for the symbol's currency, no new position is opened and
+  **any open position is closed**. Events come from ForexFactory's public JSON;
+  no API key. See [News blackout](#-news-blackout) for what happens when that
+  feed is unreachable, because the answer is "the bot stops opening trades".
 
 **What actually happens in practice matters here.** On gold the fixed SL/TP
 resolves roughly 90% of trades and the mean-reversion exit only ~10% — so the
@@ -199,10 +204,80 @@ Server settings come from the environment:
 | `BOT_AUTO_RESUME` | `0` | Restart bots that were running before a shutdown. **Off by default** — see below |
 | `BOT_ACCOUNT_SNAPSHOT_SECONDS` | `60` | How stale a stored account reading may be before it is re-captured |
 | `BOT_SETTINGS_FILE` | `data/settings.json` | **No longer read.** Only `backend.db.migrate` uses it, to import once |
+| `BOT_NEWS_ENABLED` | `1` | The news blackout. `0` disables it entirely |
+| `BOT_NEWS_BEFORE_MIN` / `BOT_NEWS_AFTER_MIN` | `30` / `30` | Window either side of a release |
+| `BOT_NEWS_IMPACTS` | `high,medium` | Which impact levels black out trading |
+| `BOT_NEWS_MAX_AGE_MIN` | `90` | How stale the calendar may get before entries stop. `0` = strictest |
+| `BOT_NEWS_REFRESH_SEC` | `1800` | Seconds between fetches. The host answers HTTP 429 if polled harder |
+| `BOT_NEWS_TIMEOUT_SEC` | `10` | Socket timeout on the calendar fetch |
+| `BOT_NEWS_URLS` | ForexFactory `thisweek` | Comma-separated. Only `thisweek` is live; `nextweek`/`lastweek` 404 |
 
 Container settings live in `.env` at the repo root (copy `.env.example`):
 `POSTGRES_PASSWORD`, `POSTGRES_PORT`, `FRONTEND_PORT`, and `BOT_API_BASE` — the
 API URL injected into the page at container start.
+
+### 📰 News blackout
+
+From **30 minutes before to 30 minutes after** a high or medium impact release
+for the symbol's currency (USD for both configured symbols), the bot opens no
+new position and **closes any position it is holding**. Clustered releases merge
+into one continuous blackout rather than briefly re-enabling trading between
+them.
+
+Events come from **ForexFactory's public JSON** (`ff_calendar_thisweek.json`) —
+free, no API key, no account. It is not an official or documented API: it is
+unversioned and can change shape or rate-limit without notice. Verify it before
+starting a bot against it, because this is the one part of the system that
+reaches the internet:
+
+```powershell
+python -m backend.live.news_feed --fetch --symbol XAUUSDm
+```
+
+Every fetch is archived to `data/news/forexfactory-<year>-W<week>.csv`, keeping
+**all** impact levels including the low and holiday rows the filter ignores, so
+a later backtest can choose its own thresholds. That archive is also the only
+way this rule will ever become backtestable — the feed itself has no history.
+
+**It fails closed, and you need to know what that means.** If the calendar
+cannot be read, **the bot stops opening trades.** A single failed request does
+not do this; the calendar going *stale* does, after `BOT_NEWS_MAX_AGE_MIN`
+(default 90 minutes, against a 30-minute refresh — so two consecutive failures
+cost nothing). Before the first successful fetch, entries are blocked.
+
+Three things it deliberately does **not** do:
+
+- It **never closes a position because the feed is broken.** Only a known,
+  scheduled event closes a position. An unknown or stale calendar blocks new
+  entries and leaves what you are holding alone.
+- It **never suspends the scale-out or the break-even stop.** A live position
+  with no break-even stop through the most volatile hour of the day is worse
+  than the entry the rule declined to take.
+- It **never blocks the exit.** A position inside a blackout can still leave on
+  its stop, its target, or the mean-reversion signal.
+
+Because a blocked bot and a broken bot both read as "Running and not trading" on
+the card, the reason is always reported. The dashboard shows it inline; for the
+feed's own health:
+
+```powershell
+curl http://127.0.0.1:8000/health     # -> the "news" block
+```
+
+`events_fetched` vs `events` is the useful pair — the first says the feed
+worked, the second says how many of those events could actually black you out.
+`stale: true` with a populated `last_error` is a broken feed; `stale: false` with
+a blackout message on the card is a release in progress.
+
+**This filter has not been validated against real history, and it changes
+results.** A live-API-only source has no past, so there was nothing to backtest
+it on. Against a *synthetic* US release schedule over the cached gold data it
+suppresses ~5% of entries and cuts max drawdown ~12%, but gold remains a losing
+configuration either way. Treat that as suggestive, not as evidence, and
+re-measure once `data/news/` has accumulated real history alongside matching
+bars. It is enabled because it was asked for.
+
+Turn it off with `BOT_NEWS_ENABLED=0`.
 
 ### Auto-resume is off by default
 
@@ -465,6 +540,12 @@ a losing one hides behind a winning one. Run it twice and compare.
 4. Those symbols visible in MT5's **Market Watch** (right-click → Show All).
 5. **Algo Trading enabled** in the terminal (the toolbar button must be green).
 6. **Docker**, for Postgres and the dashboard container.
+7. **A correct system clock on the trading host, and outbound HTTPS.** The news
+   blackout is a wall-clock rule measured in true UTC from this machine's clock,
+   so a host 30 minutes out shifts every blackout window by 30 minutes — and
+   nothing in the logs would show it. Keep Windows time sync on. If the host
+   cannot reach `nfs.faireconomy.media`, the bot will refuse to open trades
+   (see below); set `BOT_NEWS_ENABLED=0` if that is not what you want.
 
 ### Step 1 — Install
 

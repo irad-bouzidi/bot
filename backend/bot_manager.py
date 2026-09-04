@@ -15,6 +15,7 @@ from backend.core.symbols import (
 from backend.db import pool as db_pool
 from backend.db import repository as repo
 from backend.indicators.nadaraya_watson import nw_envelope, nw_warmup_bars
+from backend.live.news_feed import NullNewsFeed, from_env as news_feed_from_env
 
 # Constants
 BANDWIDTH = 8.0
@@ -381,10 +382,16 @@ def _deal_rows(history, symbol):
 # the boot rather than silently trade the code default.
 
 class TradingBot(threading.Thread):
-    def __init__(self, symbol: str):
+    def __init__(self, symbol: str, news=None):
         super().__init__()
         self.daemon = True  # S6: never block interpreter shutdown
         self.symbol = symbol
+        # S9: the news blackout. Defaults to the null feed -- always allow,
+        # never flatten -- so a directly constructed TradingBot (tests, a REPL)
+        # behaves as it did before the rule existed. BotManager passes the real
+        # one, which is shared by every symbol's thread; see news_feed.py for
+        # why there is exactly one per process.
+        self._news = news or NullNewsFeed()
         # A live REFERENCE into SYMBOL_CONFIG, not a copy: update_settings() edits
         # that dict in place so a running bot picks the new size up on its next
         # entry without being restarted. Read it under _CONFIG_LOCK where the value
@@ -609,7 +616,17 @@ class TradingBot(threading.Thread):
                 % (self.symbol, exc))
         return True
 
-    def close_position(self, position):
+    def close_position(self, position, comment="Closing NW Bot"):
+        """Close a whole position at market.
+
+        `comment` reaches `deals.comment`, which the trade fold carries through
+        to `trades.comment`, so a news flatten (S9) is distinguishable from a
+        mean-reversion exit after the fact. Without it the two are identical in
+        the stored history and the cost of the blackout rule could never be
+        measured -- which is the one thing `Trading Bot.md` insists on for any
+        rule that changes which trades exist. MT5 truncates order comments
+        around 31 characters, so keep them short.
+        """
         info = self._symbol_info()
         tick = mt5.symbol_info_tick(position.symbol)
         if info is None or tick is None:
@@ -627,7 +644,7 @@ class TradingBot(threading.Thread):
             "price": self._round_price(price, info),
             "deviation": DEVIATION_POINTS,
             "magic": MAGIC_NUMBER,
-            "comment": "Closing NW Bot",
+            "comment": comment,
             "type_time": mt5.ORDER_TIME_GTC,
             "type_filling": self._pick_filling(info),
         }
@@ -870,6 +887,31 @@ class TradingBot(threading.Thread):
 
         while not self._stop_event.is_set():
             try:
+                # S9: the news blackout, evaluated FIRST -- before the bars are
+                # read, before the warm-up and NaN guards below, and outside the
+                # S4 once-per-bar gate. Three reasons, each a different failure:
+                #
+                #  * It is a WALL-CLOCK rule. `bar_time` further down is
+                #    broker-server epoch seconds with no offset applied, so it
+                #    is the wrong clock to measure "30 minutes before 12:30 UTC"
+                #    against; the feed uses the host's UTC clock instead.
+                #  * A window opens MID-CANDLE. Behind the S4 gate the flatten
+                #    would wait for the next M5 close, leaving the position
+                #    exposed for up to 5 of the 30 minutes the rule exists to
+                #    avoid.
+                #  * Closing a position needs no envelope. Behind the
+                #    MIN_USABLE_BARS or NaN guards -- both of which `continue`
+                #    -- a bar-data hiccup would silently cancel the flatten.
+                #
+                # The extra bot_positions() round trip is paid only while a
+                # window is actually open: verdict() is an in-memory lookup.
+                news = self._news.verdict(self.symbol)
+                if news.flatten:
+                    for pos in self.bot_positions():   # S1: this bot's only
+                        log("%s: %s -- closing #%s"
+                            % (self.symbol, news.detail, pos.ticket))
+                        self.close_position(pos, comment="NW news blackout")
+
                 rates = mt5.copy_rates_from_pos(self.symbol, TIMEFRAME, 0, FETCH_BARS)
                 if rates is None or len(rates) == 0:
                     log("%s: no rates (%s); MT5 may be disconnected"
@@ -922,7 +964,13 @@ class TradingBot(threading.Thread):
                          nw_out=_finite(out), nw_upper=_finite(upper),
                          nw_lower=_finite(lower),
                          bar_time=bar_time, open_positions=len(positions),
-                         detail=None)
+                         # S9: None when nothing is blocking. The dashboard
+                         # already renders this field as a warning on the card
+                         # (frontend/src/App.tsx), which is the same channel the
+                         # warm-up shortfall and NaN-envelope cases use -- all
+                         # three are "Running but not trading", so they should
+                         # not need three different ways of saying so.
+                         detail=news.detail)
 
                 # Reconcile at most once a minute. Cheaper than the 365-day scan
                 # it replaces -- the window now starts near the newest stored
@@ -972,7 +1020,16 @@ class TradingBot(threading.Thread):
                         self._last_entry_bar is None
                         or (bar_time - self._last_entry_bar) >= COOLDOWN_BARS * TIMEFRAME_SECONDS
                     )
-                    if not cooled:
+                    if not news.allow_entries:
+                        # S9: inside a blackout window, or the calendar could
+                        # not be read at all -- the feed fails CLOSED, so an
+                        # unreachable provider stops entries rather than letting
+                        # the bot trade blind into a release. It is the reason
+                        # `news.detail` has to reach the dashboard: this is the
+                        # "Running but not trading" state CLAUDE.md warns about,
+                        # and the operator needs to tell it from a crash.
+                        pass
+                    elif not cooled:
                         pass  # still inside the post-entry cooldown
                     elif current_close < lower:
                         if self.open_trade("BUY"):
@@ -1282,6 +1339,12 @@ class BotManager:
         self.bots: Dict[str, TradingBot] = {}
         if not mt5.initialize():
             log("MT5 Init Failed: %s" % (mt5.last_error(),))
+        # S9: ONE news feed for the whole process, shared by every bot thread.
+        # Started here rather than on first use so the first fetch overlaps
+        # startup instead of costing a newly started bot its first cycles, and
+        # so /health can report the feed before any bot is running.
+        self.news = news_feed_from_env()
+        self.news.start()
 
     # ---- control ------------------------------------------------------------
 
@@ -1313,7 +1376,7 @@ class BotManager:
         # restart, and "never hide losing trades" cannot survive a counter that
         # resets.
         _persist("record desired state", repo.set_desired_state, symbol, "running")
-        self.bots[symbol] = TradingBot(symbol)
+        self.bots[symbol] = TradingBot(symbol, news=self.news)
         self.bots[symbol].start()
         _persist("log control event", repo.record_control_event,
                  symbol, "start", True, None)
@@ -1371,6 +1434,8 @@ class BotManager:
                 bot.join(timeout=5)
                 if bot.is_alive():
                     log("%s: bot thread did not stop within 5s" % symbol)
+        # S9: after the bots, so no thread can ask a stopped feed for a verdict.
+        self.news.stop()
         mt5.shutdown()
 
     # ---- reporting ----------------------------------------------------------
