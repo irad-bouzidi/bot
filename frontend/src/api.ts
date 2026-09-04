@@ -132,8 +132,13 @@ export interface SettingsChange {
   symbol: string;
   lot_size: number;
   partial_fraction: number;
+  // Nullable because a row written before the flag existed has no honest
+  // answer: the rule was unconditionally on, so `false` would misreport it and
+  // `true` would claim somebody chose it.
+  exit_at_mean: boolean | null;
   prev_lot_size: number | null;
   prev_partial_fraction: number | null;
+  prev_exit_at_mean: boolean | null;
   source: string;
   notes: string | null;
   created_at: string;
@@ -164,6 +169,13 @@ export const saveSizing = (symbol: string, lotSize: number, scaleOutLots: number
     lot_size: lotSize,
     scale_out_lots: scaleOutLots,
   });
+
+// Sends the flag and NOTHING else, which is the whole point. The backend reads
+// an absent field as "leave it alone", and a request carrying `lot_size` is
+// refused outright while a position is open -- so folding this into saveSizing
+// would make the switch unusable in exactly the situation it exists for.
+export const saveExitAtMean = (symbol: string, exitAtMean: boolean) =>
+  postJson<any>('/settings', { symbol, exit_at_mean: exitAtMean });
 
 export const getSettingsHistory = (symbol?: string, limit = 20) =>
   request<{ history: SettingsChange[] }>(

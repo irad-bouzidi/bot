@@ -30,6 +30,7 @@ const sizing = (symbol: string, pip: number, slPips: number, tpPips: number) => 
   symbol,
   lot_size: 0.1,
   partial_fraction: 0.5,
+  exit_at_mean: false,
   scale_out_lots: 0.05,
   runner_lots: 0.05,
   splittable: true,
@@ -77,13 +78,18 @@ const stats = {
 };
 
 /** Route each endpoint the dashboard polls to a canned body. */
-function mockApi(preferences: Record<string, any>, available = true) {
+function mockApi(
+  preferences: Record<string, any>,
+  available = true,
+  settingsBody: Record<string, any> = settings,
+  statsBody: Record<string, any> = stats,
+) {
   const routes: Array<[string, unknown]> = [
     ['/preferences', { available, preferences }],
     ['/health', health],
-    ['/stats', stats],
+    ['/stats', statsBody],
     ['/settings/history', { history: [] }],
-    ['/settings', settings],
+    ['/settings', settingsBody],
     ['/trades', { trades: [], total: 0, limit: 100, offset: 0 }],
     ['/backtests', { runs: [] }],
   ];
@@ -318,3 +324,147 @@ test('a failed symbol fetch says so instead of quietly showing one symbol', asyn
     await screen.findByText(/the symbol list comes from the backend/i),
   ).toBeInTheDocument();
 });
+
+// --- the centre-line exit toggle -------------------------------------------
+//
+// This rule closed the scaled-out half of trades before they could reach their
+// target, and until now it was hardcoded in three engines with no off-switch
+// anywhere. These pin the two properties that make the switch trustworthy: it
+// shows what the server actually holds, and it stays usable while a trade is
+// open -- which is the only moment anybody reaches for it.
+
+test('the centre-line exit switch shows what /settings holds, per symbol', async () => {
+  global.fetch = mockApi({ theme: 'light', view: 'dashboard' }, true, {
+    XAUUSDm: { ...sizing('XAUUSDm', 0.1, 70, 100), exit_at_mean: true },
+    BTCUSDm: sizing('BTCUSDm', 1.0, 700, 1000),
+  }) as any;
+
+  render(<App />);
+
+  const boxes = await screen.findAllByRole('checkbox', { name: /centre line/i });
+  expect(boxes).toHaveLength(2);
+  expect(boxes[0]).toBeChecked();
+  expect(boxes[1]).not.toBeChecked();
+});
+
+test('toggling the exit rule posts the flag and NOT the lot size', async () => {
+  // The whole reason it is a separate control: a request carrying `lot_size` is
+  // refused while a position is open, so a form that always sent all three
+  // fields would make the switch dead in exactly the state it matters in.
+  const fetchMock = mockApi({ theme: 'light', view: 'dashboard' });
+  const posted: any[] = [];
+  global.fetch = jest.fn((input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url.includes('/settings') && !url.includes('/settings/history') && init?.body) {
+      posted.push(JSON.parse(String(init.body)));
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve({ ...sizing('XAUUSDm', 0.1, 70, 100), exit_at_mean: true, notes: [] }),
+      } as Response);
+    }
+    return fetchMock(input);
+  }) as any;
+
+  render(<App />);
+  const boxes = await screen.findAllByRole('checkbox', { name: /centre line/i });
+  fireEvent.click(boxes[0]);
+
+  await waitFor(() => expect(posted).toHaveLength(1));
+  expect(posted[0]).toEqual({ symbol: 'XAUUSDm', exit_at_mean: true });
+  expect(posted[0]).not.toHaveProperty('lot_size');
+  expect(posted[0]).not.toHaveProperty('scale_out_lots');
+});
+
+test('the exit rule stays editable while the lot numbers are locked', async () => {
+  const locked = {
+    ...sizing('XAUUSDm', 0.1, 70, 100),
+    open_positions: 1,
+    locked: true,
+  };
+  global.fetch = mockApi({ theme: 'light', view: 'dashboard' }, true, {
+    XAUUSDm: locked,
+    BTCUSDm: sizing('BTCUSDm', 1.0, 700, 1000),
+  }) as any;
+
+  render(<App />);
+
+  const lots = await screen.findAllByLabelText('Lot size');
+  expect(lots[0]).toBeDisabled();
+  const boxes = await screen.findAllByRole('checkbox', { name: /centre line/i });
+  expect(boxes[0]).toBeEnabled();
+});
+
+test('a failed settings poll says the values on the card are stale', async () => {
+  // `settings` keeps its last value on failure. A stale lot size is visible
+  // against the dollar-risk figure beside it; a stale BOOLEAN is not -- a switch
+  // reading "off" while the bot is running with the rule on looks exactly like
+  // the truth, so the staleness has to be stated.
+  const fetchMock = mockApi({ theme: 'light', view: 'dashboard' });
+  global.fetch = jest.fn((input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.includes('/settings') && !url.includes('/settings/history')) {
+      return Promise.reject(new TypeError('Failed to fetch'));
+    }
+    return fetchMock(input);
+  }) as any;
+
+  render(<App />);
+
+  // One per bot card: the note sits on the card whose values are stale, not in a
+  // single banner, because /stats already owns the "backend is down" banner.
+  expect(await screen.findAllByText(/exit rules could not be refreshed/i)).toHaveLength(2);
+});
+
+// --- a frozen account reading ----------------------------------------------
+
+test('an account snapshot MT5 stopped refreshing is labelled, not shown as live', async () => {
+  // /stats serves the last stored snapshot when MT5 does not answer, which is
+  // the right call -- the last known balance beats an empty panel. What is
+  // pinned here is that the panel says so: the note that normally sits under
+  // the grid promises a once-a-minute refresh, so an unlabelled seven-hour-old
+  // reading presents a dead terminal as a live account.
+  const frozen = {
+    ...stats,
+    account: {
+      ...stats.account,
+      captured_at: '2026-09-04T11:04:07+00:00',
+      age_seconds: 24564,
+      stale: true,
+    },
+  };
+  const fetchMock = mockApi({ theme: 'light', view: 'dashboard' }, true, settings, frozen);
+  global.fetch = fetchMock as any;
+
+  render(<App />);
+
+  expect(await screen.findByText(/not refreshing/i)).toBeInTheDocument();
+  expect(screen.getByText(/6\.8 h old/)).toBeInTheDocument();
+  expect(screen.getByText(/2026-09-04 11:04:07 UTC/)).toBeInTheDocument();
+  // The reassuring version must be gone, not merely joined by the warning.
+  expect(screen.queryByText(/refreshed at most once a minute/i)).not.toBeInTheDocument();
+  // And the snapshot's own bookkeeping never becomes a stat card beside balance.
+  expect(screen.queryByText('age seconds')).not.toBeInTheDocument();
+  // Balance and equity both read 1,000, hence getAllByText: the point is that
+  // the figures are still served, only no longer presented as current.
+  expect(screen.getAllByText('1,000').length).toBeGreaterThan(0);
+});
+
+test('a fresh account snapshot keeps the ordinary throttle note', async () => {
+  const fresh = {
+    ...stats,
+    account: {
+      ...stats.account,
+      captured_at: '2026-09-04T17:53:31+00:00',
+      age_seconds: 12,
+      stale: false,
+    },
+  };
+  global.fetch = mockApi({ theme: 'light', view: 'dashboard' }, true, settings, fresh) as any;
+
+  render(<App />);
+
+  expect(await screen.findByText(/refreshed at most once a minute/i)).toBeInTheDocument();
+  expect(screen.queryByText(/not refreshing/i)).not.toBeInTheDocument();
+});
+

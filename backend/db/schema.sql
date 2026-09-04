@@ -20,18 +20,23 @@ CREATE TABLE IF NOT EXISTS schema_version (
 -- ---------------------------------------------------------------------------
 -- 1. Sizing -- the two runtime-editable numbers, previously data/settings.json
 -- ---------------------------------------------------------------------------
--- Only `lot_size` and `partial_fraction` live here, matching EDITABLE_KEYS. The
--- store must never be able to introduce a symbol or move a stop: those come
--- from SYMBOL_CONFIG in code, backtested, and a row here cannot reach them.
+-- Only the EDITABLE_KEYS live here -- `lot_size`, `partial_fraction` and
+-- `exit_at_mean`. The store must never be able to introduce a symbol or move a
+-- stop: those come from SYMBOL_CONFIG in code, backtested, and a row here
+-- cannot reach them. Every column below either sizes a position or removes an
+-- exit.
 --
 -- The CHECK constraints are a second line of defence behind _validated(). The
 -- file-based store could only reject a bad value on the way *out* (at load),
 -- so a hand-edited file kept its bad value silently until the next restart;
--- these reject it on the way *in*.
+-- these reject it on the way *in*. `exit_at_mean` has no CHECK because it does
+-- not need one: BOOLEAN NOT NULL has no out-of-range value to reject, so the
+-- type IS the constraint. Its absence is not an omission.
 CREATE TABLE IF NOT EXISTS symbol_settings (
     symbol            TEXT PRIMARY KEY,
     lot_size          DOUBLE PRECISION NOT NULL,
     partial_fraction  DOUBLE PRECISION NOT NULL DEFAULT 0,
+    exit_at_mean      BOOLEAN NOT NULL DEFAULT FALSE,
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT symbol_settings_lot_positive
         CHECK (lot_size > 0),
@@ -39,20 +44,47 @@ CREATE TABLE IF NOT EXISTS symbol_settings (
         CHECK (partial_fraction >= 0 AND partial_fraction < 1)
 );
 
+-- For databases created before the centre-line exit became editable (schema
+-- version 3). Both paths run this file, and on a fresh volume it is a no-op --
+-- the column is already in the CREATE above. On an EXISTING volume this is the
+-- only thing that adds it: Postgres ignores /docker-entrypoint-initdb.d/ once a
+-- data directory exists, so `python -m backend.db.migrate` is what applies it.
+--
+-- FALSE is a behaviour change, deliberately: before version 3 the rule was
+-- hardcoded ON in all three engines, so migrating switches it off. That is the
+-- point of the version -- it was closing the scaled-out half of every trade
+-- before the target could be reached.
+ALTER TABLE symbol_settings
+    ADD COLUMN IF NOT EXISTS exit_at_mean BOOLEAN NOT NULL DEFAULT FALSE;
+
 -- Append-only history of every sizing change. `lot_size` is the only risk
 -- control this bot has, so "who moved it to 0.5 and when" is worth more than
 -- the disk it costs; the JSON file overwrote its own history on every save.
+--
+-- `exit_at_mean` and `prev_exit_at_mean` are NULLABLE, unlike the two sizing
+-- columns beside them, so that NULL reads as "written before the toggle
+-- existed". A NOT NULL DEFAULT would have to invent a value for every
+-- historical row -- and would then also silently supply it to any future insert
+-- that omitted the column, recording a state nobody chose.
 CREATE TABLE IF NOT EXISTS settings_audit (
     id                     BIGSERIAL PRIMARY KEY,
     symbol                 TEXT NOT NULL,
     lot_size               DOUBLE PRECISION NOT NULL,
     partial_fraction       DOUBLE PRECISION NOT NULL,
+    exit_at_mean           BOOLEAN,
     prev_lot_size          DOUBLE PRECISION,
     prev_partial_fraction  DOUBLE PRECISION,
+    prev_exit_at_mean      BOOLEAN,
     source                 TEXT NOT NULL DEFAULT 'api',
     notes                  TEXT,
     created_at             TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Schema version 3, for an existing volume. No-ops on a fresh one.
+ALTER TABLE settings_audit
+    ADD COLUMN IF NOT EXISTS exit_at_mean BOOLEAN;
+ALTER TABLE settings_audit
+    ADD COLUMN IF NOT EXISTS prev_exit_at_mean BOOLEAN;
 
 CREATE INDEX IF NOT EXISTS settings_audit_symbol_idx
     ON settings_audit (symbol, created_at DESC);
@@ -312,5 +344,9 @@ CREATE INDEX IF NOT EXISTS account_snapshots_captured_idx
 
 -- 1: initial schema.
 -- 2: backtest_runs.symbols / .sizing -- a run can cover several symbols at once.
-INSERT INTO schema_version (version) VALUES (1), (2)
+-- 3: symbol_settings.exit_at_mean -- the centre-line exit became a UI toggle,
+--    plus the two matching settings_audit columns. Applying this version
+--    CHANGES LIVE BEHAVIOUR: the rule was hardcoded on before it, and existing
+--    rows get FALSE.
+INSERT INTO schema_version (version) VALUES (1), (2), (3)
 ON CONFLICT (version) DO NOTHING;

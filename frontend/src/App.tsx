@@ -11,6 +11,7 @@ import {
   getSettings,
   getSettingsHistory,
   getStats,
+  saveExitAtMean,
   saveSizing,
 } from './api';
 import { usePreferences } from './usePreferences';
@@ -18,6 +19,20 @@ import { usePreferences } from './usePreferences';
 const Skeleton = ({ className = '' }: { className?: string }) => (
   <div className={`skeleton ${className}`} />
 );
+
+const utcStamp = (iso: string) =>
+  new Date(iso).toISOString().slice(0, 19).replace('T', ' ');
+
+// The account panel's age comes from the API (`now() - MAX(captured_at)`,
+// measured by Postgres) rather than from subtracting `captured_at` against this
+// browser's clock, so a laptop with the wrong time cannot invent or hide
+// staleness. Formatted coarsely on purpose: the question this answers is
+// "minutes or hours?", not "how many seconds?".
+const snapshotAge = (seconds: number) => {
+  if (seconds < 90) return `${Math.round(seconds)}s`;
+  if (seconds < 5400) return `${Math.round(seconds / 60)} min`;
+  return `${(seconds / 3600).toFixed(1)} h`;
+};
 
 type View = 'dashboard' | 'backtest' | 'trades';
 const VIEWS: View[] = ['dashboard', 'backtest', 'trades'];
@@ -166,6 +181,16 @@ const SizingHistory = ({ symbol }: { symbol: string }) => {
                       : `${r.lot_size} lots`}
                     {' · '}
                     {(r.partial_fraction * 100).toFixed(0)}% scale-out
+                    {/* Without this, a flag-only edit renders identically to the
+                        row above it and reads as "nothing changed". */}
+                    {r.prev_exit_at_mean !== null &&
+                      r.prev_exit_at_mean !== r.exit_at_mean && (
+                        <>
+                          {' · '}
+                          centre-line exit {r.prev_exit_at_mean ? 'on' : 'off'} →{' '}
+                          {r.exit_at_mean ? 'on' : 'off'}
+                        </>
+                      )}
                   </span>
                   <span className="history-source">{r.source}</span>
                 </li>
@@ -317,7 +342,90 @@ const SizingEditor = ({ symbol, sizing, onSaved }: { symbol: string; sizing: any
         </button>
       </div>
 
+      <ExitRuleToggle symbol={symbol} sizing={sizing} onSaved={onSaved} />
       <SizingHistory symbol={symbol} />
+    </div>
+  );
+};
+
+// Deliberately NOT a field in the sizing form above, for three reasons: it is an
+// exit rule and not a size; every input up there is disabled while a position is
+// open and this one must not be; and Save is gated on the sizing form being
+// valid, which would make this unreachable in exactly the state it matters in.
+// It applies immediately for the same reason -- there is nothing to validate
+// against, so a Save button would only add a step.
+const ExitRuleToggle = ({ symbol, sizing, onSaved }: { symbol: string; sizing: any; onSaved: () => void }) => {
+  const [on, setOn] = useState<boolean>(!!sizing.exit_at_mean);
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
+
+  // Adopt the server's value whenever it changes and we are not mid-request.
+  // `sizing.exit_at_mean` must be in the dependency list or a change made in
+  // another tab would never appear here.
+  useEffect(() => {
+    if (busy) return;
+    setOn(!!sizing.exit_at_mean);
+  }, [sizing.exit_at_mean, busy]);
+
+  const toggle = async (next: boolean) => {
+    setBusy(true);
+    setMsg(null);
+    // Optimistic, then corrected from the response: the switch has to feel
+    // immediate, but what it reports must be what the database accepted.
+    setOn(next);
+    try {
+      const data = await saveExitAtMean(symbol, next);
+      setOn(!!data.exit_at_mean);
+      setMsg({ ok: true, text: data.notes?.length ? data.notes.join(' ') : 'Saved.' });
+      onSaved();
+    } catch (e: any) {
+      // Snapped back rather than left showing what was asked for. A switch that
+      // displays "off" after a refused write is the one failure this control
+      // cannot have: the user would leave a trade running believing the rule
+      // was off, and the bot would close it at the centre line anyway.
+      setOn(!!sizing.exit_at_mean);
+      setMsg({ ok: false, text: e instanceof ApiError ? e.message : 'Could not reach the backend.' });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="exit-rules">
+      <div className="sizing-head">
+        <span className="sizing-title">Exit rules</span>
+      </div>
+      <label className="exit-rule-row">
+        <input
+          type="checkbox"
+          checked={on}
+          disabled={busy}
+          onChange={e => toggle(e.target.checked)}
+        />
+        <span>Close at the centre line</span>
+      </label>
+      <p className="sizing-hint">
+        {on ? (
+          <>
+            <b>On.</b> A position also closes as soon as a closed bar prints back at the
+            envelope's centre line — <b>before</b> the target. The centre sits between the
+            scale-out trigger and the target, so a scaled-out runner is usually closed here
+            instead of reaching its take-profit.
+          </>
+        ) : (
+          <>
+            <b>Off.</b> The only exits are the stop, the target, and the break-even stop
+            after a scale-out. Nothing else closes a position.
+          </>
+        )}
+      </p>
+      {sizing.locked && (
+        <p className="sizing-hint muted">
+          Changeable while a position is open, unlike the lot numbers above — it derives
+          nothing from the position. Takes effect on the next closed bar.
+        </p>
+      )}
+      {msg && <p className={`sizing-msg ${msg.ok ? 'ok' : 'err'}`}>{msg.text}</p>}
     </div>
   );
 };
@@ -325,6 +433,7 @@ const SizingEditor = ({ symbol, sizing, onSaved }: { symbol: string; sizing: any
 const Dashboard = () => {
   const [data, setData] = useState<any>(null);
   const [settings, setSettings] = useState<any>({});
+  const [settingsError, setSettingsError] = useState<string | null>(null);
   const [health, setHealth] = useState<Health | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -361,10 +470,17 @@ const Dashboard = () => {
   const fetchSettings = useCallback(async () => {
     try {
       setSettings(await getSettings());
-    } catch (e) {
-      // Deliberately quiet: the /stats poll already reports a dead backend, and a
-      // second banner saying the same thing would just push the retry button off.
+      setSettingsError(null);
+    } catch (e: any) {
+      // Still not a banner -- the /stats poll already reports a dead backend and
+      // a second one would push its retry button off the screen. But no longer
+      // silent either: `settings` keeps its last value on failure, so the panel
+      // goes on showing the values from the last good poll. A stale lot size is
+      // visible against the dollar-risk figure printed beside it; a stale
+      // BOOLEAN is not -- a switch reading "off" while the bot is running with
+      // the rule on is indistinguishable from the truth.
       console.error('Failed to fetch settings', e);
+      setSettingsError(e?.message || 'Could not reach the backend.');
     }
   }, []);
 
@@ -510,8 +626,10 @@ const Dashboard = () => {
           <p className="eyebrow">Account Overview</p>
           <div className="stats-grid">
             {data?.account && Object.entries(data.account).map(([key, val]: any) => {
-              // captured_at and stale describe the snapshot, not the account.
-              if (key === 'time_profits' || key === 'captured_at' || key === 'stale') return null;
+              // captured_at, age_seconds and stale describe the snapshot, not
+              // the account, and are reported in the note under the grid.
+              if (key === 'time_profits' || key === 'captured_at'
+                  || key === 'age_seconds' || key === 'stale') return null;
               const displayValue = typeof val === 'number' ? val.toLocaleString(undefined, { maximumFractionDigits: 2 }) : val;
               return (
                 <div key={key} className="stat-card">
@@ -522,12 +640,27 @@ const Dashboard = () => {
             })}
           </div>
           {data?.account?.captured_at && (
-            <p className="snapshot-note">
-              Account snapshot taken{' '}
-              {new Date(data.account.captured_at).toISOString().slice(0, 19).replace('T', ' ')} UTC —
-              refreshed at most once a minute, because the period profits behind it are
-              four year-long history scans over IPC.
-            </p>
+            data.account.stale ? (
+              // Past the throttle with no fresh capture means MT5 did not
+              // answer, so these numbers are frozen. The balance is still worth
+              // showing -- it is the last one that was true -- but the note that
+              // used to sit here promised a once-a-minute refresh, which turned
+              // a dead terminal into what looked like a clock bug.
+              <p className="snapshot-note stale">
+                ⚠ Not refreshing. This reading is{' '}
+                {snapshotAge(data.account.age_seconds || 0)} old, taken{' '}
+                {utcStamp(data.account.captured_at)} UTC — the MT5 terminal is not
+                answering, so the balance, equity and profit periods above are the
+                last ones that were true, not the current ones. The bot cards below
+                are read from Postgres and are unaffected.
+              </p>
+            ) : (
+              <p className="snapshot-note">
+                Account snapshot taken {utcStamp(data.account.captured_at)} UTC —
+                refreshed at most once a minute, because the period profits behind it are
+                four year-long history scans over IPC.
+              </p>
+            )
           )}
 
           {/* Time-based Profits */}
@@ -639,6 +772,12 @@ const Dashboard = () => {
                     </p>
                   )}
 
+                  {settingsError && (
+                    <p className="sizing-msg err">
+                      Sizing and exit rules could not be refreshed — {settingsError}
+                      {settings[symbol] ? ' The values below are from the last good read.' : ''}
+                    </p>
+                  )}
                   {settings[symbol] && !settings[symbol].error && (
                     <SizingEditor
                       symbol={symbol}

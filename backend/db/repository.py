@@ -5,8 +5,8 @@ Python 3.8: `typing.Optional/List/Dict` and `# type:` comments, never `X | Y`.
 Two rules this module exists to enforce:
 
   * **The store cannot widen its own reach.** `load_settings()` SELECTs exactly
-    the two EDITABLE_KEYS columns for exactly the symbols the caller names, and
-    pushes both through the caller's validator. The file-based store had the
+    the EDITABLE_KEYS columns for exactly the symbols the caller names, and
+    pushes every one through the caller's validator. The file-based store had the
     same narrowness written into `_load_settings()`; moving to a database makes
     it matter more, not less, because a database is writable by `psql`, by a
     migration and by anything else with the DSN -- so a row must still not be
@@ -19,6 +19,7 @@ Two rules this module exists to enforce:
 
 import os
 
+from backend.core.symbols import BOOL_KEYS, EDITABLE_KEYS
 from backend.db import pool
 from backend.db.pool import cursor, json_param
 
@@ -86,21 +87,26 @@ def tables_present():
 # ---------------------------------------------------------------------------
 
 def load_settings(symbols, validate=None, on_reject=None):
-    """The persisted sizing for `symbols`, as {symbol: {key: value}}.
+    """The persisted settings for `symbols`, as {symbol: {key: value}}.
 
-    Only the two editable columns, only the symbols asked for, and every value
+    Only the editable columns, only the symbols asked for, and every value
     passed through `validate(key, value)` before it is handed back. A value the
     validator refuses is dropped and reported through `on_reject` rather than
     returned, so an out-of-range row leaves the code default standing -- the
-    same contract the JSON loader had, for the same reason: this is the number
-    that decides how much money is at risk per trade.
+    same contract the JSON loader had, for the same reason: these are the
+    numbers that decide how much money is at risk per trade.
+
+    The SELECT stays written out rather than built from EDITABLE_KEYS -- all the
+    SQL in this project is literal -- but the loop below reads that tuple, so
+    adding a key without adding its column raises a KeyError here instead of
+    silently returning one fewer setting than the caller asked for.
     """
     if not symbols:
         return {}
     out = {}
     with cursor() as cur:
         cur.execute("""
-            SELECT symbol, lot_size, partial_fraction
+            SELECT symbol, lot_size, partial_fraction, exit_at_mean
             FROM symbol_settings
             WHERE symbol = ANY(%s)
         """, (list(symbols),))
@@ -108,12 +114,17 @@ def load_settings(symbols, validate=None, on_reject=None):
     for row in rows:
         symbol = row["symbol"]
         values = {}
-        for key in ("lot_size", "partial_fraction"):
+        for key in EDITABLE_KEYS:
             raw = row[key]
             if raw is None:
                 continue
             if validate is None:
-                values[key] = float(raw)
+                # Only reached by callers that opted out of validation (the
+                # migrate path's existence check). float() would turn False into
+                # 0.0 and then back into a truthy 0.0 nowhere -- but it would
+                # also make `exit_at_mean` compare unequal to the bool the rest
+                # of the code holds, so the type has to survive.
+                values[key] = bool(raw) if key in BOOL_KEYS else float(raw)
                 continue
             try:
                 values[key] = validate(key, raw)
@@ -125,49 +136,64 @@ def load_settings(symbols, validate=None, on_reject=None):
     return out
 
 
-def save_settings(symbol, lot_size, partial_fraction, source="api", notes=None):
-    """Upsert the sizing and append an audit row, in ONE transaction.
+def save_settings(symbol, lot_size, partial_fraction, exit_at_mean,
+                  source="api", notes=None):
+    """Upsert the settings and append an audit row, in ONE transaction.
 
     Together, because the audit row's `prev_*` columns are read from the table
     in the same statement that overwrites it. Split across two transactions, a
     concurrent save would let both audit rows claim the same previous value and
     the history would no longer reconstruct.
+
+    Every EDITABLE_KEYS value is required, not optional. The caller resolves
+    "leave this one alone" against the value currently in SYMBOL_CONFIG before
+    it gets here (see BotManager.update_settings), so a partial write cannot
+    reach the table and leave the audit trail claiming a change that was never
+    requested.
     """
     note = None if not notes else " ".join(notes) if isinstance(notes, (list, tuple)) else str(notes)
     with cursor() as cur:
         cur.execute("""
             WITH prev AS (
-                SELECT lot_size, partial_fraction
+                SELECT lot_size, partial_fraction, exit_at_mean
                 FROM symbol_settings WHERE symbol = %(symbol)s
             ), upsert AS (
-                INSERT INTO symbol_settings (symbol, lot_size, partial_fraction, updated_at)
-                VALUES (%(symbol)s, %(lot)s, %(fraction)s, now())
+                INSERT INTO symbol_settings
+                    (symbol, lot_size, partial_fraction, exit_at_mean, updated_at)
+                VALUES (%(symbol)s, %(lot)s, %(fraction)s, %(exit_at_mean)s, now())
                 ON CONFLICT (symbol) DO UPDATE
                     SET lot_size = EXCLUDED.lot_size,
                         partial_fraction = EXCLUDED.partial_fraction,
+                        exit_at_mean = EXCLUDED.exit_at_mean,
                         updated_at = now()
-                RETURNING lot_size, partial_fraction, updated_at
+                RETURNING lot_size, partial_fraction, exit_at_mean, updated_at
             )
             INSERT INTO settings_audit
-                (symbol, lot_size, partial_fraction,
-                 prev_lot_size, prev_partial_fraction, source, notes)
-            SELECT %(symbol)s, u.lot_size, u.partial_fraction,
+                (symbol, lot_size, partial_fraction, exit_at_mean,
+                 prev_lot_size, prev_partial_fraction, prev_exit_at_mean,
+                 source, notes)
+            SELECT %(symbol)s, u.lot_size, u.partial_fraction, u.exit_at_mean,
                    (SELECT lot_size FROM prev), (SELECT partial_fraction FROM prev),
+                   (SELECT exit_at_mean FROM prev),
                    %(source)s, %(notes)s
             FROM upsert u
-            RETURNING lot_size, partial_fraction
+            RETURNING lot_size, partial_fraction, exit_at_mean
         """, {"symbol": symbol, "lot": float(lot_size),
-              "fraction": float(partial_fraction), "source": source, "notes": note})
+              "fraction": float(partial_fraction),
+              "exit_at_mean": bool(exit_at_mean),
+              "source": source, "notes": note})
         row = cur.fetchone()
         return {"lot_size": float(row["lot_size"]),
-                "partial_fraction": float(row["partial_fraction"])}
+                "partial_fraction": float(row["partial_fraction"]),
+                "exit_at_mean": bool(row["exit_at_mean"])}
 
 
 def settings_history(symbol=None, limit=50):
     with cursor() as cur:
         cur.execute("""
-            SELECT id, symbol, lot_size, partial_fraction,
-                   prev_lot_size, prev_partial_fraction, source, notes, created_at
+            SELECT id, symbol, lot_size, partial_fraction, exit_at_mean,
+                   prev_lot_size, prev_partial_fraction, prev_exit_at_mean,
+                   source, notes, created_at
             FROM settings_audit
             WHERE (%(symbol)s IS NULL OR symbol = %(symbol)s)
             ORDER BY created_at DESC, id DESC

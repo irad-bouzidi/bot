@@ -22,7 +22,7 @@ python -m pytest
 python -m pytest tests/test_backtest_engine.py::test_intrabar_stop_is_detected_even_when_close_recovers
 python -m pytest -k lookahead
 python -m pytest tests/test_db_repository.py   # needs the db container up (32 tests)
-npm test --prefix frontend               # CRA/jest; App.test.tsx (4 tests)
+npm test --prefix frontend               # CRA/jest; App.test.tsx (17 tests)
 
 # Run -- the API needs BOTH a live MT5 terminal and a reachable Postgres
 python -m backend.main                   # FastAPI on 127.0.0.1:8000
@@ -35,24 +35,16 @@ docker compose up -d --build frontend
 # edges lets a losing one hide behind a winning one.
 python -m backend.scripts.run_baseline --symbol XAUUSDm --compare-legacy
 python -m backend.scripts.run_baseline --symbol BTCUSDm --start 2025-09-01
+# The centre-line exit is a flag now, defaulting from SYMBOL_CONFIG (currently
+# OFF on both symbols) and printed at the top of every report. Pass it to
+# reproduce a report stored before the flag existed -- they were all made with
+# the rule ON:
+python -m backend.scripts.run_baseline --symbol XAUUSDm --exit-at-mean
+python -m backend.scripts.run_baseline --symbol XAUUSDm --no-exit-at-mean
 # --sl/--tp are PRICE units, SYMBOL_CONFIG is pip COUNTS times a per-symbol pip.
 # They now DEFAULT from backend/core/symbols.py -- gold 70x0.1 -> 7/10, Bitcoin
 # 700x1.0 -> 700/1000 -- and the chosen numbers are printed at the top of the
 # report. Passing 7/10 for BTCUSDm would put a $7 stop on an $81,000 instrument.
-
-# News calendar (S9). The ONE networked command in the repo -- a public
-# ForexFactory GET, no API key. Verify the feed with this BEFORE starting a bot
-# against it: the bot fails closed, so a 404/429 or a changed payload shape
-# shows up as a bot that refuses to trade rather than as an error.
-python -m backend.live.news_feed --fetch --root data
-python -m backend.live.news_feed --fetch --symbol XAUUSDm   # + that symbol's next event
-python -m backend.live.news_feed --fetch --no-archive       # probe, write nothing
-
-# Replay a window WITH the blackout, to price it. With no --news-file the
-# calendar is empty and the run is byte-identical to a pre-S9 one.
-python -m backend.scripts.run_baseline --symbol XAUUSDm --news-file data/news
-python -m backend.scripts.run_baseline --symbol XAUUSDm --news-file data/news \
-    --news-before 60 --news-after 15 --news-impacts high
 
 # Data capture (MT5 host only)
 python -m backend.data.snapshot --symbol XAUUSDm --start 2023-01-01
@@ -127,7 +119,7 @@ This is the most important thing to understand before editing.
 | Config | `SYMBOL_CONFIG` (`backend/core/symbols.py`), pip counts; sizing from Postgres | `NWConfig` + `BacktestConfig`, price units |
 | Storage | Postgres (`backend/db/`) | `data/` files only — never Postgres |
 | Sizing | `SYMBOL_CONFIG["lot_size"]` / `"partial_fraction"`, editable via `POST /settings` | `BacktestConfig.volume` / `NWConfig.partial_fraction`, CLI flags |
-| News blackout (S9) | `TradingBot.run` (flatten + entry veto), events from `backend/live/news_feed.py` | `NWEnvelopeStrategy.on_bar`, events from a `--news-file` — **empty by default** |
+| Centre-line exit | `TradingBot._mean_reversion_exit`, gated on `SYMBOL_CONFIG["exit_at_mean"]` from Postgres | `NWEnvelopeStrategy.on_bar`, gated on `NWConfig.exit_at_mean` — **both default OFF** |
 
 `POST /backtest` (used by the frontend Backtest page) still runs the **legacy** engine, so
 its numbers are systematically optimistic and do not match `run_baseline`. It can now
@@ -179,6 +171,15 @@ Storage: `backtest_runs` gains `symbols TEXT[]` and `sizing JSONB` (schema versi
 matches on the array too, so a combined run appears under either symbol's filter -- it is
 a fact about both.
 
+**Schema version 3** adds `symbol_settings.exit_at_mean` plus the two matching
+`settings_audit` columns. `REQUIRED_SCHEMA_VERSION` in `bot_manager.py` is a **floor**,
+not a "has any schema" check: `load_settings()` names the new column, so a database left
+at version 2 would fail inside `_load_settings()` with a psycopg2 `UndefinedColumn` --
+past the point where `init_persistence()` can still print the migrate command. Applying
+version 3 also **changes live behaviour**, since the centre-line exit was unconditional
+before it; `python -m backend.db.migrate` is what switches it off, and the container's
+init-dir mount will not do it (Postgres ignores that directory once a volume exists).
+
 ### Persistence (`backend/db/`)
 
 Everything the UI can change, and every trade, is in Postgres. Nothing that
@@ -223,7 +224,7 @@ which is strictly worse than a gap in the history. The gap is reported through
 
 | Table | Replaces | Note |
 |---|---|---|
-| `symbol_settings` | `data/settings.json` | the two `EDITABLE_KEYS` only; CHECK constraints refuse a bad value on the way *in*, which a file could not |
+| `symbol_settings` | `data/settings.json` | the three `EDITABLE_KEYS` only; CHECK constraints refuse a bad value on the way *in*, which a file could not. `exit_at_mean` is BOOLEAN and needs none -- the type is the constraint |
 | `settings_audit` | nothing | append-only; the file overwrote its own history on every save |
 | `bot_state` | instance attributes | `desired_state` + the S4 `last_bar_time`/`last_entry_bar` |
 | `control_events` | nothing | every start/stop press, accepted or refused |
@@ -314,7 +315,9 @@ original code while Pine uses 499; the off-by-one is deliberate and configurable
 
 ### Live loop invariants (`bot_manager.py`)
 
-Each is a fix for a real incident, marked `S1`–`S6` in comments:
+Each is a fix for a real incident, marked `S1`–`S10` in comments. **`S9` is retired**
+— it was the news blackout, now removed — and the number is deliberately left as a gap
+rather than reused, so an `S9` in an older comment or commit still means what it said:
 
 - `bot_positions()` filters by `MAGIC_NUMBER` — the bot must never touch manually opened
   positions.
@@ -339,6 +342,12 @@ Each is a fix for a real incident, marked `S1`–`S6` in comments:
   repeat-fire S4 exists to prevent, reachable from the dashboard's own buttons.
   Memory stays the working copy and is written through, so a Postgres outage
   degrades to the old behaviour rather than halting a bot holding a position.
+- `S10`: the centre-line exit lives in `_mean_reversion_exit()`, extracted from `run()`
+  rather than inlined. Two reasons. It reads `exit_at_mean` under `_CONFIG_LOCK` — unlike
+  `pip` in `manage_position()`, this key is editable at runtime *and* editable while a
+  position is open, so the loop can genuinely race a save. And nothing in the suite drives
+  `run()`, so for as long as it was six inlined lines, the rule deciding most of this
+  strategy's exits had no test at all.
 
 ### Scale-out / break-even
 
@@ -361,130 +370,64 @@ was asked for, not because the data supports it;
 or a scale-out of **0 lots** in the dashboard's Position sizing panel, turns it off.
 Re-run the comparison before drawing any conclusion from a report that predates it.
 
-Of the trades that do scale out, the remainder reaches the target 55% of the time,
-break-even 32%, and the centre-line exit 13% — so the mean-reversion exit intercepts the
-runner much less often than the band geometry suggests. Disabling `exit_at_mean` raises the
-TP share to 62% and makes expectancy worse, so leave it on.
+### Centre-line (mean-reversion) exit — a UI toggle, default OFF
+
+The rule that closed a position when a closed bar printed back at the envelope's **centre**
+line. It is now `SYMBOL_CONFIG["exit_at_mean"]`, the **third** `EDITABLE_KEYS` entry, and it
+ships **off** on both symbols. `run_baseline` takes `--exit-at-mean` / `--no-exit-at-mean`
+and defaults from `SYMBOL_CONFIG`; the dashboard has a switch in the bot card's *Exit rules*
+block. With it off, a trade can only end at its stop, its break-even stop, or its target
+(nothing else closes a position).
+
+**Why it was turned off.** The centre line sits about `mult * mae` from entry — ~6.00 on
+gold — which is *past* the 5.00 scale-out trigger and *short* of the 10.00 target. The rule
+has **no scale-out awareness** (no volume check, no `be_moved` flag), so it raced the
+break-even stop and the target on every trade that banked a partial. A live XAUUSDm short
+entered at 4485.183 (SL 4492.183, TP 4475.183) banked half at 4480.183, moved its stop to
+break-even, and was then closed here at **4479.196** — short of the target it had been left
+running for. On the legacy engine that single trade is $54.94 with the rule on and $75.00
+with it off.
+
+**The previous census in this file was wrong**, and could not be checked: it claimed the
+scaled-out remainder reached the target 55% / break-even 32% / centre line 13%, but
+`data/reports/BTCUSDm_20260904_102130_ledger.csv` gives **signal 65.8% / be_stop 21.2% /
+tp 13.0%** — the two ends were transposed, so the dominant exit read as the rare one. The
+follow-on claim that disabling it "makes expectancy worse, so leave it on" had no report
+behind it at all, because `exit_at_mean` was unreachable from the CLI until the flag existed.
+
+**Measured A/B**, M5, 2025-09-01 → 2026-09-04, 0.1 lots on $1,000, central costs,
+scale-out on. The ON column reproduces the stored baseline table below to every printed
+digit, which is what confirms the flag is a true no-op when enabled:
+
+| | XAU off | XAU on | BTC off | BTC on |
+|---|---|---|---|---|
+| closed trades | 1,761 | 1,761 | 1,256 | 1,701 |
+| win rate | 53.15% | 53.44% | 57.25% | 61.67% |
+| net P&L | −$14,076 | −$13,046 | −$2,952 | −$3,677 |
+| profit factor | 0.823 | 0.834 | 0.924 | 0.890 |
+| expectancy | −0.114 R | −0.106 R | −0.034 R | −0.031 R |
+| max drawdown | 1001% | 908% | 321% | 356% |
+| `cross_center` exits | 0 | 113 (6.4%) | 0 | 1,190 (70%) |
+
+**The direction is split by symbol, and the shipped default is not the better one on gold.**
+Off costs gold ~$1,030 and 93 points of drawdown; it gains Bitcoin ~$725, 34 points of
+profit factor and 35 points of drawdown. Read the BTC trade counts carefully — 1,256 against
+1,701 — because without the early exit positions are held longer and fewer complete inside
+the same window, which is also why BTC's per-trade expectancy is marginally *worse* off
+(−0.034 R) while its net P&L and drawdown are better. It ships off on both because one rule
+across both instruments was asked for, not because gold's column supports it. Both symbols
+remain losing configurations either way.
+
+`cross_center` is now its own `exit_reason` in `backend/backtest/ledger.py` rather than
+folding into `"signal"` — that fold is what made the census above uncheckable. **Reading an
+older report: its `signal` rows are this `cross_center`.** Live, the equivalent is
+`close_position(comment="NW mean reversion")`; it previously sent `close_position`'s default
+comment, which is why the incident could not be attributed from `trades.comment`.
 
 Note when reading TP averages: rule 5 fills a gapped level at the gap price, which is
 correct for stop orders but optimistic for a take-profit LIMIT, where a broker fills at
 the limit. It inflates the TP tail on both sides of any comparison, so it does not bias
 an A/B — but do not read an average TP win as achievable.
-
-### News blackout (S9)
-
-30 minutes before through 30 minutes after a **high or medium** impact release for the
-symbol's `news_currencies` (USD for both configured symbols), the bot **opens no new
-position and closes any it holds**. Half-open window: blocked at exactly `T−30`,
-tradeable again at exactly `T+30`, and clustered releases **merge** into one continuous
-blackout rather than toggling trading back on in the gap.
-
-One definition, three files:
-
-| | |
-|---|---|
-| `backend/core/news.py` | `NewsEvent`, `NewsCalendar`, the window arithmetic, CSV read/write. **stdlib only** — no network, no MT5, no `backend.db` |
-| `backend/live/news_feed.py` | the ForexFactory fetch, the background refresh thread, and `NewsVerdict`. The **only** module in `backend/` that imports a network library |
-| `backend/strategy/nw_envelope.py` | the research half: `news_blackout` EXIT ahead of `exit_at_mean`, entry veto beside `max_spread_points` |
-
-`tests/test_db_invariants.py` enforces that split — a network import under
-`backend/{backtest,strategy,indicators,data,core,scripts}` fails the build, because a
-backtest that needs the internet is not reproducible.
-
-**Source: ForexFactory's public JSON, no API key.** Only
-`ff_calendar_thisweek.json` is live; the `nextweek`/`lastweek` URLs that circulate
-alongside it both **404** (checked 2026-09-04), and the host answers **HTTP 429** if
-polled twice in a minute — hence `BOT_NEWS_REFRESH_SEC=1800`. Do not "fix" the missing
-URLs back in without checking them.
-
-**It is a WALL-CLOCK rule, and `bar_time` is the wrong clock.** `bot_manager.py` reads
-`bar_time` as broker-**server** epoch seconds and applies no offset
-(`measure_server_utc_offset()` exists in `backend/data/mt5_source.py` but only
-`mt5_source` uses it). The gate therefore uses `datetime.now(timezone.utc)` on the host.
-`backend/core/news.py` **refuses naive datetimes** rather than assuming UTC, because
-assuming is exactly how a server timestamp silently shifts every window by the server's
-offset. The cost is one deployment assumption: **the trading host's clock must be
-NTP-correct.**
-
-**Where the two live edits sit, and why they are on opposite sides of the S4 gate:**
-
-- The **flatten** runs at the very top of the loop, before the bars are read and before
-  the `MIN_USABLE_BARS` and NaN-envelope guards — both of which `continue`, so a
-  bar-data hiccup behind them would silently cancel it. A window opens *mid-candle*;
-  behind S4 the flatten would wait for the next M5 close and leave the position exposed
-  for up to 5 of the 30 minutes the rule exists to avoid.
-- The **entry veto** sits inside `if not positions:` beside `cooled`, the only place
-  `open_trade()` is called from.
-
-**What S9 must never block**, each for a reason worse than the entry it would skip:
-`manage_position()` (S7 — a live position with no break-even stop through the most
-volatile hour of the day), the mean-reversion exit (stranding a position past its own
-exit signal), and broker-side SL/TP. `NewsVerdict` has exactly three fields and none of
-them can suspend management; a test pins that shape so a future `freeze_management`
-cannot be added and quietly honoured.
-
-**Fail closed, with a staleness horizon.** An unreadable calendar stops **entries**. It
-is *staleness* that closes the gate, not one failed request — `BOT_NEWS_MAX_AGE_MIN`
-defaults to 90 minutes against a 30-minute refresh, so two consecutive failures cost
-nothing but a real outage bites. `BOT_NEWS_MAX_AGE_MIN=0` is the strictest reading.
-Two consequences to keep straight:
-
-- **An unknown or stale calendar never flattens.** Closing a live position because an
-  HTTP request failed would be a bug wearing a safety feature's clothes. Only a *known*
-  event closes a position.
-- **A changed feed shape raises rather than reporting zero events.** An empty calendar
-  means "nothing is scheduled", so a silently-empty parse would tell the bot it was free
-  to trade straight through NFP. `parse_forexfactory` refuses a non-list payload and
-  refuses a non-empty payload it could parse nothing from.
-
-The reason reaches `bot_snapshots.detail`, which `frontend/src/App.tsx` already renders
-on the card — the same channel the warm-up shortfall and NaN-envelope cases use, since
-all three are "Running but not trading". `GET /health` gains a `news` block
-(`events_fetched` vs `events`, `last_fetch`, `stale`, `last_error`) so *blocked by a
-release* can be told from *broken feed*. This rule can genuinely stop a bot trading, so
-that distinction is load-bearing.
-
-**The research half is a no-op unless you give it a calendar**, which is the deliberate
-opposite of the live path: `news_enabled=False` by default and an empty calendar means
-"nothing scheduled". Failing closed in a backtest would silently delete trades and
-report the remainder as a result. `tests/test_news_filter.py` proves the no-op, and
-`run_baseline` with no `--news-file` is **byte-identical** to the pre-change engine on
-both symbols — that is what keeps every report in `data/reports/` comparable.
-
-Two supporting changes worth knowing about:
-
-- `EXIT_SIGNAL` used to swallow every strategy exit, so a news flatten would have been
-  indistinguishable from a mean-reversion exit in the ledger. `SIGNAL_EXIT_REASONS`
-  (`backend/backtest/ledger.py`) now maps `news_blackout` to its own `exit_reason`;
-  everything else still folds into `"signal"`, so old reports are unaffected. Live, the
-  equivalent is `close_position(comment="NW news blackout")`, which reaches
-  `deals.comment` and then `trades.comment`.
-- `run_baseline` now also writes `<stamp>_config.json`. The engine always assembled
-  `config_used` and nothing ever saved it, so a stored report could not say what
-  produced it — which this rule makes material, since a filtered and an unfiltered run
-  differ only in settings that lived nowhere on disk.
-
-**It is NOT backtested on real history, and cannot be yet.** A live-API-only source has
-no past: the fetched calendar covers the current week, and the cached bars end
-2026-08. Against a **synthetic** US release schedule (weekly claims, NFP, CPI, PPI, ISM,
-FOMC; 169 events) over the cached gold range, the direction is *suggestive only*:
-
-| central costs | news OFF | news ON |
-|---|---|---|
-| trades | 2,303 | 2,195 (−4.7%) |
-| win rate | 53.50% | 53.85% |
-| net P&L | −$16,819 | −$14,647 |
-| profit factor | 0.825 | 0.839 |
-| expectancy | −0.104 R | −0.095 R |
-| max drawdown | 1600% | 1402% (−12.4%) |
-
-Most of that comes from **suppressed entries**, not the flatten (9 trades flattened). No
-report was written into `data/reports/` for it on purpose: the filename and
-`config_used` cannot say the calendar was invented, and a synthetic result sitting beside
-real ones would eventually be read as a measurement. **Gold remains a losing
-configuration either way** — the filter reduces the bleed, it does not create an edge.
-Re-run the A/B against real history once `data/news/` has accumulated some, alongside a
-matching bar snapshot.
 
 ## Safety
 
@@ -496,26 +439,40 @@ loss cap and no margin check — `lot_size` defaults to 0.1, so gold risks ~$70 
 measured 11-12 loss streak is ~$840). The dashboard shows that dollar figure next to the
 field precisely because the lot size is the only risk control there is.
 
-The news blackout (S9) is the one other thing that can stop a trade being opened, and it
-is **not** authenticated either — it is driven by an unauthenticated public HTTP endpoint
-and by `BOT_NEWS_*` environment variables, not by the API. Note the direction of the
-risk: the feed can only ever *refuse* trades, never open one or change a size, and it
-fails closed, so the worst a compromised or dead feed does is stop the bot. That is why
-it was safe to give it no authentication and no `POST /settings` surface. `GET /health`
-is how you tell "blocked by a release" from "the feed is broken"; both look like
-"Running and not trading" on the card.
+`lot_size`, `partial_fraction` and `exit_at_mean` are the **only** three keys
+`POST /settings` can touch, and the only three persisted — now to `symbol_settings`
+in Postgres, not `data/settings.json`. They are persisted because silently restoring
+0.1 on restart would undo a size someone lowered on purpose, and restoring the
+centre-line exit would undo a rule someone switched off on purpose.
+`_load_settings()` and `repository.load_settings()` are both narrow: only those keys,
+only for symbols already in `SYMBOL_CONFIG`, only values that survive `_validated`.
+A row must never be able to introduce a symbol or move a stop — and that matters
+*more* with a database than it did with a file, because psql, a migration and
+anything else holding the DSN can write rows the UI never could. `schema.sql` adds
+CHECK constraints as a second line of defence, refusing a bad value on the way
+**in**; the file store could only reject one on the way out, at the next load.
 
-`lot_size` and `partial_fraction` are the **only** two keys `POST /settings` can touch,
-and the only two persisted — now to `symbol_settings` in Postgres, not
-`data/settings.json`. They are persisted because silently restoring 0.1 on restart
-would undo a size someone lowered on purpose. `_load_settings()` and
-`repository.load_settings()` are both narrow: only those two keys, only for symbols
-already in `SYMBOL_CONFIG`, only values that survive `_validated`. A row must never
-be able to introduce a symbol or move a stop — and that matters *more* with a
-database than it did with a file, because psql, a migration and anything else
-holding the DSN can write rows the UI never could. `schema.sql` adds CHECK
-constraints as a second line of defence, refusing a bad value on the way **in**;
-the file store could only reject one on the way out, at the next load.
+Three things to keep straight about the third key, since it is the first non-float one:
+
+- **It has no CHECK constraint, and that is not an omission.** `BOOLEAN NOT NULL`
+  admits exactly two values, so for this column the *type* is the second line of
+  defence.
+- **Its failure direction is bounded**, which is what made a rule-changing flag safe
+  to put in a writable table at all. A stray `true` can only close a position
+  *earlier*, at a price the market is offering; a stray `false` can only leave the
+  broker-side SL/TP and the break-even stop standing. Neither value can size an
+  order, widen a stop, or open a position. `lot_size` has no such bound.
+- **`_validated` now refuses a boolean under a numeric key.** `bool` is a subclass of
+  `int`, so `float(True)` is `1.0` — a boolean landing under `lot_size` would have
+  validated cleanly as 1.0 lots, ten times the shipped size, with every range check
+  passing it. That hole did not exist until this function started seeing booleans.
+
+A `POST /settings` carrying only `exit_at_mean` is **accepted while a position is
+open**, unlike a sizing edit. The sizing refusal exists because `manage_position()`
+infers "has the scale-out fired?" from the position's volume against `lot_size`;
+this flag takes part in no such inference, and the moment someone reaches for it is
+while a trade is running and the centre line is closing in on it. Refusing it then
+would withhold the control in the only situation that motivates it.
 
 The database is published on `127.0.0.1:5432` only, for the same reason
 `BOT_HOST` is loopback. `docker compose down -v` **deletes** the trade history
@@ -556,14 +513,7 @@ still holds a live reference into it and a size edit still reaches the thread.
 | scale-out trigger | 50 pips = 5.00 | 500 pips = 500 |
 | `profit_mult` (contract size) | 100 oz per lot | 1 BTC per lot |
 | risk at the 0.1 default | ~$70 | ~$70 |
-| `news_currencies` (S9) | `("USD",)` | `("USD",)` |
-
-`news_currencies` is an explicit tuple, not three letters sliced out of the ticker.
-`"XAUUSDm"[3:6]` happens to give `USD`, but gold's drivers are not defined by its quote
-currency and the next symbol added would inherit the wrong answer silently. Bitcoin takes
-the same USD blackout because it is quoted in dollars and moves on US rates prints — not
-a claim that the two react alike, only that the releases worth standing aside for are the
-same ones.
+| `exit_at_mean` | `False` (editable) | `False` (editable) |
 
 The pip COUNTS are identical on purpose -- one rule, two instruments -- so the worked
 example reads the same on both: a BTCUSDm long at 80500 targets 81500, stops at 79800,
@@ -598,12 +548,19 @@ The scale-out hurts it exactly as it hurts gold: with `--no-breakeven` the same 
 −$2,713 at −0.023R and 275% drawdown, so the rule costs ~$960 and 80 points of drawdown.
 It ships enabled because it was asked for, not because the data supports it.
 
-**Both tables above predate the news blackout (S9)** and were produced with no calendar,
-so they still describe the engine as `run_baseline` runs it by default — the no-op is
-byte-identical, which is why they remain valid as a baseline. They do **not** describe
-the live bot any more: S9 ships enabled, suppresses ~5% of entries and flattens through
-releases. Re-measure against a real calendar before comparing a live result to either
-column.
+**Both tables above predate the centre-line exit becoming a flag, and were produced
+with it ON.** That is no longer the default, so neither column describes what
+`run_baseline` now does without `--exit-at-mean` — the honest-engine figures for the
+shipped configuration are the "off" columns in the A/B table under "Centre-line
+(mean-reversion) exit" above (gold −$14,076 at 1001% drawdown, Bitcoin −$2,952 at 321%).
+Their `exit_reason` censuses are affected too: a `signal` row in any report stored before
+that change is a `cross_center`.
+
+They are otherwise still valid, including across the removal of the news blackout: that
+rule was a no-op in the research engine unless a calendar was passed, and no stored report
+ever passed one. Re-running the gold command above after the removal reproduced the
+ledger **byte for byte** (768,655 bytes) and every metric in all three cost scenarios;
+only the five dead `news_*` keys dropped out of `<stamp>_config.json`.
 
 ## Working conventions
 

@@ -208,3 +208,70 @@ def test_drawdown_uses_equity_not_realized_balance():
                (100, 100, 60, 61), (100, 101, 99, 100)])
     res = run(bs, EnterOnceStrategy(sl=100.0, tp=100.0))
     assert res.metrics["max_drawdown"] > 3.0
+
+
+# ---------------------------------------------------------------------------
+# the centre-line exit's own ledger label
+# ---------------------------------------------------------------------------
+# Moved here when the news blackout was removed and tests/test_news_filter.py
+# went with it. Neither of these is about news: they landed in that file only
+# because SIGNAL_EXIT_REASONS gained its first two entries at the same time.
+
+def test_a_centre_line_exit_reaches_the_ledger_as_its_own_reason():
+    """What makes the rule's cost measurable at all.
+
+    `cross_center` used to fold into the generic "signal" bucket. That kept the
+    one number the decision turns on -- how often the centre line intercepts a
+    scaled-out runner instead of letting it reach the target -- obtainable only
+    by knowing that "signal" happened to have exactly one producer. The census
+    in CLAUDE.md was transposed for precisely that reason and stood uncorrected
+    because nothing could check it.
+
+    Reading an OLD report: a pre-change ledger's "signal" rows are this
+    "cross_center".
+    """
+    from backend.strategy.nw_envelope import NWConfig, NWEnvelopeStrategy
+
+    class Centre(NWEnvelopeStrategy):
+        def warmup_bars(self):
+            return 0
+
+        def feature_names(self):
+            return ["dummy"]
+
+        def prepare(self, b):
+            return pd.DataFrame({"dummy": np.zeros(len(b))}, index=b.index)
+
+        def on_bar(self, ctx):
+            if ctx.position is None and ctx.index == 0:
+                return [Signal(SignalType.ENTER_LONG, "test", ctx.bar.close,
+                               sl_distance=50.0, tp_distance=50.0)]
+            if ctx.position is not None and ctx.index == 2:
+                return [Signal(SignalType.EXIT, "cross_center", ctx.bar.close)]
+            return []
+
+    bs = bars([(100, 101, 99, 100), (100, 101, 99, 100),
+               (100, 101, 99, 100), (103, 104, 102, 103)])
+    eng = BacktestEngine(Centre(NWConfig()), SPEC, costs=None,
+                         cfg=BacktestConfig(initial_balance=1000.0, volume=1.0))
+    res = eng.run(bs)
+    assert list(res.ledger["exit_reason"]) == ["cross_center"]
+
+
+def test_the_research_default_matches_the_live_bot():
+    """Both paths ship the centre-line exit OFF, and drift here is silent.
+
+    The research stack is the honest engine, so it has to model the rules the
+    bot actually runs -- a default that disagreed would make every report
+    describe a configuration nothing trades. Note what this does NOT check: the
+    live bot reads the flag from Postgres, so a dashboard toggle moves live
+    without moving this. Pass --exit-at-mean to reproduce that in a report.
+    """
+    from backend.core.symbols import SYMBOL_CONFIG
+    from backend.strategy.nw_envelope import NWConfig
+
+    assert NWConfig().exit_at_mean is False
+    for symbol, cfg in SYMBOL_CONFIG.items():
+        # Keyed access, not .get: a symbol missing the key would fall through to
+        # a default somewhere instead of stating its own rule.
+        assert cfg["exit_at_mean"] is False, symbol

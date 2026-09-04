@@ -27,20 +27,22 @@ EXIT_RISK = "risk_halt"
 # are the same "sl" in the census, and the exit-reason table is how this
 # strategy's behaviour is actually diagnosed.
 EXIT_BE = "be_stop"
-# A position closed because it was inside a news blackout window, NOT because
-# price came back to the mean. Distinct from EXIT_SIGNAL for exactly the reason
-# EXIT_BE is distinct from EXIT_SL: the exit-reason table is how this strategy
-# is diagnosed, and a rule that closes trades has to be visible in it or its
-# cost cannot be measured. `Trading Bot.md` requires that measurement for any
-# change to which trades exist.
-EXIT_NEWS = "news_blackout"
+# A position closed because price returned to the envelope's CENTRE line. This
+# used to fold into EXIT_SIGNAL to keep stored reports comparable, and that was
+# the wrong trade: the rule closes the scaled-out runner short of its target on
+# nearly every trade, and while its exits were indistinguishable from every
+# other strategy exit, its cost could not be measured -- the census in CLAUDE.md
+# was quietly transposed for exactly that reason, and stood uncorrected because
+# nothing could check it. `Trading Bot.md` requires that measurement, so the
+# rule gets its own label. It is now OFF by default (see NWConfig.exit_at_mean),
+# so a default run has none of these and only a deliberate A/B is affected.
+EXIT_CROSS = "cross_center"
 
 # Strategy exit reasons (`Signal.reason`) that earn their own exit_reason label.
 # Everything else folds into EXIT_SIGNAL, which is what every existing reason
-# did before this map existed -- so "cross_center" still reports as "signal" and
-# stored reports stay comparable.
+# did before this map existed.
 SIGNAL_EXIT_REASONS = {
-    "news_blackout": EXIT_NEWS,
+    "cross_center": EXIT_CROSS,
 }
 
 

@@ -133,15 +133,30 @@ def one_trade(symbol="XAUUSDm"):
 # ---------------------------------------------------------------------------
 
 def test_settings_round_trip():
-    repo.save_settings("XAUUSDm", 0.03, 0.25)
+    repo.save_settings("XAUUSDm", 0.03, 0.25, True)
     assert repo.load_settings(["XAUUSDm"]) == {
-        "XAUUSDm": {"lot_size": 0.03, "partial_fraction": 0.25},
+        "XAUUSDm": {"lot_size": 0.03, "partial_fraction": 0.25,
+                    "exit_at_mean": True},
     }
 
 
+@pytest.mark.parametrize("flag", [True, False])
+def test_the_flag_round_trips_as_a_boolean_not_a_number(flag):
+    """`is`, not `==`: 1.0 == True in Python.
+
+    The un-validated read path float()s every numeric column, and a float that
+    slipped through under this key would compare equal to True while being a
+    number -- which is the coercion _validated() refuses on the way in. Pinning
+    identity is the only assertion that catches it.
+    """
+    repo.save_settings("XAUUSDm", 0.03, 0.25, flag)
+    got = repo.load_settings(["XAUUSDm"])["XAUUSDm"]["exit_at_mean"]
+    assert got is flag
+
+
 def test_settings_are_only_returned_for_the_symbols_asked_for():
-    repo.save_settings("XAUUSDm", 0.03, 0.25)
-    repo.save_settings("EURUSDm", 0.5, 0.0)
+    repo.save_settings("XAUUSDm", 0.03, 0.25, False)
+    repo.save_settings("EURUSDm", 0.5, 0.0, False)
     loaded = repo.load_settings(["XAUUSDm"])
     assert list(loaded) == ["XAUUSDm"]
 
@@ -155,21 +170,59 @@ def test_the_column_constraints_refuse_an_out_of_range_value(lot, fraction):
     from an older dump.
     """
     with pytest.raises(Exception) as exc:
-        repo.save_settings("XAUUSDm", lot, fraction)
+        repo.save_settings("XAUUSDm", lot, fraction, False)
     assert "symbol_settings" in str(exc.value)
 
 
 def test_each_save_records_what_it_replaced():
-    repo.save_settings("XAUUSDm", 0.1, 0.5)
-    repo.save_settings("XAUUSDm", 0.02, 0.25, notes=["lowered on purpose"])
+    repo.save_settings("XAUUSDm", 0.1, 0.5, False)
+    repo.save_settings("XAUUSDm", 0.02, 0.25, True,
+                       notes=["lowered on purpose"])
 
     history = repo.settings_history("XAUUSDm")
     assert len(history) == 2
     newest = history[0]
     assert (newest["prev_lot_size"], newest["lot_size"]) == (0.1, 0.02)
+    assert (newest["prev_exit_at_mean"], newest["exit_at_mean"]) == (False, True)
     assert newest["notes"] == "lowered on purpose"
     # The first save had nothing to replace.
     assert history[1]["prev_lot_size"] is None
+    assert history[1]["prev_exit_at_mean"] is None
+
+
+def test_the_schema_is_re_runnable_against_an_existing_database():
+    """The ALTER TABLE path, which the container's init dir never exercises.
+
+    schema.sql is mounted into /docker-entrypoint-initdb.d/, which Postgres
+    ignores once a data volume exists -- so on every real deployment the new
+    columns arrive through `migrate`, i.e. through this file being applied a
+    second time to a database that already has the tables. CREATE TABLE IF NOT
+    EXISTS is a no-op there, so an ALTER without IF NOT EXISTS would make the
+    whole file fail on the second run and leave the column missing.
+    """
+    repo.apply_schema()
+    repo.apply_schema()
+
+    assert repo.schema_version() >= 3
+    with repo.cursor() as cur:
+        # A single %, not %%: psycopg2 only unescapes when arguments are passed,
+        # and this execute() has none.
+        # Scoped to current_schema(): this suite runs in a throwaway schema of
+        # its own, so an unqualified information_schema query also sees the real
+        # public tables and returns each column twice.
+        cur.execute("""
+            SELECT column_name, is_nullable FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name IN ('symbol_settings', 'settings_audit')
+              AND column_name LIKE '%exit_at_mean'
+            ORDER BY table_name, column_name
+        """)
+        cols = [(r["column_name"], r["is_nullable"]) for r in cur.fetchall()]
+    # The audit pair is nullable on purpose: a row written before the flag
+    # existed has no honest answer, and NULL is the only value that is not a
+    # claim about what someone chose.
+    assert cols == [("exit_at_mean", "YES"), ("prev_exit_at_mean", "YES"),
+                    ("exit_at_mean", "NO")]
 
 
 # ---------------------------------------------------------------------------
