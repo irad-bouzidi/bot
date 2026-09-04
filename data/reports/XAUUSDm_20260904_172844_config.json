@@ -1,0 +1,158 @@
+{
+  "optimistic": {
+    "initial_balance": 1000.0,
+    "volume": 0.1,
+    "tie_break": "sl_first",
+    "legacy_mode": false,
+    "costs": {
+      "spread_source": "bar",
+      "fixed_spread_points": 0.0,
+      "spread_multiplier": 0.5,
+      "commission_per_lot_round_turn": 0.0,
+      "slippage_points_entry": 0.0,
+      "slippage_points_exit": 0.0,
+      "slippage_points_stop": 0.0,
+      "swap_long_points_per_day": 0.0,
+      "swap_short_points_per_day": 0.0,
+      "triple_swap_weekday": 2
+    },
+    "strategy": {
+      "bandwidth": 8.0,
+      "mult": 3.0,
+      "window": 500,
+      "mae_window": 500,
+      "taps": null,
+      "atr_period": 14,
+      "entry_mode": "level",
+      "exit_at_mean": false,
+      "sl_mode": "fixed",
+      "sl_price": 7.0,
+      "sl_band_k": 1.0,
+      "sl_atr_mult": 1.5,
+      "tp_mode": "fixed",
+      "tp_price": 10.0,
+      "tp_r_multiple": 1.5,
+      "be_trigger_mode": "tp_fraction",
+      "be_trigger_tp_fraction": 0.5,
+      "be_trigger_price": 5.0,
+      "be_trigger_r": 0.7,
+      "partial_fraction": 0.5,
+      "min_strength": 0.0,
+      "max_spread_points": null,
+      "news_enabled": false,
+      "news_before_minutes": 30.0,
+      "news_after_minutes": 30.0,
+      "news_impacts": [
+        "high",
+        "medium"
+      ],
+      "news_currencies": [
+        "USD"
+      ]
+    }
+  },
+  "central": {
+    "initial_balance": 1000.0,
+    "volume": 0.1,
+    "tie_break": "sl_first",
+    "legacy_mode": false,
+    "costs": {
+      "spread_source": "bar",
+      "fixed_spread_points": 0.0,
+      "spread_multiplier": 1.0,
+      "commission_per_lot_round_turn": 0.0,
+      "slippage_points_entry": 0.0,
+      "slippage_points_exit": 0.0,
+      "slippage_points_stop": 0.0,
+      "swap_long_points_per_day": 0.0,
+      "swap_short_points_per_day": 0.0,
+      "triple_swap_weekday": 2
+    },
+    "strategy": {
+      "bandwidth": 8.0,
+      "mult": 3.0,
+      "window": 500,
+      "mae_window": 500,
+      "taps": null,
+      "atr_period": 14,
+      "entry_mode": "level",
+      "exit_at_mean": false,
+      "sl_mode": "fixed",
+      "sl_price": 7.0,
+      "sl_band_k": 1.0,
+      "sl_atr_mult": 1.5,
+      "tp_mode": "fixed",
+      "tp_price": 10.0,
+      "tp_r_multiple": 1.5,
+      "be_trigger_mode": "tp_fraction",
+      "be_trigger_tp_fraction": 0.5,
+      "be_trigger_price": 5.0,
+      "be_trigger_r": 0.7,
+      "partial_fraction": 0.5,
+      "min_strength": 0.0,
+      "max_spread_points": null,
+      "news_enabled": false,
+      "news_before_minutes": 30.0,
+      "news_after_minutes": 30.0,
+      "news_impacts": [
+        "high",
+        "medium"
+      ],
+      "news_currencies": [
+        "USD"
+      ]
+    }
+  },
+  "stress": {
+    "initial_balance": 1000.0,
+    "volume": 0.1,
+    "tie_break": "sl_first",
+    "legacy_mode": false,
+    "costs": {
+      "spread_source": "bar",
+      "fixed_spread_points": 0.0,
+      "spread_multiplier": 2.0,
+      "commission_per_lot_round_turn": 0.0,
+      "slippage_points_entry": 0.0,
+      "slippage_points_exit": 0.0,
+      "slippage_points_stop": 0.0,
+      "swap_long_points_per_day": 0.0,
+      "swap_short_points_per_day": 0.0,
+      "triple_swap_weekday": 2
+    },
+    "strategy": {
+      "bandwidth": 8.0,
+      "mult": 3.0,
+      "window": 500,
+      "mae_window": 500,
+      "taps": null,
+      "atr_period": 14,
+      "entry_mode": "level",
+      "exit_at_mean": false,
+      "sl_mode": "fixed",
+      "sl_price": 7.0,
+      "sl_band_k": 1.0,
+      "sl_atr_mult": 1.5,
+      "tp_mode": "fixed",
+      "tp_price": 10.0,
+      "tp_r_multiple": 1.5,
+      "be_trigger_mode": "tp_fraction",
+      "be_trigger_tp_fraction": 0.5,
+      "be_trigger_price": 5.0,
+      "be_trigger_r": 0.7,
+      "partial_fraction": 0.5,
+      "min_strength": 0.0,
+      "max_spread_points": null,
+      "news_enabled": false,
+      "news_before_minutes": 30.0,
+      "news_after_minutes": 30.0,
+      "news_impacts": [
+        "high",
+        "medium"
+      ],
+      "news_currencies": [
+        "USD"
+      ]
+    }
+  }
+}

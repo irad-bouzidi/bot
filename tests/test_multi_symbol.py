@@ -103,9 +103,12 @@ def test_migrate_seeds_a_row_for_every_configured_symbol():
 
     defaults = _code_defaults()
     assert set(defaults) == set(SYMBOL_CONFIG)
-    for symbol, (lot, fraction) in defaults.items():
-        assert lot == SYMBOL_CONFIG[symbol]["lot_size"]
-        assert fraction == SYMBOL_CONFIG[symbol]["partial_fraction"]
+    for symbol, values in defaults.items():
+        assert values["lot_size"] == SYMBOL_CONFIG[symbol]["lot_size"]
+        assert values["partial_fraction"] == SYMBOL_CONFIG[symbol]["partial_fraction"]
+        # Keyed rather than positional: EDITABLE_KEYS has grown once already,
+        # and a tuple would have silently shifted what each element meant.
+        assert values["exit_at_mean"] == SYMBOL_CONFIG[symbol]["exit_at_mean"]
 
 
 # ---------------------------------------------------------------------------

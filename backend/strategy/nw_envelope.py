@@ -32,7 +32,6 @@ from typing import List, Optional
 import numpy as np
 import pandas as pd
 
-from backend.core.news import DEFAULT_IMPACTS, NewsCalendar, empty_calendar
 from backend.core.types import Side, Signal, SignalType
 from backend.indicators.nadaraya_watson import nw_envelope, nw_warmup_bars
 from backend.strategy.base import BarContext, Strategy
@@ -48,7 +47,14 @@ class NWConfig:
     atr_period: int = 14
 
     entry_mode: str = "level"      # "level" | "cross"
-    exit_at_mean: bool = True
+    # Close on a return to the envelope's CENTRE line. Defaults FALSE to match
+    # the live bot (SYMBOL_CONFIG["exit_at_mean"], schema version 3). The centre
+    # sits about `mult * mae` from entry, INSIDE the fixed target and beyond the
+    # scale-out trigger, and this rule has no scale-out awareness -- so with it
+    # on it closes the runner short of the target on nearly every trade that
+    # banks a partial. Reports stored before the flag existed were all produced
+    # with it ON; pass --exit-at-mean to reproduce one.
+    exit_at_mean: bool = False
 
     sl_mode: str = "fixed"         # "fixed" | "band" | "atr"
     sl_price: float = 7.0          # fixed stop distance, PRICE units
@@ -78,22 +84,6 @@ class NWConfig:
     min_strength: float = 0.0      # penetration depth filter, in band half-widths
     max_spread_points: Optional[float] = None
 
-    # News blackout. `news_enabled` defaults to False and the calendar defaults
-    # to empty, so a run that says nothing about news behaves EXACTLY as it did
-    # before this rule existed -- which is what keeps every stored report in
-    # `data/reports/` comparable. `test_news_filter.py` pins that.
-    #
-    # These are scalars, and the NewsCalendar itself is a constructor argument
-    # rather than a field, because `engine._strategy_cfg` serialises this
-    # dataclass with `dataclasses.asdict` into `BacktestResult.config_used`: a
-    # calendar object would not survive it, but the window and the filter -- the
-    # part a reader of an old report needs to know -- do.
-    news_enabled: bool = False
-    news_before_minutes: float = 30.0
-    news_after_minutes: float = 30.0
-    news_impacts: tuple = ("high", "medium")
-    news_currencies: tuple = ()    # () = any currency in the calendar
-
 
 def atr(df, period=14):
     # type: (pd.DataFrame, int) -> np.ndarray
@@ -107,26 +97,9 @@ def atr(df, period=14):
 
 
 class NWEnvelopeStrategy(Strategy):
-    def __init__(self, cfg=None, calendar=None):
-        # type: (Optional[NWConfig], Optional[NewsCalendar]) -> None
-        """`calendar` supplies the news events; None means an empty one.
-
-        Passed in rather than constructed here because this class must stay
-        offline: `read_calendar` reads `data/`, the live feed reads the network,
-        and which of those applies is the caller's business. None is the
-        research default and makes the rule a no-op, so `news_enabled=True` with
-        no calendar blocks nothing rather than blocking everything -- an empty
-        calendar means "nothing scheduled", never "we cannot see the schedule".
-        Failing closed on a missing calendar is the LIVE path's job, where a
-        real position is at stake; doing it here would silently empty a backtest.
-        """
+    def __init__(self, cfg=None):
+        # type: (Optional[NWConfig]) -> None
         self.cfg = cfg or NWConfig()
-        self.calendar = calendar or empty_calendar(
-            before_minutes=self.cfg.news_before_minutes,
-            after_minutes=self.cfg.news_after_minutes,
-            impacts=self.cfg.news_impacts or DEFAULT_IMPACTS,
-            currencies=tuple(self.cfg.news_currencies) or None,
-        )
         if self.cfg.entry_mode not in ("level", "cross"):
             raise ValueError("entry_mode must be 'level' or 'cross'")
         if self.cfg.sl_mode not in ("fixed", "band", "atr"):
@@ -214,16 +187,7 @@ class NWEnvelopeStrategy(Strategy):
         if not np.isfinite(f.get("out", np.nan)) or not np.isfinite(f.get("mae", np.nan)):
             return []
 
-        blocked = c.news_enabled and self.calendar.blocked_at(ctx.time)
-
         if ctx.position is not None:
-            # Ahead of exit_at_mean on purpose: the blackout is the stronger
-            # instruction. Standing aside from a release means not HOLDING
-            # through it either, so a position inside the window leaves at the
-            # next open whether or not price has come back to the centre line.
-            if blocked:
-                return [Signal(SignalType.EXIT, "news_blackout", close,
-                               features=dict(f))]
             if c.exit_at_mean:
                 if ctx.position.side is Side.LONG and close >= f["out"]:
                     return [Signal(SignalType.EXIT, "cross_center", close,
@@ -234,12 +198,9 @@ class NWEnvelopeStrategy(Strategy):
             return []
 
         # Entry-only veto, and it sits AFTER the `ctx.position is not None`
-        # return above for the same reason max_spread_points does: a filter that
-        # also suppressed the exit branch would strand an open position past its
-        # own exit signal, which is worse than the entry it was meant to skip.
-        if blocked:
-            return []
-
+        # return above on purpose: a filter that also suppressed the exit branch
+        # would strand an open position past its own exit signal, which is worse
+        # than the entry it was meant to skip.
         if (c.max_spread_points is not None
                 and ctx.bar.spread_points > c.max_spread_points):
             return []

@@ -10,12 +10,11 @@ from typing import Dict
 
 from backend.core.errors import ConfigRejected, DatabaseUnavailable
 from backend.core.symbols import (
-    EDITABLE_KEYS, SUPPORTED_SYMBOLS, SYMBOL_CONFIG, price_levels,
+    BOOL_KEYS, EDITABLE_KEYS, SUPPORTED_SYMBOLS, SYMBOL_CONFIG, price_levels,
 )
 from backend.db import pool as db_pool
 from backend.db import repository as repo
 from backend.indicators.nadaraya_watson import nw_envelope, nw_warmup_bars
-from backend.live.news_feed import NullNewsFeed, from_env as news_feed_from_env
 
 # Constants
 BANDWIDTH = 8.0
@@ -41,6 +40,12 @@ FETCH_BARS = MIN_USABLE_BARS + 201                                       # + for
 
 # Minimum closed bars between two entries, to stop the bot re-firing the same signal.
 COOLDOWN_BARS = 3
+
+# The schema version this build's queries require, not just "any schema". Bump
+# it whenever repository.py starts naming a column that an older database does
+# not have, so init_persistence() can refuse with the migrate command instead of
+# letting psycopg2 raise UndefinedColumn from somewhere deeper.
+REQUIRED_SCHEMA_VERSION = 3
 
 # Max price slippage tolerated on a market order, in points.
 DEVIATION_POINTS = 20
@@ -108,6 +113,25 @@ def scale_out_fraction(lot_size, scale_out_lots):
 
 def _validated(key, value):
     """Range-check one EDITABLE_KEYS value, without needing a live terminal."""
+    if key in BOOL_KEYS:
+        # Deliberately NOT bool(value): bool("false") is True, so a string that
+        # reached the column through psql, a migration or an old settings.json
+        # would turn the rule ON while every place that displays it said off --
+        # the failure mode is a runner being closed before the target by a rule
+        # the dashboard reports as disabled. isinstance(True, int) is also True,
+        # so bool has to be tested before int.
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int) and value in (0, 1):
+            return bool(value)
+        raise ConfigRejected("%s must be true or false" % key)
+    if isinstance(value, bool):
+        # New hazard, created by this function seeing booleans at all: bool is a
+        # subclass of int, so float(True) is 1.0. A boolean landing under
+        # `lot_size` would validate cleanly as 1.0 lots -- ten times the shipped
+        # size, ~$700 a trade on gold -- and every range check below would pass
+        # it. Refuse the type rather than the value.
+        raise ConfigRejected("%s must be a number, not true/false" % key)
     value = float(value)
     if not math.isfinite(value):
         raise ConfigRejected("%s must be a finite number" % key)
@@ -145,8 +169,13 @@ def _load_settings():
             for key in EDITABLE_KEYS:
                 if key in values:
                     cfg[key] = values[key]
-            log("settings: %s loaded lot_size=%g partial_fraction=%g"
-                % (symbol, cfg["lot_size"], cfg.get("partial_fraction", 0.0)))
+            # exit_at_mean is formatted as on/off, not %g: it is the one
+            # EDITABLE_KEYS value that is not a number, and a boot log reading
+            # "exit_at_mean=1" would be the same ambiguity _validated() refuses.
+            log("settings: %s loaded lot_size=%g partial_fraction=%g "
+                "exit_at_mean=%s"
+                % (symbol, cfg["lot_size"], cfg.get("partial_fraction", 0.0),
+                   "on" if cfg.get("exit_at_mean") else "off"))
     return loaded
 
 
@@ -161,6 +190,7 @@ def _save_settings(symbol, notes=None):
     cfg = SYMBOL_CONFIG[symbol]
     return repo.save_settings(symbol, cfg["lot_size"],
                               cfg.get("partial_fraction", 0.0),
+                              bool(cfg.get("exit_at_mean", False)),
                               source="api", notes=notes)
 
 
@@ -195,11 +225,17 @@ def init_persistence(require_schema=True):
     """
     if require_schema:
         version = repo.schema_version()
-        if version <= 0 or not repo.tables_present():
+        # A FLOOR, not merely "some schema". load_settings() now SELECTs
+        # `exit_at_mean`, so a database left at version 2 fails inside
+        # _load_settings() with an UndefinedColumn from psycopg2 -- past the
+        # point where this function can still name the command to run, which is
+        # the whole job of the message below.
+        if version < REQUIRED_SCHEMA_VERSION or not repo.tables_present():
             raise DatabaseUnavailable(
-                "Postgres at %s has no schema (version %d). Run: "
-                "python -m backend.db.migrate"
-                % (db_pool.redact(db_pool.database_url()), version))
+                "Postgres at %s is at schema version %d; this build needs %d. "
+                "Run: python -m backend.db.migrate"
+                % (db_pool.redact(db_pool.database_url()), version,
+                   REQUIRED_SCHEMA_VERSION))
     repo.ensure_bot_rows(list(SYMBOL_CONFIG))
     loaded = _load_settings()
     for symbol in SYMBOL_CONFIG:
@@ -382,16 +418,10 @@ def _deal_rows(history, symbol):
 # the boot rather than silently trade the code default.
 
 class TradingBot(threading.Thread):
-    def __init__(self, symbol: str, news=None):
+    def __init__(self, symbol: str):
         super().__init__()
         self.daemon = True  # S6: never block interpreter shutdown
         self.symbol = symbol
-        # S9: the news blackout. Defaults to the null feed -- always allow,
-        # never flatten -- so a directly constructed TradingBot (tests, a REPL)
-        # behaves as it did before the rule existed. BotManager passes the real
-        # one, which is shared by every symbol's thread; see news_feed.py for
-        # why there is exactly one per process.
-        self._news = news or NullNewsFeed()
         # A live REFERENCE into SYMBOL_CONFIG, not a copy: update_settings() edits
         # that dict in place so a running bot picks the new size up on its next
         # entry without being restarted. Read it under _CONFIG_LOCK where the value
@@ -620,12 +650,12 @@ class TradingBot(threading.Thread):
         """Close a whole position at market.
 
         `comment` reaches `deals.comment`, which the trade fold carries through
-        to `trades.comment`, so a news flatten (S9) is distinguishable from a
-        mean-reversion exit after the fact. Without it the two are identical in
-        the stored history and the cost of the blackout rule could never be
-        measured -- which is the one thing `Trading Bot.md` insists on for any
-        rule that changes which trades exist. MT5 truncates order comments
-        around 31 characters, so keep them short.
+        to `trades.comment`, so a centre-line exit is distinguishable from any
+        other close after the fact. Without it they are identical in the stored
+        history and the cost of a rule that closes trades can never be measured
+        -- which is the one thing `Trading Bot.md` insists on for any rule that
+        changes which trades exist. MT5 truncates order comments around 31
+        characters, so keep them short.
         """
         info = self._symbol_info()
         tick = mt5.symbol_info_tick(position.symbol)
@@ -788,6 +818,40 @@ class TradingBot(threading.Thread):
                 log("%s: #%s stop moved to break-even %.5f"
                     % (self.symbol, position.ticket, entry))
 
+    def _mean_reversion_exit(self, positions, current_close, out):
+        """The centre-line exit -- OFF unless `exit_at_mean` is set for this symbol.
+
+        It used to be unconditional, and it has no scale-out awareness: no volume
+        check, no be_armed flag, nothing that notices the position already banked
+        a partial and pulled its stop to entry. `out` is the envelope's CENTRE,
+        which sits about `mult * mae` from entry -- ~6.00 on gold, PAST the 5.00
+        scale-out trigger and SHORT of the 10.00 target. So a trade that did
+        everything the scale-out rule intended was then closed here, and the
+        target it had been left running for was unreachable in practice. One live
+        XAUUSDm short entered at 4485.183 (SL 4492.183, TP 4475.183) banked half
+        at 4480.183 and closed here at 4479.196.
+
+        Extracted from run() so it can be tested: nothing drives the live loop in
+        the suite, so for as long as this was six inlined lines the rule that
+        decided most exits had no test at all.
+
+        Still behind the S4 once-per-closed-bar gate, and still not a stop -- it
+        reads the CLOSE, so it can neither replace the broker-side SL nor be
+        relied on intrabar.
+        """
+        # Read under the lock, unlike `pip` in manage_position(): this key is
+        # editable at runtime AND editable while a position is open, so the loop
+        # can genuinely race a save.
+        with _CONFIG_LOCK:
+            enabled = bool(self.config.get("exit_at_mean", False))
+        if not enabled:
+            return
+        for pos in positions:
+            if pos.type == mt5.POSITION_TYPE_BUY and current_close >= out:
+                self.close_position(pos, comment="NW mean reversion")
+            elif pos.type == mt5.POSITION_TYPE_SELL and current_close <= out:
+                self.close_position(pos, comment="NW mean reversion")
+
     def reconcile_trades(self, full=False):
         """Copy this bot's MT5 deals into Postgres and re-fold them into trades.
 
@@ -887,31 +951,6 @@ class TradingBot(threading.Thread):
 
         while not self._stop_event.is_set():
             try:
-                # S9: the news blackout, evaluated FIRST -- before the bars are
-                # read, before the warm-up and NaN guards below, and outside the
-                # S4 once-per-bar gate. Three reasons, each a different failure:
-                #
-                #  * It is a WALL-CLOCK rule. `bar_time` further down is
-                #    broker-server epoch seconds with no offset applied, so it
-                #    is the wrong clock to measure "30 minutes before 12:30 UTC"
-                #    against; the feed uses the host's UTC clock instead.
-                #  * A window opens MID-CANDLE. Behind the S4 gate the flatten
-                #    would wait for the next M5 close, leaving the position
-                #    exposed for up to 5 of the 30 minutes the rule exists to
-                #    avoid.
-                #  * Closing a position needs no envelope. Behind the
-                #    MIN_USABLE_BARS or NaN guards -- both of which `continue`
-                #    -- a bar-data hiccup would silently cancel the flatten.
-                #
-                # The extra bot_positions() round trip is paid only while a
-                # window is actually open: verdict() is an in-memory lookup.
-                news = self._news.verdict(self.symbol)
-                if news.flatten:
-                    for pos in self.bot_positions():   # S1: this bot's only
-                        log("%s: %s -- closing #%s"
-                            % (self.symbol, news.detail, pos.ticket))
-                        self.close_position(pos, comment="NW news blackout")
-
                 rates = mt5.copy_rates_from_pos(self.symbol, TIMEFRAME, 0, FETCH_BARS)
                 if rates is None or len(rates) == 0:
                     log("%s: no rates (%s); MT5 may be disconnected"
@@ -964,13 +1003,13 @@ class TradingBot(threading.Thread):
                          nw_out=_finite(out), nw_upper=_finite(upper),
                          nw_lower=_finite(lower),
                          bar_time=bar_time, open_positions=len(positions),
-                         # S9: None when nothing is blocking. The dashboard
-                         # already renders this field as a warning on the card
-                         # (frontend/src/App.tsx), which is the same channel the
-                         # warm-up shortfall and NaN-envelope cases use -- all
-                         # three are "Running but not trading", so they should
-                         # not need three different ways of saying so.
-                         detail=news.detail)
+                         # None: nothing here is blocking. The dashboard renders
+                         # this field as a warning on the card
+                         # (frontend/src/App.tsx) and the warm-up shortfall and
+                         # NaN-envelope paths above still set it -- both are
+                         # "Running but not trading", which is what the field is
+                         # for.
+                         detail=None)
 
                 # Reconcile at most once a minute. Cheaper than the 365-day scan
                 # it replaces -- the window now starts near the newest stored
@@ -1020,16 +1059,7 @@ class TradingBot(threading.Thread):
                         self._last_entry_bar is None
                         or (bar_time - self._last_entry_bar) >= COOLDOWN_BARS * TIMEFRAME_SECONDS
                     )
-                    if not news.allow_entries:
-                        # S9: inside a blackout window, or the calendar could
-                        # not be read at all -- the feed fails CLOSED, so an
-                        # unreachable provider stops entries rather than letting
-                        # the bot trade blind into a release. It is the reason
-                        # `news.detail` has to reach the dashboard: this is the
-                        # "Running but not trading" state CLAUDE.md warns about,
-                        # and the operator needs to tell it from a crash.
-                        pass
-                    elif not cooled:
+                    if not cooled:
                         pass  # still inside the post-entry cooldown
                     elif current_close < lower:
                         if self.open_trade("BUY"):
@@ -1038,11 +1068,7 @@ class TradingBot(threading.Thread):
                         if self.open_trade("SELL"):
                             self._mark_bar(last_entry_bar=bar_time)
                 else:
-                    for pos in positions:
-                        if pos.type == mt5.POSITION_TYPE_BUY and current_close >= out:
-                            self.close_position(pos)
-                        elif pos.type == mt5.POSITION_TYPE_SELL and current_close <= out:
-                            self.close_position(pos)
+                    self._mean_reversion_exit(positions, current_close, out)
 
                 self._mark_bar(last_bar_time=bar_time)
                 self._sleep(15)
@@ -1100,6 +1126,11 @@ def simulate_legacy(df, outs, uppers, lowers, config, initial_balance,
     # Matches manage_position(): a size too small to split still gets the
     # break-even stop, it just banks nothing.
     arms_breakeven = be_dist > 0 and fraction > 0
+    # Matches the live loop's gate. Defaults FALSE here too, so a config dict
+    # assembled without the key backtests the shipped behaviour rather than the
+    # pre-toggle one -- a backtest that modelled an exit the bot no longer takes
+    # is the exact mismatch POST /backtest exists to avoid.
+    at_mean = bool(config.get("exit_at_mean", False))
 
     balance = initial_balance
     trades_opened = 0
@@ -1172,7 +1203,7 @@ def simulate_legacy(df, outs, uppers, lowers, config, initial_balance,
                 exit_price = stop_price
             elif side * (price - target_price) >= 0:
                 exit_price = target_price
-            elif side * (price - out) >= 0:
+            elif at_mean and side * (price - out) >= 0:
                 exit_price = price
 
             if exit_price is not None:
@@ -1339,12 +1370,6 @@ class BotManager:
         self.bots: Dict[str, TradingBot] = {}
         if not mt5.initialize():
             log("MT5 Init Failed: %s" % (mt5.last_error(),))
-        # S9: ONE news feed for the whole process, shared by every bot thread.
-        # Started here rather than on first use so the first fetch overlaps
-        # startup instead of costing a newly started bot its first cycles, and
-        # so /health can report the feed before any bot is running.
-        self.news = news_feed_from_env()
-        self.news.start()
 
     # ---- control ------------------------------------------------------------
 
@@ -1376,7 +1401,7 @@ class BotManager:
         # restart, and "never hide losing trades" cannot survive a counter that
         # resets.
         _persist("record desired state", repo.set_desired_state, symbol, "running")
-        self.bots[symbol] = TradingBot(symbol, news=self.news)
+        self.bots[symbol] = TradingBot(symbol)
         self.bots[symbol].start()
         _persist("log control event", repo.record_control_event,
                  symbol, "start", True, None)
@@ -1434,8 +1459,6 @@ class BotManager:
                 bot.join(timeout=5)
                 if bot.is_alive():
                     log("%s: bot thread did not stop within 5s" % symbol)
-        # S9: after the bots, so no thread can ask a stopped feed for a verdict.
-        self.news.stop()
         mt5.shutdown()
 
     # ---- reporting ----------------------------------------------------------
@@ -1553,12 +1576,14 @@ class BotManager:
         with _CONFIG_LOCK:
             lot_size = float(cfg["lot_size"])
             fraction = float(cfg.get("partial_fraction", 0.0))
+            at_mean = bool(cfg.get("exit_at_mean", False))
         scale_out, runner = _split_lots(lot_size, fraction, vol_min, step)
         open_positions = len(bot_positions(symbol))
         return {
             "symbol": symbol,
             "lot_size": lot_size,
             "partial_fraction": fraction,
+            "exit_at_mean": at_mean,
             "scale_out_lots": scale_out,
             "runner_lots": runner,
             # fraction > 0 but nothing to bank: the size cannot be split at this
@@ -1575,15 +1600,21 @@ class BotManager:
             "volume_step": step,
             "broker_limits": from_broker,
             "open_positions": open_positions,
+            # SIZING is locked while a position is open -- see update_settings
+            # for why. `exit_at_mean` is deliberately NOT covered by this flag:
+            # it cannot re-scale a running position, and the moment someone
+            # reaches for that switch is while a trade is open.
             "locked": bool(open_positions),
         }
 
-    def update_settings(self, symbol, lot_size=None, scale_out_lots=None):
-        """Apply a sizing edit from the UI. Returns the new settings + any notes.
+    def update_settings(self, symbol, lot_size=None, scale_out_lots=None,
+                        exit_at_mean=None):
+        """Apply a settings edit from the UI. Returns the new settings + any notes.
 
-        Either field may be omitted to leave it alone, but they are validated
-        against each other: the scale-out is stored as a fraction of whatever lot
-        size ends up applied, so submitting both together is the normal path.
+        Any field may be omitted to leave it alone, but the two sizing fields are
+        validated against each other: the scale-out is stored as a fraction of
+        whatever lot size ends up applied, so submitting both together is the
+        normal path.
         """
         cfg = SYMBOL_CONFIG.get(symbol)
         if cfg is None:
@@ -1591,17 +1622,26 @@ class BotManager:
                                  % (symbol, ", ".join(SUPPORTED_SYMBOLS)))
         vol_min, vol_max, step, from_broker = _volume_limits(symbol)
         notes = []
+        touches_sizing = lot_size is not None or scale_out_lots is not None
 
         with _CONFIG_LOCK:
-            # Refused while a position is open, because manage_position() decides
-            # "has the scale-out already fired?" by comparing the position's volume
-            # against lot_size. Lower the size mid-trade and an already-reduced
-            # position looks untouched, so it is scaled out a second time. The
-            # alternative -- remembering the size per ticket -- would have to
-            # survive restarts, reconnects and BotManager replacing the thread,
-            # which is exactly the state that rule was written to avoid.
+            # SIZING is refused while a position is open, because
+            # manage_position() decides "has the scale-out already fired?" by
+            # comparing the position's volume against lot_size. Lower the size
+            # mid-trade and an already-reduced position looks untouched, so it is
+            # scaled out a second time. The alternative -- remembering the size
+            # per ticket -- would have to survive restarts, reconnects and
+            # BotManager replacing the thread, which is exactly the state that
+            # rule was written to avoid.
+            #
+            # The refusal is scoped to those two keys, NOT to every edit. That
+            # reasoning is lot_size's alone: `exit_at_mean` cannot re-scale
+            # anything, and the moment someone reaches for that switch is while a
+            # trade is running and the centre line is closing in on it. Refusing
+            # it then would withhold the control in the only situation that
+            # motivates it.
             open_now = len(bot_positions(symbol))
-            if open_now:
+            if open_now and touches_sizing:
                 raise ConfigRejected(
                     "%s has %d open position(s). Sizing can only be changed while "
                     "flat -- changing it now would re-scale a trade that is already "
@@ -1646,21 +1686,37 @@ class BotManager:
                         notes.append("Scale-out will fill %g lots -- the volume step "
                                      "is %g." % (fills, step))
 
+            if exit_at_mean is None:
+                new_at_mean = bool(cfg.get("exit_at_mean", False))
+            else:
+                new_at_mean = _validated("exit_at_mean", exit_at_mean)
+                if new_at_mean:
+                    # Said out loud because the rule is off by default for a
+                    # measured reason, and turning it back on is not a cosmetic
+                    # choice: the centre line sits inside the target, so the
+                    # scaled-out runner will usually be closed before reaching
+                    # it. See CLAUDE.md, "Scale-out / break-even".
+                    notes.append(
+                        "Centre-line exit ON -- a scaled-out runner will usually "
+                        "be closed at the centre line instead of the target.")
+
             # The write happens BEFORE SYMBOL_CONFIG is updated, and is allowed
-            # to raise. Postgres now holds the sizing, so an in-memory value
+            # to raise. Postgres now holds the settings, so an in-memory value
             # that the database refused would be traded for the rest of the
             # process and then vanish on restart -- the same silent-restore
             # failure from the other direction. Refuse the edit visibly instead:
             # the caller turns DatabaseUnavailable into a message on the form,
             # exactly as it does ConfigRejected.
             _persist_settings = repo.save_settings(
-                symbol, new_lot, new_fraction, source="api",
+                symbol, new_lot, new_fraction, new_at_mean, source="api",
                 notes=notes or None)
             cfg["lot_size"] = _persist_settings["lot_size"]
             cfg["partial_fraction"] = _persist_settings["partial_fraction"]
+            cfg["exit_at_mean"] = _persist_settings["exit_at_mean"]
 
-        log("%s: sizing set to lot_size=%g partial_fraction=%.4f (%g lots out)"
-            % (symbol, new_lot, new_fraction, new_lot * new_fraction))
+        log("%s: settings set to lot_size=%g partial_fraction=%.4f (%g lots out) "
+            "exit_at_mean=%s"
+            % (symbol, new_lot, new_fraction, new_lot * new_fraction, new_at_mean))
         result = self.get_settings(symbol)
         result["notes"] = notes
         return result
@@ -1803,6 +1859,16 @@ class BotManager:
             return {}
         if row is None:
             return {}
+        # Reaching here having already passed the throttle means
+        # _capture_account_snapshot() returned None -- MT5 is not answering --
+        # so this row is as old as the database just said it was. `stale` was
+        # hardcoded False, which is how a reading taken at 11:04 was served at
+        # 17:53 labelled fresh: the panel prints "refreshed at most once a
+        # minute" beside the stamp, so an unflagged old one reads as a clock
+        # bug rather than as a terminal that went away. Age comes from the
+        # SELECT (`now() - MAX(captured_at)`, one clock) and not from
+        # subtracting timestamps here, so it cannot be skewed by this host's.
+        stale = age is None or age >= self.ACCOUNT_SNAPSHOT_MAX_AGE
         return {
             "balance": row.get("balance") or 0.0,
             "equity": row.get("equity") or 0.0,
@@ -1812,7 +1878,8 @@ class BotManager:
             "drawdown": row.get("drawdown_pct") or 0.0,
             "time_profits": dict(row.get("period_profits") or {}),
             "captured_at": row.get("captured_at"),
-            "stale": False,
+            "age_seconds": age,
+            "stale": stale,
         }
 
     def _capture_account_snapshot(self, persist=True):
@@ -1880,6 +1947,7 @@ class BotManager:
             "drawdown": values["drawdown_pct"],
             "time_profits": profits,
             "captured_at": captured_at,
+            "age_seconds": 0.0,
             "stale": False,
         }
 

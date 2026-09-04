@@ -94,15 +94,19 @@ class SymbolControl(BaseModel):
     action: str # "start" or "stop"
 
 class SizingUpdate(BaseModel):
-    """A sizing edit from the dashboard, in LOTS -- the unit the trader types.
+    """A settings edit from the dashboard. Sizing is in LOTS -- what a trader types.
 
     `scale_out_lots` is converted to the stored fraction in one place
-    (scale_out_fraction); this model never carries a fraction. Either field may be
-    omitted to leave that one alone.
+    (scale_out_fraction); this model never carries a fraction. Any field may be
+    omitted to leave that one alone, which is what makes a flag-only edit
+    possible: the dashboard's centre-line toggle posts `exit_at_mean` and nothing
+    else, so it is not refused by the open-position rule that guards the two
+    sizing fields.
     """
     symbol: str
     lot_size: Optional[float] = None
     scale_out_lots: Optional[float] = None
+    exit_at_mean: Optional[bool] = None
 
 class BacktestSizing(BaseModel):
     """One symbol's sizing for one run, in LOTS. Never a fraction -- see
@@ -159,16 +163,6 @@ def health():
             complete = repo.tables_present()
         except Exception as exc:
             log("health: schema check failed -- %r" % exc)
-    # S9: the news feed fails CLOSED, so an unreachable provider stops entries.
-    # That makes this the endpoint an operator checks to tell "blocked by a real
-    # release" from "the feed is broken" -- the two look identical on the bot
-    # card. Wrapped because this endpoint promises never to raise, exactly as
-    # the schema check above is.
-    try:
-        news = manager.news.status()
-    except Exception as exc:
-        log("health: news status failed -- %r" % exc)
-        news = {"enabled": None, "error": repr(exc)}
     return {
         "database": {
             "url": db_pool.redact(db_pool.database_url()),
@@ -179,7 +173,6 @@ def health():
         },
         "auto_resume": AUTO_RESUME,
         "symbols": SUPPORTED_SYMBOLS,
-        "news": news,
     }
 
 @app.get("/stats")
@@ -227,7 +220,7 @@ def control_events(symbol: Optional[str] = None, limit: int = 50):
 
 @app.get("/settings")
 def get_settings():
-    """Sizing for every configured symbol, in the lots the UI edits."""
+    """Editable settings for every configured symbol, sizing in the lots the UI edits."""
     out = {}
     for symbol in SUPPORTED_SYMBOLS:
         try:
@@ -239,17 +232,19 @@ def get_settings():
 @app.post("/settings")
 def update_settings(ctrl: SizingUpdate):
     """S2: this changes the size of REAL orders and is as unauthenticated as
-    /control -- the loopback bind is what protects both. It is refused outright
-    while a position is open; see BotManager.update_settings for why."""
+    /control -- the loopback bind is what protects both. A SIZING edit is refused
+    while a position is open; an `exit_at_mean`-only edit is not, because it
+    cannot re-scale a running trade. See BotManager.update_settings for both."""
     try:
-        return manager.update_settings(ctrl.symbol, ctrl.lot_size, ctrl.scale_out_lots)
+        return manager.update_settings(ctrl.symbol, ctrl.lot_size,
+                                       ctrl.scale_out_lots, ctrl.exit_at_mean)
     except ConfigRejected as exc:
         return {"error": str(exc)}
     except DatabaseUnavailable as exc:
-        # Refused, not applied-in-memory-only. A size the database would not
+        # Refused, not applied-in-memory-only. A setting the database would not
         # accept must not be traded for the rest of the process and then vanish
         # on restart.
-        return {"error": "Sizing NOT changed -- %s" % exc}
+        return {"error": "Settings NOT changed -- %s" % exc}
 
 @app.get("/settings/history")
 def settings_history(symbol: Optional[str] = None, limit: int = 50):

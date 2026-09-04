@@ -37,13 +37,32 @@ def _log(msg):
 def _editable_keys_and_validator():
     """Borrow SYMBOL_CONFIG's validator without importing MetaTrader5.
 
-    bot_manager owns `_validated` and `EDITABLE_KEYS`, but importing it pulls in
-    MetaTrader5 and this script has to run on the research machine too. The
-    duplication is deliberate and narrow: the legacy import is a one-shot, and
+    bot_manager owns `_validated`, but importing it pulls in MetaTrader5 and
+    this script has to run on the research machine too. The duplicated *logic*
+    is deliberate and narrow: the legacy import is a one-shot, and
     save_settings() re-validates through the API path on every later write --
     plus the CHECK constraints in schema.sql refuse a bad value at the column.
+    The key *list* is imported rather than copied, so a new editable key cannot
+    be added and then silently skipped by this importer.
     """
+    from backend.core.symbols import BOOL_KEYS, EDITABLE_KEYS
+
     def validated(key, value):
+        if key in BOOL_KEYS:
+            # Strict for the same reason _validated() is: bool("false") is True,
+            # so a string in a hand-written settings.json would turn the rule on
+            # while every display of it said off. isinstance(True, int) is also
+            # True, so bool has to be tested first.
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, int) and value in (0, 1):
+                return bool(value)
+            raise ValueError("%s must be true or false" % key)
+        if isinstance(value, bool):
+            # bool is a subclass of int, so float(True) is 1.0 -- a boolean
+            # under `lot_size` would import as 1.0 lots, ten times the shipped
+            # size, and pass every range check below.
+            raise ValueError("%s must be a number, not true/false" % key)
         value = float(value)
         if value != value or value in (float("inf"), float("-inf")):
             raise ValueError("%s must be a finite number" % key)
@@ -53,10 +72,10 @@ def _editable_keys_and_validator():
             raise ValueError("partial_fraction must be in [0, 1)")
         return value
 
-    return ("lot_size", "partial_fraction"), validated
+    return EDITABLE_KEYS, validated
 
 
-def import_legacy_settings(path=None, known_symbols=None):
+def import_legacy_settings(path=None, known_symbols=None, defaults=None):
     """Copy data/settings.json into `symbol_settings`, once.
 
     Only for symbols that have no row yet. A later run must not overwrite a
@@ -65,10 +84,17 @@ def import_legacy_settings(path=None, known_symbols=None):
     settings file was written to prevent, just with the file winning instead of
     the default.
 
+    `defaults` is {symbol: {key: value}} from SYMBOL_CONFIG, used for keys the
+    file does not carry. It matters for `exit_at_mean`: every settings.json in
+    existence predates that key, so its absence means "not recorded", NOT
+    "off" -- and reading it as off would be the file quietly deciding a rule the
+    file never knew about.
+
     Returns the list of symbols actually imported.
     """
     path = path or LEGACY_SETTINGS_FILE
     keys, validated = _editable_keys_and_validator()
+    defaults = defaults or {}
     try:
         with open(path) as fh:
             saved = json.load(fh)
@@ -102,12 +128,15 @@ def import_legacy_settings(path=None, known_symbols=None):
         if existing.get(symbol):
             _log("%s already has a row; leaving the database value alone" % symbol)
             continue
+        fallback = defaults.get(symbol, {})
+        fraction = clean.get("partial_fraction", fallback.get("partial_fraction", 0.0))
+        at_mean = clean.get("exit_at_mean", fallback.get("exit_at_mean", False))
         repository.save_settings(
-            symbol, clean["lot_size"], clean.get("partial_fraction", 0.0),
+            symbol, clean["lot_size"], fraction, at_mean,
             source="legacy-file",
             notes="imported from %s" % os.path.basename(path))
-        _log("imported %s lot_size=%g partial_fraction=%g"
-             % (symbol, clean["lot_size"], clean.get("partial_fraction", 0.0)))
+        _log("imported %s lot_size=%g partial_fraction=%g exit_at_mean=%s"
+             % (symbol, clean["lot_size"], fraction, at_mean))
         imported.append(symbol)
     return imported
 
@@ -120,22 +149,29 @@ def seed_defaults(defaults):
     row would be the 0.1 code default -- and the whole point of persisting
     sizing is that the default never quietly comes back.
 
-    `defaults` is {symbol: (lot_size, partial_fraction)}.
+    `defaults` is {symbol: {key: value}} over EDITABLE_KEYS -- a dict rather
+    than a tuple so that a key added to that list does not silently shift the
+    meaning of a positional element here.
     """
     seeded = []
-    for symbol, (lot, fraction) in defaults.items():
+    for symbol in sorted(defaults):
+        values = defaults[symbol]
         existing = repository.load_settings([symbol])
         if existing.get(symbol):
             continue
-        repository.save_settings(symbol, lot, fraction, source="code-default",
-                                 notes="seeded from SYMBOL_CONFIG")
-        _log("seeded %s lot_size=%g partial_fraction=%g" % (symbol, lot, fraction))
+        repository.save_settings(
+            symbol, values["lot_size"], values["partial_fraction"],
+            values["exit_at_mean"], source="code-default",
+            notes="seeded from SYMBOL_CONFIG")
+        _log("seeded %s lot_size=%g partial_fraction=%g exit_at_mean=%s"
+             % (symbol, values["lot_size"], values["partial_fraction"],
+                values["exit_at_mean"]))
         seeded.append(symbol)
     return seeded
 
 
 def _code_defaults():
-    """SYMBOL_CONFIG's shipped sizing, without importing MetaTrader5.
+    """SYMBOL_CONFIG's shipped EDITABLE_KEYS values, without importing MetaTrader5.
 
     This used to `ast`-parse the dict back out of bot_manager's source, because
     `import backend.bot_manager` needs a terminal-capable host. SYMBOL_CONFIG now
@@ -146,7 +182,9 @@ def _code_defaults():
     """
     from backend.core.symbols import SYMBOL_CONFIG
 
-    return {symbol: (float(cfg["lot_size"]), float(cfg.get("partial_fraction", 0.0)))
+    return {symbol: {"lot_size": float(cfg["lot_size"]),
+                     "partial_fraction": float(cfg.get("partial_fraction", 0.0)),
+                     "exit_at_mean": bool(cfg.get("exit_at_mean", False))}
             for symbol, cfg in SYMBOL_CONFIG.items()}
 
 
@@ -182,7 +220,8 @@ def main(argv=None):
         repository.ensure_bot_rows(sorted(defaults))
 
         if not args.skip_legacy:
-            import_legacy_settings(args.settings_file, known_symbols=set(defaults))
+            import_legacy_settings(args.settings_file, known_symbols=set(defaults),
+                                   defaults=defaults)
         seed_defaults(defaults)
 
         _log("done")

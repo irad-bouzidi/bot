@@ -989,6 +989,16 @@ select:focus-visible,
   line-height: 1.5;
 }
 
+/* The account reading has stopped moving. Muted grey is right for the ordinary
+   note -- it is a footnote about a throttle -- and wrong for this one, which is
+   the only thing on the page saying the balance above it is not current. */
+.snapshot-note.stale {
+  padding: 7px 10px;
+  border-left: 3px solid var(--danger-color);
+  background: var(--card-bg);
+  color: var(--danger-color);
+}
+
 /* ---- desired-vs-actual bot state ---------------------------------------- */
 
 /* The bot was running before the process went down. Deliberately a prompt and
@@ -1047,6 +1057,37 @@ select:focus-visible,
 }
 
 /* ---- sizing history ----------------------------------------------------- */
+
+/* Separated from the sizing grid above by a rule, because it is not sizing: it
+   changes WHICH trades exist rather than how big they are, and it stays usable
+   while the lot fields are locked. */
+.exit-rules {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-color);
+}
+
+.exit-rules .sizing-head { margin-bottom: 8px; }
+
+.exit-rule-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-main);
+  cursor: pointer;
+}
+
+.exit-rule-row input[type='checkbox'] {
+  width: 14px;
+  height: 14px;
+  accent-color: var(--accent-color);
+  cursor: pointer;
+}
+
+.exit-rule-row input[type='checkbox']:disabled { cursor: default; opacity: 0.5; }
 
 .sizing-history {
   margin-top: 12px;

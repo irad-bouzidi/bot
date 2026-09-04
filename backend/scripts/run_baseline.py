@@ -36,11 +36,7 @@ import pandas as pd
 from backend.backtest.costs import CostConfig, CostModel
 from backend.backtest.engine import BacktestConfig, BacktestEngine
 from backend.backtest.metrics import by_group
-from backend.core.news import (DEFAULT_IMPACTS, empty_calendar, news_dir,
-                               read_calendar)
-from backend.core.symbols import (NEWS_AFTER_MINUTES, NEWS_BEFORE_MINUTES,
-                                  SYMBOL_CONFIG, news_currencies_for,
-                                  price_levels)
+from backend.core.symbols import SYMBOL_CONFIG, price_levels
 from backend.data.cache import DEFAULT_ROOT, CachedMarketData
 from backend.strategy.nw_envelope import NWConfig, NWEnvelopeStrategy
 
@@ -55,34 +51,7 @@ def _utc(s):
     return datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=timezone.utc)
 
 
-def build_calendar(args):
-    """Load the news calendar, or an empty one when --news-file is absent.
-
-    Empty is a real answer here, not a fallback: it means "nothing was
-    scheduled", so the run reproduces the pre-news-filter behaviour exactly.
-    That is deliberately the OPPOSITE of the live path, which refuses to open a
-    trade on a calendar it cannot vouch for -- there a real position is at
-    stake, whereas failing closed in a backtest would silently delete trades and
-    report the remainder as a result.
-    """
-    impacts = tuple(i.strip().lower() for i in args.news_impacts.split(",")
-                    if i.strip())
-    if args.news_currencies is None:
-        currencies = news_currencies_for(args.symbol) or None
-    elif args.news_currencies.strip().lower() in ("", "any", "all"):
-        currencies = None
-    else:
-        currencies = tuple(c.strip().upper()
-                           for c in args.news_currencies.split(",") if c.strip())
-    kwargs = dict(before_minutes=args.news_before, after_minutes=args.news_after,
-                  impacts=impacts, currencies=currencies)
-    if not args.news_file:
-        return empty_calendar(**kwargs), currencies, impacts
-    return read_calendar(args.news_file, **kwargs), currencies, impacts
-
-
 def build_strategy(args):
-    calendar, currencies, impacts = build_calendar(args)
     return NWEnvelopeStrategy(NWConfig(
         bandwidth=args.bandwidth, mult=args.mult, window=args.window,
         mae_window=args.mae_window, entry_mode=args.entry_mode,
@@ -90,12 +59,8 @@ def build_strategy(args):
         be_trigger_mode="none" if args.no_breakeven else "tp_fraction",
         be_trigger_tp_fraction=args.be_trigger_fraction,
         partial_fraction=args.partial_fraction,
-        news_enabled=bool(args.news_file),
-        news_before_minutes=args.news_before,
-        news_after_minutes=args.news_after,
-        news_impacts=impacts,
-        news_currencies=tuple(currencies or ()),
-    ), calendar=calendar)
+        exit_at_mean=bool(args.exit_at_mean),
+    ))
 
 
 def run_one(barset, args, spread_mult, slip_mult, legacy=False):
@@ -164,17 +129,13 @@ def print_report(name, m):
 def _apply_symbol_defaults(args):
     """Resolve the settings that have per-symbol defaults, and SAY WHAT THEY ARE.
 
-    --sl / --tp / --be-trigger-fraction from SYMBOL_CONFIG, plus the news
-    blackout's state. Both for the same reason: the live bot holds its geometry
-    in pips (70 x 0.1 on gold, 700 x 1.0 on Bitcoin) and this script takes price
-    units, so the conversion has to happen somewhere; doing it here means the
-    two cannot drift, and printing it means a report can be read six months
-    later without guessing which numbers produced it. An unconfigured symbol
-    must pass the geometry explicitly rather than inherit another instrument's
-    stop.
-
-    The news line is printed even when the filter is OFF, because a silent
-    absence reads as "there was no such rule" -- and there now is one.
+    --sl / --tp / --be-trigger-fraction and the centre-line exit, all from
+    SYMBOL_CONFIG. Same reason for each: the live bot holds its geometry in pips
+    (70 x 0.1 on gold, 700 x 1.0 on Bitcoin) and this script takes price units,
+    so the conversion has to happen somewhere; doing it here means the two
+    cannot drift, and printing it means a report can be read six months later
+    without guessing which numbers produced it. An unconfigured symbol must pass
+    the geometry explicitly rather than inherit another instrument's stop.
     """
     known = args.symbol in SYMBOL_CONFIG
     levels = price_levels(args.symbol) if known else None
@@ -197,24 +158,25 @@ def _apply_symbol_defaults(args):
                                               SYMBOL_CONFIG[args.symbol]["sl_pips"],
                                               SYMBOL_CONFIG[args.symbol]["tp_pips"])))
 
-    # Printed for the same reason as the geometry above: the news filter changes
-    # which trades exist, so a report that does not say whether it was on cannot
-    # be compared with one that does. "off" is stated explicitly rather than
-    # omitted -- a silent absence reads as "there was no such rule".
-    calendar, currencies, impacts = build_calendar(args)
-    if not args.news_file:
-        print("news filter: OFF (no --news-file) -- comparable with reports "
-              "made before the blackout rule existed")
+    # Not part of the loop above: this one is a flag, not a price level, and an
+    # unconfigured symbol gets a usable default rather than a SystemExit. FALSE
+    # is safe to assume where a stop distance is not -- it only removes an exit,
+    # and it is what every configured symbol ships.
+    if args.exit_at_mean is None:
+        args.exit_at_mean = bool(
+            SYMBOL_CONFIG.get(args.symbol, {}).get("exit_at_mean", False))
+        source = "SYMBOL_CONFIG[%s]" % args.symbol if known else "the default"
     else:
-        print("news filter: ON, -%g/+%gmin around %d events from %s "
-              "(impacts=%s currencies=%s)"
-              % (args.news_before, args.news_after, len(calendar),
-                 args.news_file, ",".join(impacts),
-                 "any" if currencies is None else ",".join(currencies)))
-        if calendar.is_empty:
-            print("  WARNING: the calendar matched 0 events, so this run is "
-                  "identical to --news-file being absent. Check the impact and "
-                  "currency filters and the date range of the file.")
+        source = "the command line"
+    # Printed on every run, on or off, for the same reason the geometry is: this
+    # rule changes which trades exist, so a report that does not say whether it
+    # was on cannot be compared with one that does. Reports stored before the
+    # flag existed were all produced with it ON.
+    print("centre-line exit: %s (from %s)"
+          % ("ON -- a scaled-out runner is usually closed before the target"
+             if args.exit_at_mean else
+             "OFF -- stop, break-even or target only", source))
+
 
 
 def main(argv=None):
@@ -249,6 +211,18 @@ def main(argv=None):
     p.add_argument("--no-costs", action="store_true")
     p.add_argument("--no-breakeven", action="store_true",
                    help="disable the scale-out / break-even rule, to measure it")
+    # Tri-state on purpose: None means "take the symbol's shipped value", so the
+    # research run models the live bot without being told to. --no-breakeven
+    # above is a plain store_true because the scale-out ships ON everywhere; this
+    # rule ships OFF, so a store_true alone could only ever turn it on and there
+    # would be no way to say "on for this symbol, off for that one".
+    p.add_argument("--exit-at-mean", dest="exit_at_mean",
+                   action="store_true", default=None,
+                   help="close on a return to the envelope centre line "
+                        "(default: the symbol's SYMBOL_CONFIG exit_at_mean)")
+    p.add_argument("--no-exit-at-mean", dest="exit_at_mean",
+                   action="store_false",
+                   help="leave a position to its stop, break-even or target only")
     p.add_argument("--be-trigger-fraction", type=float, default=None,
                    help="scale-out trigger as a fraction of the TP distance "
                         "(default: the symbol's be_trigger_pips / tp_pips)")
@@ -257,24 +231,6 @@ def main(argv=None):
     p.add_argument("--compare-legacy", action="store_true",
                    help="also run the ORIGINAL close-only, cost-free engine to show "
                         "how much it was flattering itself")
-    # News blackout. OFF unless --news-file is given: with no calendar there are
-    # no events, and a run with no events must reproduce the pre-filter numbers
-    # exactly so old reports stay comparable.
-    p.add_argument("--news-file", default=None,
-                   help="CSV file or directory of them (e.g. %s) holding the "
-                        "economic calendar. Omit to disable the news blackout "
-                        "entirely. Fetch one with: python -m "
-                        "backend.live.news_feed --fetch"
-                        % news_dir(DEFAULT_ROOT))
-    p.add_argument("--news-before", type=float, default=NEWS_BEFORE_MINUTES,
-                   help="minutes before an event to stop trading")
-    p.add_argument("--news-after", type=float, default=NEWS_AFTER_MINUTES,
-                   help="minutes after an event to resume trading")
-    p.add_argument("--news-impacts", default=",".join(DEFAULT_IMPACTS),
-                   help="comma-separated impact levels that trigger a blackout")
-    p.add_argument("--news-currencies", default=None,
-                   help="comma-separated currencies whose events count, or "
-                        "'any' (default: the symbol's news_currencies)")
     p.add_argument("--out", default=None, help="directory for ledger + metrics")
     args = p.parse_args(argv)
     _apply_symbol_defaults(args)
@@ -329,9 +285,9 @@ def main(argv=None):
     # whose top level is a scenario map -- adding a sibling key there would read
     # as a fourth scenario to anything already iterating it. It is written at
     # all because the engine has always assembled it and nothing ever saved it:
-    # a stored report could not say what produced it, which the news filter
-    # makes material, since a filtered and an unfiltered run differ only in
-    # settings that lived nowhere on disk.
+    # a stored report could not say what produced it, which the centre-line
+    # exit flag makes material: two runs that differ only in a rule that changes
+    # which trades exist would otherwise be indistinguishable on disk.
     with open(os.path.join(out, stamp + "_config.json"), "w") as fh:
         json.dump({k: v.config_used for k, v in results.items()}, fh,
                   indent=2, default=str)
