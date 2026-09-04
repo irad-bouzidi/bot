@@ -4,11 +4,21 @@ Runs entirely offline against `data/` -- no MT5 needed. Snapshot first on the
 trading host (see backend/data/snapshot.py), copy `data/` here, then:
 
     python -m backend.scripts.run_baseline --symbol XAUUSDm
+    python -m backend.scripts.run_baseline --symbol BTCUSDm
     python -m backend.scripts.run_baseline --symbol XAUUSDm --compare-legacy
 
 Reports every metric the spec asks for, plus breakdowns by session, day of week,
 direction and exit reason, and writes the full trade ledger so the diagnosis
 phase has something to work with.
+
+ONE SYMBOL PER RUN, on purpose. The dashboard's /backtest can replay several
+symbols onto one account; this script cannot, because a report here is the basis
+for a decision about a strategy on an instrument and averaging two instruments'
+edges together is how a losing one hides behind a winning one. Run it twice.
+
+--sl / --tp are PRICE units and default to the symbol's own SYMBOL_CONFIG
+geometry (gold 7/10, Bitcoin 700/1000), printed at the top of every report so a
+saved run says what produced it.
 
 Three cost scenarios are always reported. The CENTRAL column is the decision
 basis: entries fire during volatility expansions, when spreads are widest, so a
@@ -26,6 +36,7 @@ import pandas as pd
 from backend.backtest.costs import CostConfig, CostModel
 from backend.backtest.engine import BacktestConfig, BacktestEngine
 from backend.backtest.metrics import by_group
+from backend.core.symbols import SYMBOL_CONFIG, price_levels
 from backend.data.cache import DEFAULT_ROOT, CachedMarketData
 from backend.strategy.nw_envelope import NWConfig, NWEnvelopeStrategy
 
@@ -114,6 +125,38 @@ def print_report(name, m):
             print("  NOTE: %s" % m[note])
 
 
+def _apply_symbol_defaults(args):
+    """Fill --sl / --tp / --be-trigger-fraction from SYMBOL_CONFIG, and SAY SO.
+
+    The live bot holds its geometry in pips (70 x 0.1 on gold, 700 x 1.0 on
+    Bitcoin) and this script takes price units, so the conversion has to happen
+    somewhere; doing it here means the two cannot drift, and printing it means a
+    report can be read six months later without guessing which numbers produced
+    it. An unconfigured symbol must pass both explicitly rather than inherit
+    another instrument's stop.
+    """
+    known = args.symbol in SYMBOL_CONFIG
+    levels = price_levels(args.symbol) if known else None
+    chosen = []
+    for flag, key in (("sl", "sl_price"), ("tp", "tp_price"),
+                      ("be_trigger_fraction", "be_trigger_tp_fraction")):
+        if getattr(args, flag) is not None:
+            continue
+        if not known:
+            raise SystemExit(
+                "%s is not in SYMBOL_CONFIG, so --%s has no default. Pass --sl "
+                "and --tp explicitly (PRICE units), or add the symbol to "
+                "backend/core/symbols.py." % (args.symbol, flag.replace("_", "-")))
+        setattr(args, flag, levels[key])
+        chosen.append("%s=%g" % (flag, levels[key]))
+    if chosen:
+        print("geometry: %s from SYMBOL_CONFIG[%s] (%s)"
+              % (", ".join(chosen), args.symbol,
+                 "pip=%g sl=%g tp=%g pips" % (levels["pip"],
+                                              SYMBOL_CONFIG[args.symbol]["sl_pips"],
+                                              SYMBOL_CONFIG[args.symbol]["tp_pips"])))
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(prog="backend.scripts.run_baseline",
                                 description=__doc__,
@@ -130,15 +173,25 @@ def main(argv=None):
     p.add_argument("--window", type=int, default=500)
     p.add_argument("--mae-window", type=int, default=500)
     p.add_argument("--entry-mode", default="level", choices=["level", "cross"])
-    p.add_argument("--sl", type=float, default=7.0, help="stop distance, PRICE units")
-    p.add_argument("--tp", type=float, default=10.0, help="target distance, PRICE units")
+    # No numeric default: 7.0/10.0 is gold's geometry in price units, and
+    # silently applying it to BTCUSDm would put a $7 stop on an $81,000
+    # instrument and report the result as a baseline. Left None and resolved from
+    # SYMBOL_CONFIG below, so the pip counts the live bot trades are the pip
+    # counts this measures.
+    p.add_argument("--sl", type=float, default=None,
+                   help="stop distance, PRICE units (default: the symbol's "
+                        "SYMBOL_CONFIG stop)")
+    p.add_argument("--tp", type=float, default=None,
+                   help="target distance, PRICE units (default: the symbol's "
+                        "SYMBOL_CONFIG target)")
     p.add_argument("--commission", type=float, default=0.0)
     p.add_argument("--slippage", type=float, default=0.0, help="points")
     p.add_argument("--no-costs", action="store_true")
     p.add_argument("--no-breakeven", action="store_true",
                    help="disable the scale-out / break-even rule, to measure it")
-    p.add_argument("--be-trigger-fraction", type=float, default=0.5,
-                   help="scale-out trigger as a fraction of the TP distance")
+    p.add_argument("--be-trigger-fraction", type=float, default=None,
+                   help="scale-out trigger as a fraction of the TP distance "
+                        "(default: the symbol's be_trigger_pips / tp_pips)")
     p.add_argument("--partial-fraction", type=float, default=0.5,
                    help="proportion of the position closed at the trigger")
     p.add_argument("--compare-legacy", action="store_true",
@@ -146,6 +199,7 @@ def main(argv=None):
                         "how much it was flattering itself")
     p.add_argument("--out", default=None, help="directory for ledger + metrics")
     args = p.parse_args(argv)
+    _apply_symbol_defaults(args)
 
     md = CachedMarketData(root=args.root, offline=True)
     strat = build_strategy(args)

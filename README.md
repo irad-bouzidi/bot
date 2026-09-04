@@ -33,14 +33,22 @@ This bot places **real market orders**. Read this section before running it.
   It is enabled because it was requested; disable it with
   `--no-breakeven`, `partial_fraction = 0` in `SYMBOL_CONFIG`, or a scale-out of
   0 lots in the dashboard's Position sizing panel.
-- **`lot_size` defaults to 0.1, which risks ~$70 per gold trade** against the 70-pip
-  stop. It is editable from the dashboard — which shows the dollar risk as you type —
-  and persisted, but it still comes with no equity-based sizing, no daily or weekly
-  loss cap and no margin check.
+- **Both configured symbols backtest NEGATIVE on cached data.** Central costs,
+  M5, 2025-09-01 to 2026-09-04, 0.1 lots on $1,000, honest engine: gold at 7/10
+  is -$13,046 (-0.106R, 908% drawdown) and Bitcoin at 700/1000 is -$3,677
+  (-0.031R, 356% drawdown). Bitcoin is the less bad of the two at the same
+  nominal risk; neither is a configuration to fund. Nothing here promises
+  profitability — re-measure on your own data.
+- **`lot_size` defaults to 0.1, which risks ~$70 per trade on either symbol**
+  against its stop. It is editable from the dashboard — which shows the dollar
+  risk as you type — and persisted, but it still comes with no equity-based
+  sizing, no daily or weekly loss cap and no margin check.
   This configuration produced runs of 11-12 consecutive losses in backtest — about
   $840 — at roughly 4.4 trades per day. Note that "0.1 lots" means a completely
   different dollar risk on another instrument: the risk is set by the contract
-  size, not the nominal volume.
+  size, not the nominal volume. Gold and Bitcoin happening to both cost ~$70 at
+  0.1 lots is a coincidence of their contract sizes (100 oz/lot over a 7.00 stop
+  vs 1 BTC/lot over a 700.00 one), not a property that a third symbol inherits.
 - The backtest engine has no ruin or margin model, so a simulated balance can go
   negative and drawdown can exceed 100%.
 
@@ -125,14 +133,17 @@ frontend/Dockerfile             CRA build → static `serve` (no nginx)
 frontend/serve.json             SPA fallback, cache rules, security headers
 frontend/docker-entrypoint.sh   writes env.js from BOT_API_BASE at start
 tests/                          pytest suite (runs with no MT5 and no Postgres)
-data/                           Bar cache + reports (gitignored)
+data/                           Bar cache, contract specs + reports (committed)
 ```
 
 ---
 
 ## ⚙️ Configuration
 
-Strategy constants live at the top of `backend/bot_manager.py`:
+Strategy constants live at the top of `backend/bot_manager.py`; the per-symbol
+table lives in `backend/core/symbols.py`, which imports neither MetaTrader5 nor
+psycopg2 so the live loop, `backend.db.migrate` and the offline research scripts
+all read the same numbers instead of copying them.
 
 | Name | Default | Meaning |
 |---|---|---|
@@ -141,14 +152,32 @@ Strategy constants live at the top of `backend/bot_manager.py`:
 | `WINDOW_SIZE` | `500` | Kernel window |
 | `MAE_WINDOW` | `500` | Band lookback (Pine uses 499) |
 | `COOLDOWN_BARS` | `3` | Minimum closed bars between entries |
-| `be_trigger_pips` | `50` / `250` | Profit distance that arms the scale-out (half the target) |
-| `partial_fraction` | `0.5` | Proportion closed at that trigger; the rest runs to TP |
+| `partial_fraction` | `0.5` | Proportion closed at the scale-out trigger; the rest runs to TP |
 | `DEVIATION_POINTS` | `20` | Max slippage tolerated on a market order |
 | `MAGIC_NUMBER` | `123456` | Identifies this bot's positions |
 | `TIMEFRAME` | `M5` | Chart timeframe |
 
-Per-symbol settings are in `SYMBOL_CONFIG` in the same file (`lot_size`,
-`sl_pips`, `tp_pips`, `pip`).
+Per-symbol settings are in `SYMBOL_CONFIG` (`backend/core/symbols.py`). Two
+symbols are configured, and the geometry is the same **rule** expressed in each
+instrument's own units:
+
+| | XAUUSDm | BTCUSDm |
+|---|---|---|
+| `pip` | `0.1` | `1.0` |
+| `sl_pips` / `tp_pips` | `70` / `100` → 7.00 / 10.00 | `700` / `1000` → 700 / 1000 |
+| `be_trigger_pips` | `50` → 5.00 | `500` → 500 |
+| `profit_mult` (contract size) | `100` oz per lot | `1` BTC per lot |
+| `lot_size` default | `0.1` (~$70 at risk) | `0.1` (~$70 at risk) |
+
+Worked through on Bitcoin: a long filled at **80500** takes profit at **81500**
+and stops at **79800**; at **81000** — half way to the target — `partial_fraction`
+of the position is closed and the stop moves to **80500**, so the remainder runs
+to the target at no risk. A sell mirrors it: 79500 target, 81200 stop, 80000
+trigger. The same rule on gold is 7.00 / 10.00 / 5.00.
+
+Adding a third symbol is one `SYMBOL_CONFIG` entry — the dashboard reads its
+symbol list from `/settings` — but re-derive its dollar risk from the contract
+size and back-test it before funding it.
 
 `lot_size` and `partial_fraction` are also editable at runtime from the dashboard's
 **Position sizing** panel and from the Backtest page, and are persisted to the
@@ -192,7 +221,7 @@ collapsing them into one word is how a dead bot comes to report "Running".
 | `deals` / `trades` | MT5's raw deals, and one row per **position** folded from them |
 | `bot_state` / `control_events` | desired run state, the per-bar entry guards, every start/stop press |
 | `bot_snapshots` | the latest envelope reading per symbol |
-| `backtest_runs` | every backtest, inputs and outputs, failures included |
+| `backtest_runs` | every backtest, inputs and outputs, failures included — including combined multi-symbol runs |
 | `ui_preferences` | theme, active view, backtest form values |
 | `account_snapshots` | throttled account readings, which accumulate an equity curve |
 
@@ -299,14 +328,22 @@ file the first time a column changed.
 
 Postgres ignores that directory once the data volume exists, so
 `python -m backend.db.migrate` is the path that works every time. It is
-idempotent — every statement in `schema.sql` is `IF NOT EXISTS` — so running
-both is harmless. `migrate` also:
+idempotent — every statement in `schema.sql` is `IF NOT EXISTS`, `ADD COLUMN IF
+NOT EXISTS` or a guarded backfill — so running both is harmless, and running it
+against a database created by an earlier version applies the difference. `migrate`
+also:
 
 - imports `data/settings.json` into `symbol_settings` **once**, so a lot size you
   lowered on purpose is not lost in the move to Postgres. A re-run leaves the
   database value alone rather than restoring the file's;
 - seeds a row for any configured symbol that has none, so `/settings` never has
   to answer "no row" — the fallback for which would be the 0.1 code default.
+  This is what gives a new symbol its stored lot size; run `migrate` after adding
+  one.
+
+**Schema version 2** adds `backtest_runs.symbols` and `.sizing`, for runs that
+cover several symbols at once. Existing rows are backfilled with their single
+symbol, so nothing needs re-creating — run `migrate` and the columns appear.
 
 `python -m backend.db.migrate --check` reports connectivity and schema version
 and changes nothing.
@@ -385,6 +422,7 @@ results than a close-only, cost-free backtest.
 
 ```bash
 python -m backend.data.snapshot --symbol XAUUSDm --start 2023-01-01
+python -m backend.data.snapshot --symbol BTCUSDm --start 2025-09-01
 python -m backend.data.snapshot --list          # coverage report
 ```
 
@@ -394,12 +432,23 @@ Copy the resulting `data/` directory to wherever you run research.
 
 ```bash
 python -m backend.scripts.run_baseline --symbol XAUUSDm --compare-legacy
+python -m backend.scripts.run_baseline --symbol BTCUSDm --start 2025-09-01
 ```
 
 This prints every metric, breakdowns by session / day-of-week / direction /
 exit-reason, three cost scenarios, and writes the full trade ledger to
 `data/reports/`. `--compare-legacy` also runs the original close-only, cost-free
 engine so you can see how much it was overstating results.
+
+`--sl` / `--tp` are **price** units and default to the symbol's own
+`SYMBOL_CONFIG` geometry — 7 / 10 for gold, 700 / 1000 for Bitcoin — printed at
+the top of each report so a saved run says what produced it. Passing gold's 7/10
+for `BTCUSDm` would put a $7 stop on an $81,000 instrument.
+
+**One symbol per run, deliberately.** The dashboard can backtest several symbols
+together; this script cannot, because a report here is the basis for a decision
+about a strategy *on an instrument*, and averaging two instruments' edges is how
+a losing one hides behind a winning one. Run it twice and compare.
 
 ---
 
@@ -410,9 +459,10 @@ engine so you can see how much it was overstating results.
 1. **MetaTrader 5 terminal** installed, running, and **logged into your account**.
    The bot attaches to the open terminal; it does not log in itself.
 2. **Python 3.8+** and **Node.js**.
-3. An account carrying the symbol `XAUUSDm` — check your broker's exact suffix,
-   since `XAUUSD` and `XAUUSDm` are different symbols.
-4. The symbol visible in MT5's **Market Watch** (right-click → Show All).
+3. An account carrying the symbols `XAUUSDm` and `BTCUSDm` — check your broker's
+   exact suffixes, since `XAUUSD` and `XAUUSDm` are different symbols. Either can
+   simply be left stopped if your account does not offer it.
+4. Those symbols visible in MT5's **Market Watch** (right-click → Show All).
 5. **Algo Trading enabled** in the terminal (the toolbar button must be green).
 6. **Docker**, for Postgres and the dashboard container.
 
@@ -443,8 +493,9 @@ is carried over, then leaves the database value alone on every later run.
 
 ```bash
 python -m pytest                                     # should pass
-python -m backend.db.migrate --check                 # schema version 1
+python -m backend.db.migrate --check                 # schema version 2
 python -m backend.data.snapshot --symbol XAUUSDm --spec-only
+python -m backend.data.snapshot --symbol BTCUSDm --spec-only
 ```
 
 The second command confirms the terminal is reachable and prints your broker's
@@ -486,6 +537,19 @@ npx concurrently "python -m backend.main" "npm start --prefix frontend"
 Point MT5 at a **demo account** and run the dashboard against it first. Confirm
 that trades open and close as expected, and watch the backend log — every
 rejected order now prints its retcode and the broker's comment.
+
+The **Backtest** page takes one symbol, the other, or **all of them at once** —
+the symbol chips toggle individually and **All assets** selects every configured
+symbol in one click. The list is read from `/settings`, so it always matches
+`SYMBOL_CONFIG`; if that request fails the page says so rather than quietly
+offering gold alone. All at once means every selected symbol replayed onto a
+*single* account in close-time order, so the
+combined drawdown is the merged equity curve's — not the two per-symbol figures
+added together, which would be wrong in both directions. The per-symbol
+breakdown under the results shows each symbol run alone for comparison. Sizing is
+set per symbol, because a lot is not a comparable unit across instruments. Every
+number on that page still comes from the **legacy close-only, cost-free engine**
+and is systematically optimistic; use `run_baseline` to decide anything.
 
 ### Step 7 — Start trading
 

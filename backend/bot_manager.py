@@ -9,6 +9,9 @@ from datetime import datetime, timedelta
 from typing import Dict
 
 from backend.core.errors import ConfigRejected, DatabaseUnavailable
+from backend.core.symbols import (
+    EDITABLE_KEYS, SUPPORTED_SYMBOLS, SYMBOL_CONFIG, price_levels,
+)
 from backend.db import pool as db_pool
 from backend.db import repository as repo
 from backend.indicators.nadaraya_watson import nw_envelope, nw_warmup_bars
@@ -50,40 +53,17 @@ SYMBOL_FILLING_IOC = 2
 def log(msg):
     print("[%s] %s" % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg), flush=True)
 
-# Symbol configurations
-# pip: price movement per pip (for SL/TP calculation)
-# lot_size: position size. EDITABLE at runtime -- see EDITABLE_KEYS below.
-# sl_pips/tp_pips: stop loss and take profit in pips
-# profit_mult: multiplier for P&L calculation (profit = price_diff * lot_size * profit_mult)
-# be_trigger_pips: profit distance at which the scale-out arms. Half the target --
-#   see NWConfig.be_trigger_mode="tp_fraction", the same rule.
-# partial_fraction: proportion of the position closed at that trigger. 0.5 of the
-#   0.1 default is 0.05 out and 0.05 left running to the target, which is what was
-#   asked for. It is a FRACTION, not a lot count, so it tracks lot_size instead of
-#   silently becoming a different share of the position when the size changes.
-#   EDITABLE at runtime, but only ever via scale_out_fraction(): the UI speaks
-#   lots, this dict does not.
-SYMBOL_CONFIG = {
-    "XAUUSDm": {
-        "pip": 0.1,
-        "lot_size": 0.1,            # risks ~$70/trade at the 70-pip stop
-        "sl_pips": 70,
-        "tp_pips": 100,
-        "profit_mult": 100,
-        "be_trigger_pips": 50,      # 5.00 in price -- half of the 100-pip target
-        "partial_fraction": 0.5,    # 0.05 out at +5.00, 0.05 runs to the target
-    },
-}
-
-SUPPORTED_SYMBOLS = list(SYMBOL_CONFIG.keys())
-
-# ---- runtime-editable sizing -------------------------------------------------
+# Symbol configurations, EDITABLE_KEYS and SUPPORTED_SYMBOLS all live in
+# backend/core/symbols.py now. They moved because the same table is needed by
+# `backend.db.migrate` (no terminal) and by `backend.scripts.run_baseline` (no
+# terminal and no database), and neither may import this module -- it imports
+# MetaTrader5. Re-exported here because every existing caller, and every test,
+# reads them off `backend.bot_manager`.
 #
-# The dashboard can edit exactly these two keys; every other key above is fixed in
-# code. They are persisted, because with no equity-based sizing anywhere in this
-# bot the lot size IS the risk control: someone who lowers it to 0.02 to cut their
-# exposure must not have 0.1 -- and ~$70 a trade -- quietly restored by a restart.
-EDITABLE_KEYS = ("lot_size", "partial_fraction")
+# SYMBOL_CONFIG is the SAME dict object, not a copy: update_settings() mutates it
+# in place and a running bot holds a live reference into it (TradingBot.config),
+# which is how a size edit reaches a thread without restarting it.
+# (the import itself is at the top of the file, with the others)
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -409,7 +389,16 @@ class TradingBot(threading.Thread):
         # that dict in place so a running bot picks the new size up on its next
         # entry without being restarted. Read it under _CONFIG_LOCK where the value
         # has to stay consistent with a position (see open_trade).
-        self.config = SYMBOL_CONFIG.get(symbol, SYMBOL_CONFIG["XAUUSDm"])
+        #
+        # An unknown symbol used to fall back to XAUUSDm's row. That was survivable
+        # while gold was the only symbol; with a second one it is a live hazard,
+        # because the fallback is silent and the numbers are not interchangeable --
+        # gold's pip is 0.1, so a BTCUSDm typo would compute a $0.70 stop on an
+        # $81,000 instrument and send it. Refuse instead.
+        if symbol not in SYMBOL_CONFIG:
+            raise ConfigRejected("Unknown symbol %r. Configured: %s"
+                                 % (symbol, ", ".join(SUPPORTED_SYMBOLS)))
+        self.config = SYMBOL_CONFIG[symbol]
         self.running = False
         self._stop_event = threading.Event()
 
@@ -1065,6 +1054,18 @@ def simulate_legacy(df, outs, uppers, lowers, config, initial_balance,
     partials_fired = 0
     partial_pl = 0.0
 
+    # One entry per CLOSED trade, in the order they closed. It exists so several
+    # symbols can be replayed onto ONE account (combine_legacy_results): a
+    # combined drawdown cannot be recovered from two finished summaries, because
+    # the deepest trough of the merged curve depends on the interleaving, and
+    # taking the worse of the two per-symbol figures both understates a
+    # simultaneous drawdown and overstates offsetting ones.
+    closed_trades = []
+    # No `time` column in the synthetic frames the engine's own tests use. None
+    # rather than a positional index, so a caller merging two symbols can tell
+    # "unknown" from "bar 3" instead of interleaving on a meaningless key.
+    times = df["time"] if "time" in df.columns else None
+
     side = 0              # 0 flat, +1 long, -1 short -- lets one branch serve both
     entry_price = 0.0
     open_volume = 0.0     # lots still running; the scale-out reduces it
@@ -1129,6 +1130,15 @@ def simulate_legacy(df, outs, uppers, lowers, config, initial_balance,
                     wins += 1
                 elif trade_pl < 0:
                     losses += 1
+                # `trade_pl`, not `pl`: the partial is part of this trade's
+                # result, and recording the runner alone would let a combined
+                # equity curve book the scale-out twice -- once here and once in
+                # the symbol's own total.
+                closed_trades.append({
+                    "closed_at": (times.iloc[i] if times is not None else None),
+                    "pl": trade_pl,
+                    "scaled_out": be_armed and scale_out_lots > 0,
+                })
                 side = 0
 
         peak_balance = max(peak_balance, balance)
@@ -1150,6 +1160,7 @@ def simulate_legacy(df, outs, uppers, lowers, config, initial_balance,
         "runner_lots": runner_lots,
         "partials_fired": partials_fired,
         "partial_pl": partial_pl,
+        "closed_trades": closed_trades,
         # This engine checks exits on CLOSES only and models no spread, commission
         # or slippage. It DOES now model the scale-out / break-even rule, but at an
         # assumed fill on the trigger level, so it still flatters that rule too.
@@ -1159,6 +1170,99 @@ def simulate_legacy(df, outs, uppers, lowers, config, initial_balance,
             "assumed to fill at their level on the bar that closes past them. "
             "Results are optimistic and do not reflect live behaviour. Use "
             "`python -m backend.scripts.run_baseline` for decisions."
+        ),
+    }
+
+
+def combine_legacy_results(results, initial_balance):
+    """Replay several symbols' closed trades onto ONE account, in time order.
+
+    "Both combined" has to mean one account, because that is the only version of
+    the question a trader can act on: two symbols funded separately are just two
+    backtests printed next to each other. The consequence is that the combined
+    figures are NOT the per-symbol ones added up --
+
+      * `max_drawdown` comes from the merged equity curve. Summing or taking the
+        worse of the two per-symbol percentages gets it wrong in both directions:
+        it understates two drawdowns that happen to land together, and overstates
+        two that offset. The interleaving is the whole content of the number, and
+        it cannot be recovered from finished summaries -- which is why
+        simulate_legacy returns `closed_trades` at all.
+      * win/loss counts DO add up, since a trade is won or lost on its own P&L
+        regardless of what the other symbol was doing.
+
+    `results` is {symbol: simulate_legacy(...)}. Pure -- no MT5, no database.
+    """
+    events = []
+    for symbol, res in results.items():
+        for seq, trade in enumerate(res.get("closed_trades") or []):
+            events.append((symbol, seq, trade))
+
+    # Sorted by close time when every trade has one, which is the live path:
+    # run_backtest hands simulate_legacy a frame with a `time` column. Synthetic
+    # frames have none, and interleaving those on a positional index would invent
+    # an ordering across symbols; leave them grouped and say so instead.
+    untimed = [e for e in events if e[2].get("closed_at") is None]
+    ordered = not untimed
+    if ordered:
+        events.sort(key=lambda e: (e[2]["closed_at"], e[0], e[1]))
+
+    balance = initial_balance
+    peak_balance = initial_balance
+    max_drawdown = 0.0
+    wins = losses = 0
+    total_pl = 0.0
+    for _symbol, _seq, trade in events:
+        pl = trade["pl"]
+        balance += pl
+        total_pl += pl
+        if pl > 0:
+            wins += 1
+        elif pl < 0:
+            losses += 1
+        peak_balance = max(peak_balance, balance)
+        if peak_balance != 0:
+            max_drawdown = max(max_drawdown,
+                               (peak_balance - balance) / peak_balance * 100)
+
+    trades_opened = sum(r["trades_opened"] for r in results.values())
+    per_symbol = {}
+    for symbol, res in results.items():
+        clean = {k: v for k, v in res.items() if k != "closed_trades"}
+        per_symbol[symbol] = clean
+
+    return {
+        # Request order, not sorted: the dashboard renders the per-symbol table
+        # from this and a run of "gold, then Bitcoin" that reads back the other
+        # way round looks like a different run.
+        "symbols": list(results),
+        "combined": True,
+        "trades_ordered": ordered,
+        "initial_balance": initial_balance,
+        "final_balance": balance,
+        "total_pl": total_pl,
+        "trades_opened": trades_opened,
+        "wins": wins,
+        "losses": losses,
+        # Denominator is trades OPENED, matching the single-symbol engine: a
+        # trade still open at the end of the window is counted as taken and as
+        # neither won nor lost, so the two numbers stay comparable.
+        "win_rate": (wins / trades_opened * 100) if trades_opened > 0 else 0,
+        "max_drawdown": max_drawdown,
+        "partials_fired": sum(r["partials_fired"] for r in results.values()),
+        "partial_pl": sum(r["partial_pl"] for r in results.values()),
+        "per_symbol": per_symbol,
+        "warning": (
+            "Close-only, cost-free engine: no spread/commission/slippage and no "
+            "intrabar stops -- the stop, the target and the scale-out are all "
+            "assumed to fill at their level on the bar that closes past them. "
+            "Combined figures replay both symbols onto ONE account in close-time "
+            "order, so the drawdown is the merged curve's and is NOT the sum of "
+            "the per-symbol ones. Results are optimistic and do not reflect live "
+            "behaviour. Use `python -m backend.scripts.run_baseline` for decisions."
+            + ("" if ordered else
+               " NOTE: some trades carried no close time, so they could not be "
+               "interleaved -- the combined drawdown is unreliable for this run.")
         ),
     }
 
@@ -1400,7 +1504,7 @@ class BotManager:
             "sl_pips": cfg["sl_pips"],
             "tp_pips": cfg["tp_pips"],
             "pip": cfg["pip"],
-            "risk_per_lot": cfg["sl_pips"] * cfg["pip"] * cfg["profit_mult"],
+            "risk_per_lot": price_levels(symbol)["risk_per_lot"],
             "volume_min": vol_min,
             "volume_max": vol_max,
             "volume_step": step,
@@ -1500,15 +1604,27 @@ class BotManager:
 
     def run_backtest(self, symbol, start_date, end_date, initial_balance,
                      lot_size=None, partial_fraction=None):
-        """Fetch bars and run the legacy engine. `lot_size` / `partial_fraction`
-        override the live settings for this run only -- nothing is written back."""
+        """Fetch bars and run the legacy engine for ONE symbol.
+
+        `lot_size` / `partial_fraction` override the live settings for this run
+        only -- nothing is written back. The returned dict carries
+        `closed_trades`, which run_backtests() needs to merge symbols onto one
+        account and then strips; it is not part of what /backtest answers.
+        """
+        if symbol not in SYMBOL_CONFIG:
+            # Not a fallback to gold. The bars would be Bitcoin's and the pip
+            # gold's, and the run would report a plausible number for a strategy
+            # nobody configured.
+            return {"error": "Unknown symbol %r. Configured: %s"
+                             % (symbol, ", ".join(SUPPORTED_SYMBOLS))}
         if not mt5.initialize():
             return {"error": "MT5 Init Failed"}
 
         # Fetch rates
         rates = mt5.copy_rates_range(symbol, TIMEFRAME, start_date, end_date)
         if rates is None or len(rates) == 0:
-            return {"error": "No historical data found for the given range"}
+            return {"error": "No historical data found for %s in the given range"
+                             % symbol}
 
         df = pd.DataFrame(rates)
         df['time'] = pd.to_datetime(df['time'], unit='s')
@@ -1516,7 +1632,7 @@ class BotManager:
         # Create a temporary bot instance to use its envelope logic
         bot = TradingBot(symbol)
         with _CONFIG_LOCK:
-            config = dict(SYMBOL_CONFIG.get(symbol, SYMBOL_CONFIG["XAUUSDm"]))
+            config = dict(SYMBOL_CONFIG[symbol])
         if lot_size is not None:
             config["lot_size"] = _validated("lot_size", lot_size)
         if partial_fraction is not None:
@@ -1526,6 +1642,57 @@ class BotManager:
         vol_min, _vol_max, step, _from_broker = _volume_limits(symbol)
         return simulate_legacy(df, outs, uppers, lowers, config, initial_balance,
                                volume_min=vol_min, volume_step=step)
+
+    def run_backtests(self, symbols, start_date, end_date, initial_balance,
+                      sizing=None):
+        """Backtest one or several symbols; several are replayed onto ONE account.
+
+        `sizing` is {symbol: {"lot_size": .., "partial_fraction": ..}} -- per
+        symbol, because a lot is not a comparable unit across symbols. 0.1 lots
+        of gold and 0.1 lots of Bitcoin risk about the same $70 here, but only by
+        coincidence of the two contract sizes; one number applied to both would
+        be a different bet on each the moment a third symbol arrives.
+
+        The single-symbol answer keeps the shape it has always had, so stored
+        runs and anything reading `lot_size` off the top level still work; it
+        just gains `symbols` and `per_symbol`. A multi-symbol answer is the
+        combined one, with the per-symbol results underneath it.
+
+        A symbol that fails takes the whole run down rather than being dropped:
+        "gold and Bitcoin combined" silently answered with gold alone is the kind
+        of result someone acts on.
+        """
+        sizing = sizing or {}
+        wanted = []
+        for symbol in symbols:
+            if symbol not in wanted:
+                wanted.append(symbol)
+        if not wanted:
+            return {"error": "No symbol selected."}
+
+        results = {}
+        for symbol in wanted:
+            per = sizing.get(symbol) or {}
+            res = self.run_backtest(symbol, start_date, end_date, initial_balance,
+                                    lot_size=per.get("lot_size"),
+                                    partial_fraction=per.get("partial_fraction"))
+            if res.get("error"):
+                return res
+            results[symbol] = res
+
+        if len(wanted) == 1:
+            symbol = wanted[0]
+            single = {k: v for k, v in results[symbol].items()
+                      if k != "closed_trades"}
+            out = dict(single)
+            out["symbols"] = wanted
+            out["combined"] = False
+            # Present even for one symbol, so the dashboard has a single shape to
+            # render instead of a branch that only the combined case exercises.
+            out["per_symbol"] = {symbol: single}
+            return out
+
+        return combine_legacy_results(results, initial_balance)
 
     # ---- account ------------------------------------------------------------
 

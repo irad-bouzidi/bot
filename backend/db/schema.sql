@@ -202,16 +202,28 @@ CREATE INDEX IF NOT EXISTS trades_symbol_status_idx
 -- legacy close-only engine and its numbers are systematically optimistic; a
 -- stored result with no engine column would be indistinguishable from a
 -- run_baseline report later on.
+-- A run may cover SEVERAL symbols replayed onto one account, so `symbol` alone
+-- stopped being able to describe one. It is kept as the human label ("XAUUSDm",
+-- or "XAUUSDm + BTCUSDm") because every stored row already has one and the list
+-- views read it; `symbols` is the queryable truth, and `sizing` holds the lots
+-- per symbol, which a pair of scalar columns cannot -- 0.1 lots of gold and 0.1
+-- of Bitcoin are the same number and a different bet.
+--
+-- The scalar `lot_size` / `scale_out_lots` stay, and stay populated for a
+-- single-symbol run, so rows written before this change keep their meaning
+-- rather than being migrated into a shape they were never recorded in.
 CREATE TABLE IF NOT EXISTS backtest_runs (
     id                BIGSERIAL PRIMARY KEY,
     engine            TEXT NOT NULL DEFAULT 'legacy',
     symbol            TEXT NOT NULL,
+    symbols           TEXT[] NOT NULL DEFAULT '{}',
     start_date        TIMESTAMPTZ NOT NULL,
     end_date          TIMESTAMPTZ NOT NULL,
     initial_balance   DOUBLE PRECISION NOT NULL,
     lot_size          DOUBLE PRECISION,
     scale_out_lots    DOUBLE PRECISION,
     partial_fraction  DOUBLE PRECISION,
+    sizing            JSONB NOT NULL DEFAULT '{}'::jsonb,
     status            TEXT NOT NULL DEFAULT 'ok',
     error             TEXT,
     result            JSONB,
@@ -220,10 +232,25 @@ CREATE TABLE IF NOT EXISTS backtest_runs (
     CONSTRAINT backtest_runs_status CHECK (status IN ('ok', 'error'))
 );
 
+-- For databases created before the two columns existed. Both paths run this
+-- file, and on a fresh volume these are no-ops.
+ALTER TABLE backtest_runs ADD COLUMN IF NOT EXISTS symbols TEXT[] NOT NULL DEFAULT '{}';
+ALTER TABLE backtest_runs ADD COLUMN IF NOT EXISTS sizing JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+-- Backfill, once: a pre-existing row named exactly one symbol, so its array is
+-- that symbol. Guarded on emptiness, not on a version, so re-running cannot
+-- overwrite a real multi-symbol row with a single-element array.
+UPDATE backtest_runs SET symbols = ARRAY[symbol]
+WHERE symbols = '{}' OR symbols IS NULL;
+
 CREATE INDEX IF NOT EXISTS backtest_runs_created_idx
     ON backtest_runs (created_at DESC);
 CREATE INDEX IF NOT EXISTS backtest_runs_symbol_idx
     ON backtest_runs (symbol, created_at DESC);
+-- Filtering the list by symbol has to find a combined run too, so it matches on
+-- the array; without this index that becomes a sequential scan per poll.
+CREATE INDEX IF NOT EXISTS backtest_runs_symbols_idx
+    ON backtest_runs USING GIN (symbols);
 
 
 -- ---------------------------------------------------------------------------
@@ -283,5 +310,7 @@ CREATE INDEX IF NOT EXISTS account_snapshots_captured_idx
     ON account_snapshots (captured_at DESC);
 
 
-INSERT INTO schema_version (version) VALUES (1)
+-- 1: initial schema.
+-- 2: backtest_runs.symbols / .sizing -- a run can cover several symbols at once.
+INSERT INTO schema_version (version) VALUES (1), (2)
 ON CONFLICT (version) DO NOTHING;

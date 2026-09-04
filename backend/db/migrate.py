@@ -137,32 +137,17 @@ def seed_defaults(defaults):
 def _code_defaults():
     """SYMBOL_CONFIG's shipped sizing, without importing MetaTrader5.
 
-    The values are read out of bot_manager's source rather than imported,
-    because `import backend.bot_manager` needs a terminal-capable host. Falls
-    back to the documented XAUUSDm pair if the parse finds nothing, and says so.
+    This used to `ast`-parse the dict back out of bot_manager's source, because
+    `import backend.bot_manager` needs a terminal-capable host. SYMBOL_CONFIG now
+    lives in `backend.core.symbols`, which imports nothing but the standard
+    library, so it can simply be imported -- and a symbol added to it can no
+    longer be silently skipped here by a parse that stopped matching the source
+    it was reading.
     """
-    src = os.path.join(_REPO_ROOT, "backend", "bot_manager.py")
-    defaults = {}
-    try:
-        import ast
-        with open(src) as fh:
-            tree = ast.parse(fh.read())
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Assign):
-                continue
-            names = [t.id for t in node.targets if isinstance(t, ast.Name)]
-            if "SYMBOL_CONFIG" not in names:
-                continue
-            table = ast.literal_eval(node.value)
-            for symbol, cfg in table.items():
-                defaults[symbol] = (float(cfg["lot_size"]),
-                                    float(cfg.get("partial_fraction", 0.0)))
-    except Exception as exc:
-        _log("could not read SYMBOL_CONFIG from %s (%s)" % (src, exc))
-    if not defaults:
-        _log("falling back to the documented XAUUSDm default 0.1 / 0.5")
-        defaults = {"XAUUSDm": (0.1, 0.5)}
-    return defaults
+    from backend.core.symbols import SYMBOL_CONFIG
+
+    return {symbol: (float(cfg["lot_size"]), float(cfg.get("partial_fraction", 0.0)))
+            for symbol, cfg in SYMBOL_CONFIG.items()}
 
 
 def main(argv=None):

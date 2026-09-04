@@ -31,14 +31,18 @@ npx concurrently "python -m backend.main" "npm start --prefix frontend"
 # or serve the built dashboard from its container instead of `npm start`:
 docker compose up -d --build frontend
 
-# Research (offline, no MT5)
+# Research (offline, no MT5). ONE SYMBOL PER RUN -- averaging two instruments'
+# edges lets a losing one hide behind a winning one.
 python -m backend.scripts.run_baseline --symbol XAUUSDm --compare-legacy
-# NB: --sl/--tp are PRICE units, while SYMBOL_CONFIG is in "pips" (pip = 0.1).
-# XAUUSDm's live 70/100 pips is the 7/10 default here.
-python -m backend.scripts.run_baseline --symbol XAUUSDm --start 2025-09-01
+python -m backend.scripts.run_baseline --symbol BTCUSDm --start 2025-09-01
+# --sl/--tp are PRICE units, SYMBOL_CONFIG is pip COUNTS times a per-symbol pip.
+# They now DEFAULT from backend/core/symbols.py -- gold 70x0.1 -> 7/10, Bitcoin
+# 700x1.0 -> 700/1000 -- and the chosen numbers are printed at the top of the
+# report. Passing 7/10 for BTCUSDm would put a $7 stop on an $81,000 instrument.
 
 # Data capture (MT5 host only)
 python -m backend.data.snapshot --symbol XAUUSDm --start 2023-01-01
+python -m backend.data.snapshot --symbol BTCUSDm --start 2025-09-01
 python -m backend.data.snapshot --list                         # cache coverage
 python -m backend.data.snapshot --symbol XAUUSDm --spec-only   # smoke-test the terminal
 python -m backend.data.snapshot --symbol XAUUSDm --verify 2026-07
@@ -106,12 +110,14 @@ This is the most important thing to understand before editing.
 | Backtest | `BotManager.run_backtest` → `simulate_legacy` — close-only, cost-free, scale-out modelled at the trigger level | `backend/backtest/engine.py` — next-bar-open fills, intrabar stops, cost model |
 | Data | `mt5.copy_rates_*` direct | `MarketData` / `CachedMarketData` over `data/` |
 | P&L | `price_diff * lot_size * profit_mult` | `SymbolSpec.pl()` from real tick value |
-| Config | `SYMBOL_CONFIG` dict, pips; sizing from Postgres | `NWConfig` + `BacktestConfig`, price units |
+| Config | `SYMBOL_CONFIG` (`backend/core/symbols.py`), pip counts; sizing from Postgres | `NWConfig` + `BacktestConfig`, price units |
 | Storage | Postgres (`backend/db/`) | `data/` files only — never Postgres |
 | Sizing | `SYMBOL_CONFIG["lot_size"]` / `"partial_fraction"`, editable via `POST /settings` | `BacktestConfig.volume` / `NWConfig.partial_fraction`, CLI flags |
 
 `POST /backtest` (used by the frontend Backtest page) still runs the **legacy** engine, so
-its numbers are systematically optimistic and do not match `run_baseline`. The research
+its numbers are systematically optimistic and do not match `run_baseline`. It can now
+cover several symbols at once -- see "Combined backtests" below; the optimism is per
+symbol and does not cancel out when they are merged. The research
 stack is the honest one; `BacktestConfig(legacy_mode=True)` reproduces the old behaviour
 inside the new engine purely for regression comparison (`run_baseline --compare-legacy`
 prints the overstatement). When changing strategy behaviour, expect to change it in
@@ -128,6 +134,35 @@ Two caveats on the legacy engine, both new:
 - `BacktestConfig(legacy_mode=True)` skips the whole intrabar block, scale-out included,
   so `--compare-legacy` and `POST /backtest` now agree only when `partial_fraction=0`.
   Do not read one as a check on the other.
+
+### Combined backtests
+
+`POST /backtest` takes `symbols` (a list) and per-symbol `sizing` in lots, and replays
+several symbols onto **one account** in close-time order (`combine_legacy_results`).
+That is the only reading of "both combined" a trader can act on -- two symbols funded
+separately are just two backtests printed side by side.
+
+The consequence is that the combined figures are **not** the per-symbol ones added up.
+`max_drawdown` comes from the merged equity curve, because the interleaving is the whole
+content of that number: two drawdowns that land together compound, two that offset do
+not, and neither is recoverable from finished summaries. That is why `simulate_legacy`
+returns `closed_trades` at all -- it is an input to the merge, stripped before the result
+is returned or stored. Win/loss counts *do* add up, and `win_rate`'s denominator stays
+`trades_opened` so it is comparable with the per-symbol figures printed beside it.
+
+Sizing is per symbol because a lot is not a comparable unit across symbols. `run_baseline`
+deliberately has no combined mode; run it twice.
+
+The Backtest page's symbol chips come from `/settings`, so they always match
+`SYMBOL_CONFIG` -- there is no second list to keep in step. **All assets** selects every
+one of them. A failed `/settings` fetch is reported on the form instead of swallowed: the
+fallback list is a single symbol, so swallowing it renders as "this bot only trades gold",
+a plausible page with nothing on it to suggest anything is missing.
+
+Storage: `backtest_runs` gains `symbols TEXT[]` and `sizing JSONB` (schema version 2).
+`symbol` stays as the label (`"XAUUSDm + BTCUSDm"`), and `list_backtests(symbol=...)`
+matches on the array too, so a combined run appears under either symbol's filter -- it is
+a fact about both.
 
 ### Persistence (`backend/db/`)
 
@@ -367,10 +402,54 @@ already-reduced position look untouched and scales it out twice. Remembering the
 per ticket instead would need exactly the cross-restart state that S7 was written to
 avoid.
 
-`XAUUSDm` is the only configured symbol. Adding another means adding a `SYMBOL_CONFIG`
-entry *and* extending `SUPPORTED_SYMBOLS` in `frontend/src/BacktestPage.tsx`, and the
-per-trade dollar risk does not carry over: it comes from the contract size, not the
-nominal 0.1 lots. Do not add one without a backtest showing its R:R works.
+### Symbols
+
+`XAUUSDm` and `BTCUSDm` are configured, both in **`backend/core/symbols.py`** --
+`SYMBOL_CONFIG` moved there out of `bot_manager` so that `backend.db.migrate` (no
+terminal) and `run_baseline` (no terminal, no database) can read the same table
+instead of copying it. `bot_manager` re-exports the same dict object, so a running bot
+still holds a live reference into it and a size edit still reaches the thread.
+
+| | XAUUSDm | BTCUSDm |
+|---|---|---|
+| `pip` | 0.1 | 1.0 |
+| stop / target | 70 / 100 pips = 7.00 / 10.00 | 700 / 1000 pips = 700 / 1000 |
+| scale-out trigger | 50 pips = 5.00 | 500 pips = 500 |
+| `profit_mult` (contract size) | 100 oz per lot | 1 BTC per lot |
+| risk at the 0.1 default | ~$70 | ~$70 |
+
+The pip COUNTS are identical on purpose -- one rule, two instruments -- so the worked
+example reads the same on both: a BTCUSDm long at 80500 targets 81500, stops at 79800,
+and at 81000 banks `partial_fraction` of the position and pulls the stop to 80500.
+
+**The equal $70 is a coincidence of the two contract sizes, not a rule.** Gold is 100 oz
+over a 7.00 stop, Bitcoin 1 BTC over a 700.00 one. A third symbol will land wherever its
+contract size puts it, so re-derive the dollar risk rather than assuming 0.1 lots means
+$70. `TradingBot.__init__` and `run_backtest` now **refuse** an unconfigured symbol
+instead of falling back to gold's row, because that fallback is silent and gold's pip
+would compute a $0.70 stop on an $81,000 instrument.
+
+Adding a third symbol means a `SYMBOL_CONFIG` entry and nothing else in the frontend --
+the Backtest page reads its symbol list from `/settings`, which is keyed off
+`SYMBOL_CONFIG`. Still do not add one without a backtest showing its R:R works.
+
+**BTCUSDm's measured baseline is NEGATIVE**, like gold's. Central costs, M5, 2025-09-01
+to 2026-09-04, 0.1 lots on $1,000, honest engine (`data/reports/BTCUSDm_20260904_*`):
+
+| | XAUUSDm 7/10 | BTCUSDm 700/1000 |
+|---|---|---|
+| trades | 1,761 | 1,701 |
+| win rate | 53.4% | 61.7% |
+| net P&L | −$13,046 | −$3,677 |
+| profit factor | 0.83 | 0.89 |
+| expectancy | −0.106 R | −0.031 R |
+| max drawdown | 908% | 356% |
+
+Bitcoin is the *less bad* of the two on the identical window at the same nominal risk --
+better profit factor, a third of the drawdown -- and it is still a losing configuration.
+The scale-out hurts it exactly as it hurts gold: with `--no-breakeven` the same window is
+−$2,713 at −0.023R and 275% drawdown, so the rule costs ~$960 and 80 points of drawdown.
+It ships enabled because it was asked for, not because the data supports it.
 
 ## Working conventions
 

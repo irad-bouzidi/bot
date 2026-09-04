@@ -479,8 +479,10 @@ const Dashboard = () => {
     );
   }
 
+  // Every configured symbol, not just the first. The Trades page used to be
+  // handed symbols[0] alone, which quietly hid every trade on any other symbol
+  // the moment a second one was configured.
   const symbols = Object.keys(data?.bots || {});
-  const primarySymbol = symbols[0];
 
   return (
     <div className="dashboard-container">
@@ -501,7 +503,7 @@ const Dashboard = () => {
       {view === 'backtest' ? (
         <BacktestPage prefs={prefs} />
       ) : view === 'trades' ? (
-        <TradesPage symbol={primarySymbol} />
+        <TradesPage symbols={symbols} />
       ) : (
         <>
           {/* Account Overview */}
