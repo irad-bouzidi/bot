@@ -83,11 +83,15 @@ const DealRows = ({ positionId }: { positionId: number }) => {
   );
 };
 
-const TradesPage = ({ symbol }: { symbol?: string }) => {
+// `symbols` is every configured symbol; `symbol` (undefined) means all of them.
+// The page used to be handed ONE symbol -- the first key of /stats -- which
+// silently hid every trade on any other symbol the moment a second one existed.
+const TradesPage = ({ symbols = [] }: { symbols?: string[] }) => {
   const [trades, setTrades] = useState<Trade[]>([]);
   const [total, setTotal] = useState(0);
   const [offset, setOffset] = useState(0);
   const [status, setStatus] = useState<StatusFilter>('all');
+  const [symbol, setSymbol] = useState<string | undefined>(undefined);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<number | null>(null);
@@ -115,8 +119,8 @@ const TradesPage = ({ symbol }: { symbol?: string }) => {
     load();
   }, [load]);
 
-  // The filter changes what the offset means, so an offset from the previous
-  // filter would land on a page that no longer exists.
+  // Either filter changes what the offset means, so an offset from the previous
+  // one would land on a page that no longer exists.
   useEffect(() => {
     setOffset(0);
   }, [status, symbol]);
@@ -165,6 +169,26 @@ const TradesPage = ({ symbol }: { symbol?: string }) => {
               {s === 'all' ? 'All' : s === 'open' ? 'Open' : 'Closed'}
             </button>
           ))}
+          {symbols.length > 1 && (
+            <>
+              <span className="filter-divider" aria-hidden="true" />
+              <button
+                className={`preset-btn ${symbol === undefined ? 'active' : ''}`}
+                onClick={() => setSymbol(undefined)}
+              >
+                All symbols
+              </button>
+              {symbols.map(s => (
+                <button
+                  key={s}
+                  className={`preset-btn ${symbol === s ? 'active' : ''}`}
+                  onClick={() => setSymbol(s)}
+                >
+                  {s}
+                </button>
+              ))}
+            </>
+          )}
           <span className="trades-count">
             {total} trade{total === 1 ? '' : 's'}
           </span>
@@ -189,6 +213,7 @@ const TradesPage = ({ symbol }: { symbol?: string }) => {
               <thead>
                 <tr>
                   <th>Position</th>
+                  {symbols.length > 1 && <th>Symbol</th>}
                   <th>Side</th>
                   <th>Status</th>
                   <th>Opened</th>
@@ -213,6 +238,7 @@ const TradesPage = ({ symbol }: { symbol?: string }) => {
                         onClick={() => setExpanded(isExpanded ? null : t.position_id)}
                       >
                         <td className="mono">#{t.position_id}</td>
+                        {symbols.length > 1 && <td className="mono">{t.symbol}</td>}
                         <td>
                           <span className={`side-badge ${t.side}`}>
                             {t.side === 'long' ? 'Long' : 'Short'}
@@ -245,7 +271,7 @@ const TradesPage = ({ symbol }: { symbol?: string }) => {
                       </tr>
                       {isExpanded && (
                         <tr className="trade-detail-row">
-                          <td colSpan={11}>
+                          <td colSpan={symbols.length > 1 ? 12 : 11}>
                             <DealRows positionId={t.position_id} />
                           </td>
                         </tr>

@@ -738,56 +738,78 @@ def account_equity_curve(limit=500):
 # backtest runs
 # ---------------------------------------------------------------------------
 
+# Every column the run views read. Written once so `list_backtests` and
+# `get_backtest` cannot drift apart -- they did not, but a column added to one
+# and not the other is a bug that only shows on the detail view.
+_BACKTEST_COLUMNS = """
+    id, engine, symbol, symbols, start_date, end_date, initial_balance,
+    lot_size, scale_out_lots, partial_fraction, sizing, status, error,
+    result, duration_ms, created_at
+"""
+
+
 def record_backtest(symbol, start_date, end_date, initial_balance,
                     lot_size=None, scale_out_lots=None, partial_fraction=None,
                     engine="legacy", status="ok", error=None, result=None,
-                    duration_ms=None):
+                    duration_ms=None, symbols=None, sizing=None):
     """Store one run, inputs and outputs together.
 
     Errored runs are stored too. A run that found no bars for its window is a
     fact about that window, and discarding it is how the same unavailable range
     gets asked for five times.
+
+    `symbol` is the label ("XAUUSDm", or "XAUUSDm + BTCUSDm") and `symbols` the
+    list actually run; `sizing` is the lots per symbol. The scalar `lot_size` /
+    `scale_out_lots` stay for single-symbol runs so that rows written before
+    combined runs existed keep meaning what they said.
     """
     with cursor() as cur:
         cur.execute("""
             INSERT INTO backtest_runs
-                (engine, symbol, start_date, end_date, initial_balance, lot_size,
-                 scale_out_lots, partial_fraction, status, error, result, duration_ms)
-            VALUES (%(engine)s, %(symbol)s, %(start)s, %(end)s, %(balance)s,
-                    %(lot)s, %(scale_out)s, %(fraction)s, %(status)s, %(error)s,
-                    %(result)s, %(duration)s)
+                (engine, symbol, symbols, start_date, end_date, initial_balance,
+                 lot_size, scale_out_lots, partial_fraction, sizing, status,
+                 error, result, duration_ms)
+            VALUES (%(engine)s, %(symbol)s, %(symbols)s, %(start)s, %(end)s,
+                    %(balance)s, %(lot)s, %(scale_out)s, %(fraction)s,
+                    %(sizing)s, %(status)s, %(error)s, %(result)s, %(duration)s)
             RETURNING id, created_at
-        """, {"engine": engine, "symbol": symbol, "start": start_date,
+        """, {"engine": engine, "symbol": symbol,
+              "symbols": list(symbols) if symbols else [symbol],
+              "start": start_date,
               "end": end_date, "balance": float(initial_balance),
               "lot": lot_size, "scale_out": scale_out_lots,
-              "fraction": partial_fraction, "status": status, "error": error,
+              "fraction": partial_fraction,
+              "sizing": json_param(sizing or {}),
+              "status": status, "error": error,
               "result": json_param(result) if result is not None else None,
               "duration": duration_ms})
         return dict(cur.fetchone())
 
 
 def list_backtests(symbol=None, limit=25):
+    """Runs, newest first. Filtering by a symbol finds COMBINED runs too.
+
+    `symbol = %s OR %s = ANY(symbols)` rather than the label alone: a run of gold
+    and Bitcoin together is a fact about gold, and hiding it from the gold filter
+    would make the list quietly disagree with the history.
+    """
     with cursor() as cur:
         cur.execute("""
-            SELECT id, engine, symbol, start_date, end_date, initial_balance,
-                   lot_size, scale_out_lots, partial_fraction, status, error,
-                   result, duration_ms, created_at
+            SELECT %s
             FROM backtest_runs
-            WHERE (%(symbol)s IS NULL OR symbol = %(symbol)s)
+            WHERE (%%(symbol)s IS NULL
+                   OR symbol = %%(symbol)s
+                   OR %%(symbol)s = ANY(symbols))
             ORDER BY created_at DESC, id DESC
-            LIMIT %(limit)s
-        """, {"symbol": symbol, "limit": int(limit)})
+            LIMIT %%(limit)s
+        """ % _BACKTEST_COLUMNS, {"symbol": symbol, "limit": int(limit)})
         return [dict(r) for r in cur.fetchall()]
 
 
 def get_backtest(run_id):
     with cursor() as cur:
-        cur.execute("""
-            SELECT id, engine, symbol, start_date, end_date, initial_balance,
-                   lot_size, scale_out_lots, partial_fraction, status, error,
-                   result, duration_ms, created_at
-            FROM backtest_runs WHERE id = %s
-        """, (int(run_id),))
+        cur.execute("SELECT %s FROM backtest_runs WHERE id = %%s"
+                    % _BACKTEST_COLUMNS, (int(run_id),))
         row = cur.fetchone()
         return dict(row) if row else None
 

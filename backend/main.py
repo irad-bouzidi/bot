@@ -4,7 +4,7 @@ import time
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from backend.bot_manager import (
     BotManager, SUPPORTED_SYMBOLS, log, scale_out_fraction, init_persistence,
     AUTO_RESUME,
@@ -104,8 +104,26 @@ class SizingUpdate(BaseModel):
     lot_size: Optional[float] = None
     scale_out_lots: Optional[float] = None
 
-class BacktestRequest(BaseModel):
+class BacktestSizing(BaseModel):
+    """One symbol's sizing for one run, in LOTS. Never a fraction -- see
+    scale_out_fraction()."""
     symbol: str
+    lot_size: Optional[float] = None
+    scale_out_lots: Optional[float] = None
+
+class BacktestRequest(BaseModel):
+    """One or several symbols, over one window, on ONE account.
+
+    `symbols` is the field the dashboard sends; `symbol` is the single-symbol
+    form every stored run and every older client used, and is still accepted.
+    Sizing is per symbol because a lot is not comparable across symbols: 0.1 lots
+    of gold and 0.1 of Bitcoin risk about the same $70 only by coincidence of the
+    two contract sizes. The flat `lot_size` / `scale_out_lots` remain as the
+    single-symbol shorthand and, for lack of anywhere better to put them, apply
+    to every selected symbol when `sizing` is absent.
+    """
+    symbol: Optional[str] = None
+    symbols: Optional[List[str]] = None
     start_date: str
     end_date: str
     initial_balance: float
@@ -113,6 +131,7 @@ class BacktestRequest(BaseModel):
     # currently configured with, so the default backtest matches the default bot.
     lot_size: Optional[float] = None
     scale_out_lots: Optional[float] = None
+    sizing: Optional[List[BacktestSizing]] = None
 
 class PreferencesUpdate(BaseModel):
     """A patch of the dashboard's own state -- theme, active view, form values.
@@ -263,6 +282,12 @@ def trade_deals(position_id: int):
 def refresh_trades(symbol: Optional[str] = None, full: bool = False):
     """Re-read MT5's deal history into Postgres now, rather than on the next
     once-a-minute pass. Idempotent -- the upsert is keyed on the deal ticket."""
+    if symbol and symbol not in SUPPORTED_SYMBOLS:
+        # Checked here rather than left to TradingBot's own refusal, so the
+        # message names the configured symbols instead of surfacing a raised
+        # exception's repr.
+        return {"error": "Unknown symbol %r. Configured: %s"
+                         % (symbol, ", ".join(SUPPORTED_SYMBOLS))}
     try:
         if symbol:
             bot = manager.bots.get(symbol)
@@ -276,35 +301,39 @@ def refresh_trades(symbol: Optional[str] = None, full: bool = False):
 
 @app.post("/backtest")
 def backtest(req: BacktestRequest):
-    """Run the legacy engine and STORE the run, inputs and outputs together.
+    """Run the legacy engine over one or several symbols and STORE the run.
+
+    Several symbols are replayed onto ONE account, in close-time order, because
+    that is the only reading of "both combined" a trader can act on -- see
+    combine_legacy_results. The combined drawdown is therefore the merged curve's
+    and is NOT the per-symbol figures added up.
 
     Errored runs are stored too. A run that found no bars for its window is a
     fact about that window, and dropping it is how the same unavailable range
     gets asked for five times.
     """
     started = time.time()
-    fraction = None
     start = end = None
+    symbols = []
+    sizing = {}
     try:
+        symbols = _requested_symbols(req)
         start = datetime.fromisoformat(req.start_date)
         end = datetime.fromisoformat(req.end_date)
-        if req.scale_out_lots is not None:
-            # Against the lot size THIS RUN uses, not the live one: the pair has to
-            # be interpreted together or the fraction means something else.
-            lot = (req.lot_size if req.lot_size is not None
-                   else manager.get_settings(req.symbol)["lot_size"])
-            fraction = scale_out_fraction(lot, req.scale_out_lots)
-        result = manager.run_backtest(req.symbol, start, end, req.initial_balance,
-                                      lot_size=req.lot_size,
-                                      partial_fraction=fraction)
-    except Exception as e:
-        _store_backtest(req, start, end, fraction, None, str(e), started)
-        return {"error": str(e)}
+        sizing = _resolve_sizing(req, symbols)
+        result = manager.run_backtests(symbols, start, end, req.initial_balance,
+                                       sizing=sizing)
+    except Exception as exc:
+        # ConfigRejected (unknown symbol, impossible scale-out), a bad ISO date,
+        # and anything the engine throws all land here and are all stored: a run
+        # that could not happen is still a fact about the inputs it was given.
+        _store_backtest(req, symbols, start, end, sizing, None, str(exc), started)
+        return {"error": str(exc)}
 
-    # run_backtest reports "no bars in range" as an {"error": ...} body rather
+    # run_backtests reports "no bars in range" as an {"error": ...} body rather
     # than by raising, so the stored status has to come from the payload.
     error = result.get("error") if isinstance(result, dict) else None
-    stored = _store_backtest(req, start, end, fraction, result, error, started)
+    stored = _store_backtest(req, symbols, start, end, sizing, result, error, started)
     if error:
         return result
     if stored is not None:
@@ -314,18 +343,106 @@ def backtest(req: BacktestRequest):
     return result
 
 
-def _store_backtest(req, start, end, fraction, result, error, started):
+def _raw_symbols(req):
+    """Whatever the request named, unvalidated and de-duplicated in order."""
+    raw = list(req.symbols) if req.symbols else ([req.symbol] if req.symbol else [])
+    out = []
+    for symbol in raw:
+        symbol = (symbol or "").strip()
+        if symbol and symbol not in out:
+            out.append(symbol)
+    return out
+
+
+def _requested_symbols(req):
+    """The symbols this run covers, validated and de-duplicated in order.
+
+    Validated HERE rather than left to run_backtest, so that an unknown symbol in
+    a combined request is refused before any of it runs -- a partial combined
+    result is worse than none, because it looks like an answer to the question
+    that was asked.
+    """
+    symbols = _raw_symbols(req)
+    for symbol in symbols:
+        if symbol not in SUPPORTED_SYMBOLS:
+            raise ConfigRejected("Unknown symbol %r. Configured: %s"
+                                 % (symbol, ", ".join(SUPPORTED_SYMBOLS)))
+    if not symbols:
+        raise ConfigRejected("Select at least one symbol. Configured: %s"
+                             % ", ".join(SUPPORTED_SYMBOLS))
+    return symbols
+
+
+def _resolve_sizing(req, symbols):
+    """{symbol: {"lot_size", "partial_fraction"}} for this run only.
+
+    The scale-out arrives in LOTS and is converted against the lot size THIS RUN
+    uses for THAT symbol -- not the live one, and not another symbol's. The pair
+    only means anything read together: 0.05 out of 0.1 is half, and out of 0.2 it
+    is a quarter, so resolving it against the wrong lot size silently backtests a
+    different rule from the one the form is describing.
+    """
+    per_symbol = {}
+    if req.sizing:
+        for entry in req.sizing:
+            if entry.symbol not in symbols:
+                raise ConfigRejected(
+                    "Sizing given for %r, which is not in this run." % entry.symbol)
+            per_symbol[entry.symbol] = (entry.lot_size, entry.scale_out_lots)
+    for symbol in symbols:
+        # The flat fields are the single-symbol shorthand; applied to each symbol
+        # only when no per-symbol entry overrides them.
+        per_symbol.setdefault(symbol, (req.lot_size, req.scale_out_lots))
+
+    out = {}
+    for symbol in symbols:
+        lot, scale_out = per_symbol[symbol]
+        resolved = {}
+        if lot is not None:
+            resolved["lot_size"] = lot
+        if scale_out is not None:
+            live = lot if lot is not None else manager.get_settings(symbol)["lot_size"]
+            resolved["partial_fraction"] = scale_out_fraction(live, scale_out)
+        out[symbol] = resolved
+    return out
+
+
+def _run_label(symbols):
+    """What `backtest_runs.symbol` shows for this run.
+
+    Kept as a label rather than dropped, because every stored row has one and the
+    list views read it; `symbols` is the column that gets queried.
+    """
+    return " + ".join(symbols) if symbols else "(none)"
+
+
+def _store_backtest(req, symbols, start, end, sizing, result, error, started):
     """Record one run. Never raises -- a storage failure must not lose the run's
-    RESULT, which the user is waiting on and which took real time to compute."""
+    RESULT, which the user is waiting on and which took real time to compute.
+
+    `symbols` is empty when validation refused the request before resolving it,
+    so what was ASKED FOR is stored instead. A run rejected for naming a symbol
+    that does not exist is a fact about the request worth keeping, for the same
+    reason a window with no bars is.
+    """
+    symbols = symbols or _raw_symbols(req)
+    single = symbols[0] if len(symbols) == 1 else None
+    stored_sizing = _stored_sizing(req, symbols, sizing)
+    one = stored_sizing.get(single) or {} if single else {}
     try:
         return repo.record_backtest(
-            symbol=req.symbol,
+            symbol=_run_label(symbols),
+            symbols=symbols,
             start_date=start or req.start_date,
             end_date=end or req.end_date,
             initial_balance=req.initial_balance,
-            lot_size=req.lot_size,
-            scale_out_lots=req.scale_out_lots,
-            partial_fraction=fraction,
+            # Only meaningful for a single symbol. On a combined run they would
+            # be one symbol's lots filed under both, so they stay NULL and
+            # `sizing` carries the real per-symbol numbers.
+            lot_size=one.get("lot_size"),
+            scale_out_lots=one.get("scale_out_lots"),
+            partial_fraction=one.get("partial_fraction"),
+            sizing=stored_sizing,
             engine="legacy",
             status="error" if error else "ok",
             error=error,
@@ -335,6 +452,28 @@ def _store_backtest(req, start, end, fraction, result, error, started):
     except Exception as exc:
         log("db: could not store the backtest run -- %r" % exc)
         return None
+
+
+def _stored_sizing(req, symbols, sizing):
+    """The per-symbol lots as submitted, so a stored run can be reloaded exactly.
+
+    Lots, not the fraction: the fraction is derived and the form speaks lots, so
+    storing only the fraction would make a reloaded run show a scale-out that was
+    never typed.
+    """
+    submitted = {}
+    if req.sizing:
+        submitted = {e.symbol: e for e in req.sizing}
+    out = {}
+    for symbol in symbols:
+        entry = submitted.get(symbol)
+        out[symbol] = {
+            "lot_size": entry.lot_size if entry else req.lot_size,
+            "scale_out_lots": entry.scale_out_lots if entry else req.scale_out_lots,
+            "partial_fraction": (sizing.get(symbol) or {}).get("partial_fraction"),
+        }
+    return out
+
 
 @app.get("/backtests")
 def list_backtests(symbol: Optional[str] = None, limit: int = 25):

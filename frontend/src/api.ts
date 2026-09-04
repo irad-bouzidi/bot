@@ -81,16 +81,45 @@ export interface Trade {
   comment: string | null;
 }
 
+// One symbol's sizing for one backtest, in LOTS -- the unit the form speaks.
+// The backend converts the scale-out to a fraction of THAT symbol's lot size;
+// there is no fraction on this side of the wire (see scale_out_fraction).
+export interface BacktestSizing {
+  symbol: string;
+  lot_size?: number;
+  scale_out_lots?: number;
+}
+
+export interface BacktestRequest {
+  symbols: string[];
+  start_date: string;
+  end_date: string;
+  initial_balance: number;
+  sizing: BacktestSizing[];
+}
+
 export interface BacktestRun {
   id: number;
   engine: string;
+  // `symbol` is the label ("XAUUSDm", or "XAUUSDm + BTCUSDm"); `symbols` is the
+  // list actually run. A combined run appears under EITHER symbol's filter,
+  // because it is a fact about both.
   symbol: string;
+  symbols: string[];
   start_date: string;
   end_date: string;
   initial_balance: number;
   lot_size: number | null;
   scale_out_lots: number | null;
   partial_fraction: number | null;
+  // Per-symbol lots as submitted, so a stored run reloads into the form exactly
+  // as it was typed. Null-valued entries mean "whatever the bot was configured
+  // with at the time", which is what an untouched form sends.
+  sizing: Record<string, {
+    lot_size: number | null;
+    scale_out_lots: number | null;
+    partial_fraction: number | null;
+  }> | null;
   status: 'ok' | 'error';
   error: string | null;
   result: any | null;
@@ -169,7 +198,7 @@ export const refreshTrades = (symbol?: string, full = false) =>
     {},
   );
 
-export const runBacktest = (payload: Record<string, unknown>) =>
+export const runBacktest = (payload: BacktestRequest) =>
   postJson<any>('/backtest', payload);
 
 export const getBacktests = (symbol?: string, limit = 25) =>
