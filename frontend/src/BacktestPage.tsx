@@ -8,6 +8,7 @@ import {
   runBacktest,
 } from './api';
 import { PreferencesState } from './usePreferences';
+import ConfirmDialog from './ConfirmDialog';
 
 // The symbol list is NOT hardcoded any more. It comes from /settings, which is
 // keyed by whatever is in SYMBOL_CONFIG, so adding a third symbol to the backend
@@ -111,6 +112,12 @@ const BacktestPage = ({ prefs }: { prefs: PreferencesState }) => {
   const [runs, setRuns] = useState<BacktestRun[]>([]);
   const [historyError, setHistoryError] = useState<string | null>(null);
   const [symbolsError, setSymbolsError] = useState<string | null>(null);
+  // The run the delete button was pressed on, held until it is confirmed. A
+  // stored run is the only record of a computation that took real time, and the
+  // button sits in a row that is itself clickable -- so the press has to be a
+  // request to delete, not the deletion.
+  const [pendingDelete, setPendingDelete] = useState<BacktestRun | null>(null);
+  const [deleting, setDeleting] = useState(false);
 
   // One writer for both local state and the stored preference, so no field can
   // be changed without being persisted.
@@ -356,14 +363,33 @@ const BacktestPage = ({ prefs }: { prefs: PreferencesState }) => {
     setError(run.status === 'error' ? run.error : null);
   };
 
-  const remove = async (id: number) => {
+  const confirmDelete = async () => {
+    if (!pendingDelete) return;
+    setDeleting(true);
+    setHistoryError(null);
     try {
-      await deleteBacktest(id);
+      await deleteBacktest(pendingDelete.id);
+      setPendingDelete(null);
       loadRuns();
     } catch (e: any) {
+      // The dialog closes either way: left open, it would be covering the
+      // message that says why the delete did not happen.
+      setPendingDelete(null);
       setHistoryError(e?.message || 'Could not delete that run.');
+    } finally {
+      setDeleting(false);
     }
   };
+
+  /** Names one run in prose, for the delete button and the dialog. */
+  const runLabel = (run: BacktestRun) =>
+    run.symbol +
+    ', ' +
+    run.start_date.slice(0, 10) +
+    ' to ' +
+    run.end_date.slice(0, 10) +
+    ', run ' +
+    new Date(run.created_at).toISOString().slice(0, 16).replace('T', ' ');
 
   const combined = !!result?.combined;
   const perSymbol: Array<[string, any]> = result
@@ -374,334 +400,493 @@ const BacktestPage = ({ prefs }: { prefs: PreferencesState }) => {
     : [];
 
   return (
-    <div className="backtest-container">
-      <div className="backtest-card">
-        <p className="eyebrow">Simulation</p>
-        <h2>Strategy Backtester</h2>
-        <p className="backtest-sub">Run the envelope strategy against historical price data before risking it live.</p>
-
-        <div className="symbol-picker">
-          <span className="symbol-picker-label">Symbols</span>
-          <div className="symbol-chips">
-            {available.length > 1 && (
-              <button
-                type="button"
-                className={`symbol-chip all ${allSelected ? 'active' : ''}`}
-                onClick={selectAll}
-                aria-pressed={allSelected}
-              >
-                All assets
-              </button>
-            )}
-            {available.map(s => (
-              <button
-                key={s}
-                type="button"
-                className={`symbol-chip ${form.symbols.includes(s) ? 'active' : ''}`}
-                onClick={() => toggleSymbol(s)}
-                aria-pressed={form.symbols.includes(s)}
-              >
-                {s}
-              </button>
-            ))}
-          </div>
-          {symbolsError && <p className="sizing-msg err">{symbolsError}</p>}
-          <span className="field-hint">
-            {form.symbols.length > 1 ? (
-              <>
-                Combined: {form.symbols.join(' + ')} are replayed onto <b>one</b> $
-                {form.initial_balance} account in close-time order, so the drawdown is the
-                merged curve's — not the per-symbol ones added together.
-              </>
-            ) : (
-              `Pick more than one — or “All assets” — to backtest them together on a single account.`
-            )}
-          </span>
-        </div>
-
-        <div className="backtest-form">
-          <div className="form-group">
-            <label>Initial Balance ($)</label>
-            <input
-              type="number"
-              value={form.initial_balance}
-              onChange={e => patch({ initial_balance: parseFloat(e.target.value) })}
-            />
-          </div>
-
-          <div className="form-group">
-            <label>Start Date</label>
-            <input
-              type="date"
-              value={form.start_date}
-              onChange={e => patch({ start_date: e.target.value, preset: null })}
-            />
-          </div>
-
-          <div className="form-group">
-            <label>End Date</label>
-            <input
-              type="date"
-              value={form.end_date}
-              onChange={e => patch({ end_date: e.target.value, preset: null })}
-            />
-          </div>
-
-          <div className="preset-group">
-            {(['week', 'month', 'year'] as const).map(p => (
-              <button
-                key={p}
-                onClick={() => handleDatePreset(p)}
-                className={`preset-btn ${form.preset === p ? 'active' : ''}`}
-              >
-                {p === 'week' ? 'Last Week' : p === 'month' ? 'Last Month' : 'Last Year'}
-              </button>
-            ))}
-          </div>
-        </div>
-
-        {/* One sizing row per selected symbol. Per symbol and not one shared
-            pair, because the stop is what turns lots into dollars and it is not
-            the same distance on two instruments -- gold's is 7.00, Bitcoin's is
-            700.00. The dollar figure beside each row is the point. */}
-        <div className="sizing-rows">
-          {rows.map(r => {
-            const step = r.sizing?.volume_step ?? 0.01;
-            const trigger = r.sizing ? r.sizing.be_trigger_pips * r.sizing.pip : null;
-            const risk = r.sizing && r.lotOk ? r.sizing.risk_per_lot * r.lotNum : null;
-            return (
-              <div className="sizing-row" key={r.symbol}>
-                <div className="sizing-row-head">
-                  <span className="sizing-row-symbol">{r.symbol}</span>
-                  <span className="sizing-row-risk">
-                    {risk !== null ? `~$${risk.toFixed(0)} at risk / trade` : '—'}
-                  </span>
-                </div>
-                <div className="sizing-grid">
-                  <label className="sizing-field">
-                    <span>Lot size</span>
-                    <input
-                      type="number"
-                      inputMode="decimal"
-                      min={0}
-                      step={step}
-                      value={r.lot}
-                      onChange={e => setLot(r.symbol, e.target.value)}
-                    />
-                  </label>
-                  <label className="sizing-field">
-                    <span>Scale-out lots</span>
-                    <input
-                      type="number"
-                      inputMode="decimal"
-                      min={0}
-                      step={step}
-                      value={r.scaleOut}
-                      onChange={e => setScaleOut(r.symbol, e.target.value)}
-                    />
-                  </label>
-                </div>
-                <span className="field-hint">
-                  {r.outOk && r.outNum > 0 && trigger !== null
-                    ? `${r.share.toFixed(0)}% banked at +${trigger.toFixed(2)}, stop to break-even.`
-                    : 'Scale-out off — the whole position runs to the stop or the target.'}
-                  {r.sizing ? ` Live setting: ${r.sizing.lot_size} / ${r.sizing.scale_out_lots}.` : ''}
-                </span>
-                {r.problem && <p className="sizing-msg err">{r.problem}</p>}
-              </div>
-            );
-          })}
-          <p className="field-hint">
-            The scale-out is measured <b>negative</b> on both cached symbols: it lifts the
-            win rate and lowers expectancy. 0 turns it off.
+    <>
+      <div className="page-head">
+        <div>
+          <p className="eyebrow">Simulation</p>
+          <h2 className="page-title">Strategy backtester</h2>
+          <p className="page-desc">
+            Run the envelope strategy against historical price data before risking it
+            live. Every run is stored with the inputs that produced it.
           </p>
         </div>
+      </div>
 
-        <button className="btn-run" onClick={execute} disabled={loading}>
-          {loading ? 'Running...' : form.symbols.length > 1 ? 'Run Combined Backtest' : 'Run Backtest'}
-        </button>
+      {/* The form is one card in three blocks -- instruments, window, sizing --
+          because they are answered in that order and the third one's fields
+          depend on the first one's answer. */}
+      <section className="card">
+        <div className="card-header">
+          <div>
+            <h3 className="card-title">Parameters</h3>
+            <p className="card-desc">
+              Sizing is per symbol: a lot is not a comparable unit across instruments,
+              because the stop is what turns lots into dollars and it is 7.00 on gold
+              against 700.00 on Bitcoin.
+            </p>
+          </div>
+        </div>
 
-        {error && <div className="error-msg">{error}</div>}
+        <div className="card-content">
+          <div className="field wide">
+            <span className="field-label">Instruments</span>
+            <div className="chip-group">
+              {available.length > 1 && (
+                <button
+                  type="button"
+                  className={`chip chip-all ${allSelected ? 'active' : ''}`}
+                  onClick={selectAll}
+                  aria-pressed={allSelected}
+                >
+                  All assets
+                </button>
+              )}
+              {available.map(s => (
+                <button
+                  key={s}
+                  type="button"
+                  className={`chip ${form.symbols.includes(s) ? 'active' : ''}`}
+                  onClick={() => toggleSymbol(s)}
+                  aria-pressed={form.symbols.includes(s)}
+                >
+                  {s}
+                </button>
+              ))}
+            </div>
+            {symbolsError && <p className="msg err">{symbolsError}</p>}
+            <p className="hint">
+              {form.symbols.length > 1 ? (
+                <>
+                  Combined: {form.symbols.join(' + ')} are replayed onto <b>one</b> $
+                  {form.initial_balance} account in close-time order, so the drawdown is the
+                  merged curve's — not the per-symbol ones added together.
+                </>
+              ) : (
+                'Pick more than one — or “All assets” — to backtest them together on a single account.'
+              )}
+            </p>
+          </div>
 
-        {result && (
-          <>
-            {combined && (
-              <p className="result-note">
-                Combined across <b>{(result.symbols || []).join(' + ')}</b> on one $
-                {result.initial_balance?.toFixed(0)} account.
+          <hr className="separator" />
+
+          <div className="form-grid three">
+            <label className="field">
+              <span>Initial balance ($)</span>
+              <input
+                className="input"
+                type="number"
+                value={form.initial_balance}
+                onChange={e => patch({ initial_balance: parseFloat(e.target.value) })}
+              />
+            </label>
+
+            <label className="field">
+              <span>Start date</span>
+              <input
+                className="input"
+                type="date"
+                value={form.start_date}
+                onChange={e => patch({ start_date: e.target.value, preset: null })}
+              />
+            </label>
+
+            <label className="field">
+              <span>End date</span>
+              <input
+                className="input"
+                type="date"
+                value={form.end_date}
+                onChange={e => patch({ end_date: e.target.value, preset: null })}
+              />
+            </label>
+          </div>
+
+          <div className="field wide">
+            <span className="field-label">Quick window</span>
+            <div className="toggle-group">
+              {(['week', 'month', 'year'] as const).map(p => (
+                <button
+                  key={p}
+                  type="button"
+                  onClick={() => handleDatePreset(p)}
+                  className={`toggle ${form.preset === p ? 'active' : ''}`}
+                  aria-pressed={form.preset === p}
+                >
+                  {p === 'week' ? 'Last Week' : p === 'month' ? 'Last Month' : 'Last Year'}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <hr className="separator" />
+
+          {/* One sizing row per selected symbol. Per symbol and not one shared
+              pair, because the stop is what turns lots into dollars and it is not
+              the same distance on two instruments -- gold's is 7.00, Bitcoin's is
+              700.00. The dollar figure beside each row is the point. */}
+          <div className="field wide">
+            <span className="field-label">Position sizing</span>
+            <div className="stack">
+              {rows.map(r => {
+                const step = r.sizing?.volume_step ?? 0.01;
+                const trigger = r.sizing ? r.sizing.be_trigger_pips * r.sizing.pip : null;
+                const risk = r.sizing && r.lotOk ? r.sizing.risk_per_lot * r.lotNum : null;
+                return (
+                  <div className="panel" key={r.symbol}>
+                    <div className="panel-head">
+                      <span className="panel-title">{r.symbol}</span>
+                      <span className="panel-meta">
+                        {risk !== null ? `~$${risk.toFixed(0)} at risk / trade` : '—'}
+                      </span>
+                    </div>
+                    <div className="form-grid two">
+                      <label className="field">
+                        <span>Lot size</span>
+                        <input
+                          className="input"
+                          type="number"
+                          inputMode="decimal"
+                          min={0}
+                          step={step}
+                          value={r.lot}
+                          onChange={e => setLot(r.symbol, e.target.value)}
+                        />
+                      </label>
+                      <label className="field">
+                        <span>Scale-out lots</span>
+                        <input
+                          className="input"
+                          type="number"
+                          inputMode="decimal"
+                          min={0}
+                          step={step}
+                          value={r.scaleOut}
+                          onChange={e => setScaleOut(r.symbol, e.target.value)}
+                        />
+                      </label>
+                    </div>
+                    <p className="hint">
+                      {r.outOk && r.outNum > 0 && trigger !== null
+                        ? `${r.share.toFixed(0)}% banked at +${trigger.toFixed(2)}, stop to break-even.`
+                        : 'Scale-out off — the whole position runs to the stop or the target.'}
+                      {r.sizing ? ` Live setting: ${r.sizing.lot_size} / ${r.sizing.scale_out_lots}.` : ''}
+                    </p>
+                    {r.problem && <p className="msg err">{r.problem}</p>}
+                  </div>
+                );
+              })}
+            </div>
+            <p className="hint">
+              The scale-out is measured <b>negative</b> on both cached symbols: it lifts the
+              win rate and lowers expectancy. 0 turns it off.
+            </p>
+          </div>
+        </div>
+
+        <div className="card-footer">
+          <button className="btn btn-primary" onClick={execute} disabled={loading}>
+            {loading ? 'Running…' : form.symbols.length > 1 ? 'Run Combined Backtest' : 'Run Backtest'}
+          </button>
+          <span className="hint">
+            {form.start_date && form.end_date
+              ? `${form.start_date} → ${form.end_date}`
+              : 'Pick a window to run.'}
+          </span>
+        </div>
+      </section>
+
+      {error && (
+        <div className="alert alert-destructive">
+          <span className="alert-icon">⚠️</span>
+          <div className="alert-body">
+            <p>{error}</p>
+          </div>
+        </div>
+      )}
+
+      {result && (
+        <section className="card">
+          <div className="card-header">
+            <div>
+              <h3 className="card-title">Result</h3>
+              <p className="card-desc">
+                {combined ? (
+                  <>
+                    Combined across <b>{(result.symbols || []).join(' + ')}</b> on one $
+                    {result.initial_balance?.toFixed(0)} account.
+                  </>
+                ) : (
+                  'Legacy close-only engine — see the note under the table.'
+                )}
               </p>
-            )}
-            <div className="results-grid">
-              <div className="result-card">
-                <div className="res-label">Final Balance</div>
-                <div className="res-value">${result.final_balance.toFixed(2)}</div>
+            </div>
+          </div>
+
+          <div className="card-content">
+            <div className="stat-grid">
+              <div className="stat">
+                <span className="stat-label">Final balance</span>
+                <span className="stat-value">${result.final_balance.toFixed(2)}</span>
               </div>
-              <div className="result-card">
-                <div className="res-label">Total P&L</div>
-                <div className={`res-value ${result.total_pl >= 0 ? 'positive' : 'negative'}`}>
-                  ${result.total_pl.toFixed(2)}
-                </div>
+              <div className="stat">
+                <span className="stat-label">Total P&L</span>
+                <span className={`stat-value ${result.total_pl >= 0 ? 'positive' : 'negative'}`}>
+                  {money(result.total_pl)}
+                </span>
               </div>
-              <div className="result-card">
-                <div className="res-label">Win Rate</div>
-                <div className="res-value">{result.win_rate.toFixed(2)}%</div>
+              <div className="stat">
+                <span className="stat-label">Win rate</span>
+                <span className="stat-value">{result.win_rate.toFixed(2)}%</span>
               </div>
-              <div className="result-card">
-                <div className="res-label">Trades</div>
-                <div className="res-value">{result.trades_opened}</div>
+              <div className="stat">
+                <span className="stat-label">Trades</span>
+                <span className="stat-value">{result.trades_opened}</span>
               </div>
-              <div className="result-card">
-                <div className="res-label">Wins / Losses</div>
-                <div className="res-value">{result.wins} / {result.losses}</div>
+              <div className="stat">
+                <span className="stat-label">Wins / losses</span>
+                <span className="stat-value">{result.wins} / {result.losses}</span>
               </div>
-              <div className="result-card">
-                <div className="res-label">
-                  {combined ? 'Max Drawdown (merged)' : 'Max Drawdown'}
-                </div>
-                <div className="res-value">{result.max_drawdown.toFixed(2)}%</div>
+              <div className="stat">
+                <span className="stat-label">
+                  {combined ? 'Max drawdown (merged)' : 'Max drawdown'}
+                </span>
+                <span className="stat-value">{result.max_drawdown.toFixed(2)}%</span>
               </div>
-              <div className="result-card">
-                <div className="res-label">Scale-outs Fired</div>
-                <div className="res-value">{result.partials_fired}</div>
+              <div className="stat">
+                <span className="stat-label">Scale-outs fired</span>
+                <span className="stat-value">{result.partials_fired}</span>
               </div>
-              <div className="result-card">
-                <div className="res-label">Banked on Partials</div>
-                <div className={`res-value ${result.partial_pl >= 0 ? 'positive' : 'negative'}`}>
-                  ${result.partial_pl.toFixed(2)}
-                </div>
+              <div className="stat">
+                <span className="stat-label">Banked on partials</span>
+                <span className={`stat-value ${result.partial_pl >= 0 ? 'positive' : 'negative'}`}>
+                  {money(result.partial_pl)}
+                </span>
               </div>
               {!combined && result.lot_size !== undefined && (
-                <div className="result-card">
-                  <div className="res-label">Lots (out / runner)</div>
-                  <div className="res-value">
+                <div className="stat">
+                  <span className="stat-label">Lots (out / runner)</span>
+                  <span className="stat-value">
                     {result.lot_size} ({result.scale_out_lots} / {result.runner_lots})
-                  </div>
+                  </span>
                 </div>
               )}
             </div>
 
-            {/* Always shown, even for one symbol, so the combined and single
-                views are the same view. On a combined run these numbers are each
-                symbol run ALONE on the full starting balance -- which is why
-                their drawdowns do not add up to the merged one above. */}
-            <div className="table-scroll">
-              <table className="runs-table per-symbol-table">
-                <thead>
-                  <tr>
-                    <th>Symbol</th>
-                    <th className="num">Lots (out / runner)</th>
-                    <th className="num">Trades</th>
-                    <th className="num">Wins / Losses</th>
-                    <th className="num">Win rate</th>
-                    <th className="num">P&L</th>
-                    <th className="num">Scale-outs</th>
-                    <th className="num">Own drawdown</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {perSymbol.map(([symbol, per]) =>
-                    per ? (
-                      <tr key={symbol}>
-                        <td className="mono">{symbol}</td>
-                        <td className="num">
-                          {per.lot_size} ({per.scale_out_lots} / {per.runner_lots})
-                        </td>
-                        <td className="num">{per.trades_opened}</td>
-                        <td className="num">{per.wins} / {per.losses}</td>
-                        <td className="num">{per.win_rate.toFixed(1)}%</td>
-                        <td className={`num strong ${per.total_pl >= 0 ? 'positive' : 'negative'}`}>
-                          {money(per.total_pl)}
-                        </td>
-                        <td className="num">{per.partials_fired}</td>
-                        <td className="num">{per.max_drawdown.toFixed(1)}%</td>
-                      </tr>
-                    ) : null,
-                  )}
-                </tbody>
-              </table>
+            {/* The engine has always returned this and the page has always dropped it.
+                It says the numbers above are optimistic, which is the single most
+                important thing on the page. */}
+            {result.warning && <p className="note">{result.warning}</p>}
+          </div>
+        </section>
+      )}
+
+      {/* Always shown, even for one symbol, so the combined and single views are
+          the same view. On a combined run these numbers are each symbol run
+          ALONE on the full starting balance -- which is why their drawdowns do
+          not add up to the merged one above.
+
+          Its own card, flush to the edges, because that is how every other
+          table in this app sits: a card header names it and the table starts at
+          the border. It used to be a bordered box inset in the card above,
+          which made the same component look like two different ones on two
+          pages. */}
+      {result && (
+        <section className="card">
+          <div className="card-header">
+            <div>
+              <h3 className="card-title">Per symbol</h3>
+              <p className="card-desc">
+                Each symbol run <b>alone</b> on the full ${result.initial_balance?.toFixed(0)}{' '}
+                starting balance. Their drawdowns are therefore not the merged figure
+                above, and do not add up to it.
+              </p>
             </div>
-          </>
+          </div>
+          <div className="table-wrap">
+            <table className="data-table">
+              <caption className="sr-only">
+                Backtest result for each symbol, run separately
+              </caption>
+              <thead>
+                <tr>
+                  <th scope="col">Symbol</th>
+                  <th scope="col" className="num">Lots (out / runner)</th>
+                  <th scope="col" className="num">Trades</th>
+                  <th scope="col" className="num">Wins / losses</th>
+                  <th scope="col" className="num">Win rate</th>
+                  <th scope="col" className="num">P&L</th>
+                  <th scope="col" className="num">Scale-outs</th>
+                  <th scope="col" className="num">Own drawdown</th>
+                </tr>
+              </thead>
+              <tbody>
+                {perSymbol.map(([symbol, per]) =>
+                  per ? (
+                    <tr key={symbol}>
+                      <td className="mono">{symbol}</td>
+                      <td className="num">
+                        {per.lot_size} ({per.scale_out_lots} / {per.runner_lots})
+                      </td>
+                      <td className="num">{per.trades_opened}</td>
+                      <td className="num">{per.wins} / {per.losses}</td>
+                      <td className="num">{per.win_rate.toFixed(1)}%</td>
+                      <td className={`num strong ${per.total_pl >= 0 ? 'positive' : 'negative'}`}>
+                        {money(per.total_pl)}
+                      </td>
+                      <td className="num">{per.partials_fired}</td>
+                      <td className="num">{per.max_drawdown.toFixed(1)}%</td>
+                    </tr>
+                  ) : null,
+                )}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      )}
+
+      <section className="card">
+        <div className="card-header">
+          <div>
+            <h3 className="card-title">Past runs</h3>
+            <p className="card-desc">
+              Select a row to load its parameters and result back into the form.{' '}
+              <b>Engine</b> matters: these are all the legacy close-only engine, whose
+              numbers are systematically optimistic, so they are not comparable with a{' '}
+              <code>run_baseline</code> report.
+            </p>
+          </div>
+          {historySymbol && <span className="badge badge-outline">{historySymbol}</span>}
+        </div>
+
+        {historyError && (
+          <div className="card-content">
+            <p className="msg err">{historyError}</p>
+          </div>
         )}
 
-        {/* The engine has always returned this and the page has always dropped it.
-            It says the numbers above are optimistic, which is the single most
-            important thing on the page. */}
-        {result?.warning && <p className="result-note">{result.warning}</p>}
-
-        <div className="run-history">
-          <h3>Past runs</h3>
-          <p className="backtest-sub">
-            Every run is stored with the inputs that produced it — click one to load
-            its parameters and result back into the form. <b>engine</b> matters:
-            these are all the legacy close-only engine, whose numbers are
-            systematically optimistic, so they are not comparable with a
-            <code> run_baseline</code> report.
-          </p>
-          {historyError && <div className="error-msg">{historyError}</div>}
-          {!runs.length ? (
-            <p className="sizing-hint muted">No runs recorded yet.</p>
-          ) : (
-            <div className="table-scroll">
-              <table className="runs-table">
-                <thead>
-                  <tr>
-                    <th>When</th>
-                    <th>Symbols</th>
-                    <th>Window</th>
-                    <th className="num">Balance</th>
-                    <th className="num">P&L</th>
-                    <th className="num">Win rate</th>
-                    <th className="num">Trades</th>
-                    <th>Engine</th>
-                    <th />
-                  </tr>
-                </thead>
-                <tbody>
-                  {runs.map(run => {
-                    const r = run.result || {};
-                    return (
-                      <tr key={run.id} className="run-row" onClick={() => reload(run)}>
-                        <td>{new Date(run.created_at).toISOString().slice(0, 16).replace('T', ' ')}</td>
-                        <td className="mono">{run.symbol}</td>
-                        <td className="mono">
-                          {run.start_date.slice(0, 10)} → {run.end_date.slice(0, 10)}
-                        </td>
-                        <td className="num">${run.initial_balance.toFixed(0)}</td>
-                        <td className={`num ${run.status === 'error' ? '' : (r.total_pl ?? 0) >= 0 ? 'positive' : 'negative'}`}>
-                          {run.status === 'error' ? '—' : `$${(r.total_pl ?? 0).toFixed(2)}`}
-                        </td>
-                        <td className="num">
-                          {run.status === 'error' ? '—' : `${(r.win_rate ?? 0).toFixed(1)}%`}
-                        </td>
-                        <td className="num">{run.status === 'error' ? '—' : r.trades_opened ?? 0}</td>
-                        <td>
-                          {run.status === 'error' ? (
-                            <span className="run-failed" title={run.error || ''}>failed</span>
-                          ) : (
-                            run.engine
-                          )}
-                        </td>
-                        <td>
+        {!runs.length ? (
+          <div className="empty-state">
+            <div className="empty-icon">🗒️</div>
+            <h3>No runs recorded yet</h3>
+            <p>Run a backtest above and it will be stored here with its inputs.</p>
+          </div>
+        ) : (
+          <div className="table-wrap">
+            <table className="data-table">
+              <caption className="sr-only">
+                Stored backtest runs. Activate a row to load its parameters and result
+                back into the form.
+              </caption>
+              <thead>
+                <tr>
+                  <th scope="col">When</th>
+                  <th scope="col">Symbols</th>
+                  <th scope="col">Window</th>
+                  <th scope="col" className="num">Balance</th>
+                  <th scope="col" className="num">P&L</th>
+                  <th scope="col" className="num">Win rate</th>
+                  <th scope="col" className="num">Trades</th>
+                  <th scope="col">Engine</th>
+                  {/* Not an empty <th>. A column with no name is announced as
+                      blank, and this one holds the only destructive control on
+                      the page. */}
+                  <th scope="col" className="col-actions">
+                    <span className="sr-only">Actions</span>
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                {runs.map(run => {
+                  const r = run.result || {};
+                  return (
+                    <tr
+                      key={run.id}
+                      className="row-clickable"
+                      // The row is the control that loads the run, so it has to
+                      // be operable without a mouse. It was click-only, which
+                      // left every stored run unreachable from the keyboard.
+                      tabIndex={0}
+                      onClick={() => reload(run)}
+                      onKeyDown={e => {
+                        if (e.key === 'Enter' || e.key === ' ') {
+                          e.preventDefault();
+                          reload(run);
+                        }
+                      }}
+                    >
+                      <td>{new Date(run.created_at).toISOString().slice(0, 16).replace('T', ' ')}</td>
+                      <td className="mono">{run.symbol}</td>
+                      <td className="mono">
+                        {run.start_date.slice(0, 10)} → {run.end_date.slice(0, 10)}
+                      </td>
+                      <td className="num">${run.initial_balance.toFixed(0)}</td>
+                      <td className={`num ${run.status === 'error' ? '' : (r.total_pl ?? 0) >= 0 ? 'positive' : 'negative'}`}>
+                        {run.status === 'error' ? '—' : money(r.total_pl ?? 0)}
+                      </td>
+                      <td className="num">
+                        {run.status === 'error' ? '—' : `${(r.win_rate ?? 0).toFixed(1)}%`}
+                      </td>
+                      <td className="num">{run.status === 'error' ? '—' : r.trades_opened ?? 0}</td>
+                      <td>
+                        {run.status === 'error' ? (
+                          <span className="badge badge-destructive" title={run.error || ''}>
+                            failed
+                          </span>
+                        ) : (
+                          <span className="badge badge-secondary">{run.engine}</span>
+                        )}
+                      </td>
+                      <td className="col-actions">
+                        <div className="row-actions">
                           <button
-                            className="link-btn danger"
+                            type="button"
+                            className="btn btn-icon danger"
+                            // Icon-only, so it carries its own name -- and the
+                            // name says WHICH run, because "Delete" repeated
+                            // fifteen times down a column identifies nothing.
+                            aria-label={'Delete the backtest run: ' + runLabel(run)}
+                            title="Delete this run"
                             onClick={e => {
                               e.stopPropagation();
-                              remove(run.id);
+                              setPendingDelete(run);
                             }}
                           >
-                            Delete
+                            <svg viewBox="0 0 24 24" aria-hidden="true">
+                              <path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6M10 11v6M14 11v6" />
+                            </svg>
                           </button>
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </div>
-      </div>
-    </div>
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
+
+      <ConfirmDialog
+        open={!!pendingDelete}
+        title="Delete this backtest run?"
+        description={
+          <>
+            <p>
+              <b>{pendingDelete ? runLabel(pendingDelete) : ''}</b>
+            </p>
+            <p>
+              The stored inputs and result are removed for good. Re-running the same
+              window will recompute it, but this record of it will not come back.
+            </p>
+          </>
+        }
+        confirmLabel="Delete run"
+        tone="destructive"
+        busy={deleting}
+        onConfirm={confirmDelete}
+        onCancel={() => setPendingDelete(null)}
+      />
+    </>
   );
 };
 

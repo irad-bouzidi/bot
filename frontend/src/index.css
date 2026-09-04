@@ -1,52 +1,126 @@
+/* ==========================================================================
+   Design tokens — shadcn/ui (zinc) semantic palette.
+   --------------------------------------------------------------------------
+   Values are stored as bare HSL triples, exactly as shadcn does, so every
+   consumer can dial opacity with `hsl(var(--muted) / 0.5)` instead of needing
+   a second, hand-mixed colour variable for every translucent surface. Adding
+   `--muted-50` style duplicates is how the previous palette grew two colours
+   that had to be kept in step by hand across both themes.
+
+   The three surfaces are `--background` (the page), `--card` (a panel) and
+   `--muted` (anything nested inside a panel: table headers, sub-panels,
+   metric tiles). Panels are defined by their BORDER, not by a shadow or a
+   fill — that is the whole visual grammar here, and it is why a nested panel
+   can safely reuse `--card`'s border colour.
+   ========================================================================== */
+
+:root {
+  --background: 0 0% 100%;
+  --foreground: 240 10% 3.9%;
+
+  --card: 0 0% 100%;
+  --card-foreground: 240 10% 3.9%;
+
+  --primary: 240 5.9% 10%;
+  --primary-foreground: 0 0% 98%;
+
+  --secondary: 240 4.8% 95.9%;
+  --secondary-foreground: 240 5.9% 10%;
+
+  --muted: 240 4.8% 95.9%;
+  --muted-foreground: 240 3.8% 46.1%;
+
+  --accent: 240 4.8% 95.9%;
+  --accent-foreground: 240 5.9% 10%;
+
+  --destructive: 0 72.2% 50.6%;
+  --destructive-foreground: 0 0% 98%;
+
+  /* Not a shadcn default. Wins and losses are the two things this dashboard
+     exists to report, and reading a win in the neutral foreground colour makes
+     a losing account and a winning one look the same at a glance. */
+  --success: 142 71% 35%;
+  --success-foreground: 0 0% 98%;
+
+  --border: 240 5.9% 90%;
+  --input: 240 5.9% 90%;
+  --ring: 240 5.9% 10%;
+
+  --radius: 0.5rem;
+
+  --font-sans: 'Inter', ui-sans-serif, system-ui, -apple-system,
+    'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  /* Prices, lots and P&L are compared down a column, so they are set in a
+     monospace with tabular figures throughout — a proportional 1 against a
+     proportional 8 makes two aligned numbers look ragged. */
+  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo,
+    Consolas, 'Liberation Mono', monospace;
+}
+
+[data-theme='dark'] {
+  --background: 240 10% 3.9%;
+  --foreground: 0 0% 98%;
+
+  --card: 240 8% 5.5%;
+  --card-foreground: 0 0% 98%;
+
+  --primary: 0 0% 98%;
+  --primary-foreground: 240 5.9% 10%;
+
+  --secondary: 240 3.7% 15.9%;
+  --secondary-foreground: 0 0% 98%;
+
+  --muted: 240 3.7% 15.9%;
+  --muted-foreground: 240 5% 64.9%;
+
+  --accent: 240 3.7% 15.9%;
+  --accent-foreground: 0 0% 98%;
+
+  /* Lightened from shadcn's dark `0 62.8% 30.6%`, which is a FILL colour. Most
+     of this dashboard's destructive ink is text — a refused save, a negative
+     P&L — and that value fails contrast against the near-black background. */
+  --destructive: 0 72% 60%;
+  --destructive-foreground: 0 0% 98%;
+
+  --success: 142 60% 55%;
+  --success-foreground: 240 5.9% 10%;
+
+  --border: 240 3.7% 15.9%;
+  --input: 240 3.7% 18%;
+  --ring: 240 4.9% 83.9%;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  color-scheme: light;
+}
+
+[data-theme='dark'] {
+  color-scheme: dark;
+}
+
 body {
   margin: 0;
-  font-family: 'IBM Plex Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  background-color: hsl(var(--background));
+  color: hsl(var(--foreground));
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.5;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  font-feature-settings: 'cv11', 'ss01';
+  font-variant-numeric: tabular-nums;
 }
 
-/*
-  Light theme: a "paper ledger" session — warm parchment ground, ink text,
-  the same antique-gold accent as the dark desk. Not an inversion of the
-  dark palette; a distinct printed-ticker-tape read on the same identity.
-*/
-:root {
-  --bg-color: #f3efe6;
-  --card-bg: #ffffff;
-  --card-bg-raised: #faf7f0;
-  --text-main: #1b1d22;
-  --text-muted: #6b6f7a;
-  --border-color: #ddd6c6;
-  --accent-color: #a9822f;
-  --accent-color-strong: #8a691f;
-  --danger-color: #c0392b;
-  --success-color: #2f7a4d;
-  --card-shadow: none;
-  --secondary-bg: #ece6d8;
-  --font-display: 'IBM Plex Sans Condensed', 'IBM Plex Sans', sans-serif;
-  --font-mono: 'IBM Plex Mono', 'Courier New', monospace;
-}
-
-/*
-  Dark theme: the primary "desk" — near-black terminal glass, warm bone-white
-  text (phosphor paper, not pure white), antique gold as the operating accent —
-  a literal nod to XAUUSD, the instrument these bots trade.
-*/
-[data-theme='dark'] {
-  --bg-color: #0b0d12;
-  --card-bg: #12151c;
-  --card-bg-raised: #181c25;
-  --text-main: #edeae2;
-  --text-muted: #7c8496;
-  --border-color: #232833;
-  --accent-color: #c9a961;
-  --accent-color-strong: #e0bf7f;
-  --danger-color: #e2605a;
-  --success-color: #7fb88f;
-  --card-shadow: none;
-  --secondary-bg: #10131a;
-}
-
-code {
+code,
+kbd,
+pre {
   font-family: var(--font-mono);
+}
+
+::selection {
+  background: hsl(var(--primary) / 0.15);
 }

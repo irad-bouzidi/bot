@@ -15,10 +15,16 @@ import {
   saveSizing,
 } from './api';
 import { usePreferences } from './usePreferences';
+import ConfirmDialog from './ConfirmDialog';
 
 const Skeleton = ({ className = '' }: { className?: string }) => (
   <div className={`skeleton ${className}`} />
 );
+
+// The sign goes in front of the currency symbol, not between it and the digits:
+// `$-37.42` is what a bare template literal produces and it reads as a typo.
+const money = (n: number | null | undefined) =>
+  n === null || n === undefined ? '—' : `${n < 0 ? '-' : ''}$${Math.abs(n).toFixed(2)}`;
 
 const utcStamp = (iso: string) =>
   new Date(iso).toISOString().slice(0, 19).replace('T', ' ');
@@ -43,7 +49,9 @@ const VIEW_LABELS: Record<View, string> = {
 };
 
 // Signature device: a stylized Nadaraya-Watson kernel-regression envelope —
-// the exact smoothed mean + upper/lower bands these bots trade against.
+// the exact smoothed mean + upper/lower bands these bots trade against. Drawn
+// full-bleed under the header rather than inside the content column, so it
+// reads as a rule under the nav and does not set the page's top margin.
 const EnvelopeCurve = () => (
   <svg className="envelope-curve" viewBox="0 0 1200 100" preserveAspectRatio="none" aria-hidden="true">
     <line className="env-baseline" x1="0" y1="99" x2="1200" y2="99" />
@@ -62,34 +70,43 @@ const EnvelopeCurve = () => (
   </svg>
 );
 
-const StatCardSkeleton = () => (
-  <div className="stat-card">
-    <Skeleton className="stat-label-skeleton" />
-    <Skeleton className="stat-value-skeleton" />
+const StatSkeleton = () => (
+  <div className="stat">
+    <Skeleton className="sk-line md" />
+    <Skeleton className="sk-value" />
   </div>
 );
 
 const BotCardSkeleton = () => (
-  <div className="bot-card">
-    <div className="bot-header">
-      <Skeleton className="bot-title-skeleton" />
-      <Skeleton className="status-badge-skeleton" />
+  <div className="card bot-card">
+    <div className="card-header">
+      <Skeleton className="sk-title" />
+      <Skeleton className="sk-badge" />
     </div>
-    <div className="indicator-grid">
-      <Skeleton /><Skeleton /><Skeleton /><Skeleton />
-    </div>
-    <div className="performance-grid">
-      <Skeleton /><Skeleton /><Skeleton /><Skeleton />
-    </div>
-    <div className="sizing-section">
-      <Skeleton className="sizing-title-skeleton" />
-      <div className="sizing-grid">
-        <Skeleton className="sizing-field-skeleton" />
-        <Skeleton className="sizing-field-skeleton" />
+    <div className="card-content">
+      <div className="metric-grid">
+        <Skeleton className="sk-metric" />
+        <Skeleton className="sk-metric" />
+        <Skeleton className="sk-metric" />
+        <Skeleton className="sk-metric" />
+      </div>
+      <div className="metric-grid">
+        <Skeleton className="sk-metric" />
+        <Skeleton className="sk-metric" />
+        <Skeleton className="sk-metric" />
+        <Skeleton className="sk-metric" />
+      </div>
+      <div className="panel">
+        <Skeleton className="sk-line lg" />
+        <div className="form-grid two">
+          <Skeleton className="sk-field" />
+          <Skeleton className="sk-field" />
+        </div>
       </div>
     </div>
-    <div className="button-group">
-      <Skeleton className="btn-skeleton" /><Skeleton className="btn-skeleton" />
+    <div className="card-footer split">
+      <Skeleton className="sk-btn" />
+      <Skeleton className="sk-btn" />
     </div>
   </div>
 );
@@ -103,15 +120,15 @@ const DatabaseBanner = ({ health }: { health: Health | null }) => {
   if (!health || (health.database.reachable && health.database.tables_present)) return null;
   const { reachable, url, migrate_command, schema_version } = health.database;
   return (
-    <div className="error-banner db-banner">
-      <span>🗄️</span>
-      <div>
+    <div className="alert alert-destructive">
+      <span className="alert-icon">🗄️</span>
+      <div className="alert-body">
         <p>
           {!reachable
             ? `Postgres at ${url} is not reachable. Nothing is being persisted — trade history, sizing changes and preferences are all being dropped.`
             : `Postgres is reachable but the schema is incomplete (version ${schema_version}).`}
         </p>
-        <code className="db-banner-cmd">{migrate_command}</code>
+        <code className="alert-cmd">{migrate_command}</code>
       </div>
     </div>
   );
@@ -128,12 +145,15 @@ const ResumeNotice = ({
   symbol: string;
   onStart: () => void;
 }) => (
-  <div className="resume-notice">
-    <span>
-      <b>{symbol}</b> was running before the last shutdown and was not
-      auto-started.
-    </span>
-    <button className="btn btn-start btn-inline" onClick={onStart}>
+  <div className="alert alert-warning">
+    <span className="alert-icon">⏸</span>
+    <div className="alert-body">
+      <p>
+        <b>{symbol}</b> was running before the last shutdown and was not
+        auto-started.
+      </p>
+    </div>
+    <button className="btn btn-outline btn-sm" onClick={onStart}>
       Start again
     </button>
   </div>
@@ -160,14 +180,14 @@ const SizingHistory = ({ symbol }: { symbol: string }) => {
   };
 
   return (
-    <div className="sizing-history">
+    <div>
       <button className="link-btn" onClick={toggle}>
         {open ? 'Hide' : 'Show'} sizing history
       </button>
       {open && (
         <>
-          {error && <p className="sizing-msg err">{error}</p>}
-          {rows && !rows.length && <p className="sizing-hint muted">No changes recorded.</p>}
+          {error && <p className="msg err">{error}</p>}
+          {rows && !rows.length && <p className="hint muted">No changes recorded.</p>}
           {rows && rows.length > 0 && (
             <ul className="history-list">
               {rows.map(r => (
@@ -275,76 +295,82 @@ const SizingEditor = ({ symbol, sizing, onSaved }: { symbol: string; sizing: any
   };
 
   return (
-    <div className="sizing-section">
-      <div className="sizing-head">
-        <span className="sizing-title">Position sizing</span>
-        <span className={`sizing-risk ${lotOk ? '' : 'muted'}`}>
-          {lotOk ? `~$${(sizing.risk_per_lot * lotNum).toFixed(0)} at risk / trade` : '—'}
-        </span>
-      </div>
+    <>
+      <div className="panel">
+        <div className="panel-head">
+          <span className="panel-title">Position sizing</span>
+          <span className={`panel-meta ${lotOk ? '' : 'muted'}`}>
+            {lotOk ? `~$${(sizing.risk_per_lot * lotNum).toFixed(0)} at risk / trade` : '—'}
+          </span>
+        </div>
 
-      <div className="sizing-grid">
-        <label className="sizing-field">
-          <span>Lot size</span>
-          <input
-            type="number"
-            inputMode="decimal"
-            min={sizing.volume_min}
-            max={sizing.volume_max}
-            step={sizing.volume_step}
-            value={lot}
-            disabled={locked || busy}
-            onChange={edit(setLot)}
-          />
-        </label>
-        <label className="sizing-field">
-          <span>Scale-out lots</span>
-          <input
-            type="number"
-            inputMode="decimal"
-            min={0}
-            step={sizing.volume_step}
-            value={scaleOut}
-            disabled={locked || busy}
-            onChange={edit(setScaleOut)}
-          />
-        </label>
-      </div>
+        <div className="form-grid two">
+          <label className="field">
+            <span>Lot size</span>
+            <input
+              className="input"
+              type="number"
+              inputMode="decimal"
+              min={sizing.volume_min}
+              max={sizing.volume_max}
+              step={sizing.volume_step}
+              value={lot}
+              disabled={locked || busy}
+              onChange={edit(setLot)}
+            />
+          </label>
+          <label className="field">
+            <span>Scale-out lots</span>
+            <input
+              className="input"
+              type="number"
+              inputMode="decimal"
+              min={0}
+              step={sizing.volume_step}
+              value={scaleOut}
+              disabled={locked || busy}
+              onChange={edit(setScaleOut)}
+            />
+          </label>
+        </div>
 
-      <p className="sizing-hint">
-        {outNum === 0 || !outOk ? (
-          <>Scale-out off — the whole position runs to the stop or the target.</>
-        ) : (
-          <>
-            <b>{share.toFixed(0)}%</b> banked at +{triggerPrice.toFixed(2)}, stop to break-even,{' '}
-            {(lotNum - outNum).toFixed(2)} runs on. Stored as a share, so it stays {share.toFixed(0)}%
-            if you change the lot size.
-          </>
-        )}
-      </p>
-      <p className="sizing-hint muted">
-        Broker min {sizing.volume_min} · step {sizing.volume_step}
-        {sizing.broker_limits ? '' : ' (terminal offline — defaults shown)'}
-        {sizing.splittable === false && outNum > 0
-          ? ` · ${lot} lots cannot be split here, so only the stop will move.`
-          : ''}
-      </p>
+        <div className="stack">
+          <p className="hint">
+            {outNum === 0 || !outOk ? (
+              <>Scale-out off — the whole position runs to the stop or the target.</>
+            ) : (
+              <>
+                <b>{share.toFixed(0)}%</b> banked at +{triggerPrice.toFixed(2)}, stop to break-even,{' '}
+                {(lotNum - outNum).toFixed(2)} runs on. Stored as a share, so it stays {share.toFixed(0)}%
+                if you change the lot size.
+              </>
+            )}
+          </p>
+          <p className="hint muted">
+            Broker min {sizing.volume_min} · step {sizing.volume_step}
+            {sizing.broker_limits ? '' : ' (terminal offline — defaults shown)'}
+            {sizing.splittable === false && outNum > 0
+              ? ` · ${lot} lots cannot be split here, so only the stop will move.`
+              : ''}
+          </p>
 
-      {problem && <p className="sizing-msg err">{problem}</p>}
-      {msg && <p className={`sizing-msg ${msg.ok ? 'ok' : 'err'}`}>{msg.text}</p>}
+          {problem && <p className="msg err">{problem}</p>}
+          {msg && <p className={`msg ${msg.ok ? 'ok' : 'err'}`}>{msg.text}</p>}
+        </div>
 
-      <div className="sizing-actions">
-        <button className="btn btn-save" onClick={save} disabled={!dirty || busy || !!problem}>
-          {busy ? 'Saving…' : 'Save sizing'}
-        </button>
-        <button className="btn btn-reset" onClick={reset} disabled={!dirty || busy}>
-          Reset
-        </button>
+        <div className="form-actions">
+          <button className="btn btn-primary btn-sm" onClick={save} disabled={!dirty || busy || !!problem}>
+            {busy ? 'Saving…' : 'Save sizing'}
+          </button>
+          <button className="btn btn-outline btn-sm" onClick={reset} disabled={!dirty || busy}>
+            Reset
+          </button>
+        </div>
       </div>
 
       <ExitRuleToggle symbol={symbol} sizing={sizing} onSaved={onSaved} />
       <SizingHistory symbol={symbol} />
-    </div>
+    </>
   );
 };
 
@@ -391,12 +417,13 @@ const ExitRuleToggle = ({ symbol, sizing, onSaved }: { symbol: string; sizing: a
   };
 
   return (
-    <div className="exit-rules">
-      <div className="sizing-head">
-        <span className="sizing-title">Exit rules</span>
+    <div className="panel">
+      <div className="panel-head">
+        <span className="panel-title">Exit rules</span>
       </div>
-      <label className="exit-rule-row">
+      <label className="checkbox-row">
         <input
+          className="checkbox"
           type="checkbox"
           checked={on}
           disabled={busy}
@@ -404,28 +431,30 @@ const ExitRuleToggle = ({ symbol, sizing, onSaved }: { symbol: string; sizing: a
         />
         <span>Close at the centre line</span>
       </label>
-      <p className="sizing-hint">
-        {on ? (
-          <>
-            <b>On.</b> A position also closes as soon as a closed bar prints back at the
-            envelope's centre line — <b>before</b> the target. The centre sits between the
-            scale-out trigger and the target, so a scaled-out runner is usually closed here
-            instead of reaching its take-profit.
-          </>
-        ) : (
-          <>
-            <b>Off.</b> The only exits are the stop, the target, and the break-even stop
-            after a scale-out. Nothing else closes a position.
-          </>
-        )}
-      </p>
-      {sizing.locked && (
-        <p className="sizing-hint muted">
-          Changeable while a position is open, unlike the lot numbers above — it derives
-          nothing from the position. Takes effect on the next closed bar.
+      <div className="stack">
+        <p className="hint">
+          {on ? (
+            <>
+              <b>On.</b> A position also closes as soon as a closed bar prints back at the
+              envelope's centre line — <b>before</b> the target. The centre sits between the
+              scale-out trigger and the target, so a scaled-out runner is usually closed here
+              instead of reaching its take-profit.
+            </>
+          ) : (
+            <>
+              <b>Off.</b> The only exits are the stop, the target, and the break-even stop
+              after a scale-out. Nothing else closes a position.
+            </>
+          )}
         </p>
-      )}
-      {msg && <p className={`sizing-msg ${msg.ok ? 'ok' : 'err'}`}>{msg.text}</p>}
+        {sizing.locked && (
+          <p className="hint muted">
+            Changeable while a position is open, unlike the lot numbers above — it derives
+            nothing from the position. Takes effect on the next closed bar.
+          </p>
+        )}
+        {msg && <p className={`msg ${msg.ok ? 'ok' : 'err'}`}>{msg.text}</p>}
+      </div>
     </div>
   );
 };
@@ -437,6 +466,15 @@ const Dashboard = () => {
   const [health, setHealth] = useState<Health | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // The Start/Stop press, held until it is confirmed. Start places real orders
+  // and Stop can strand an open position, so neither is a single click any
+  // more -- see `requestControl` for which of the two need confirming.
+  const [pending, setPending] = useState<{ symbol: string; action: 'start' | 'stop' } | null>(null);
+  const [controlBusy, setControlBusy] = useState(false);
+  // Per symbol, because a failed Start on gold says nothing about Bitcoin. It
+  // used to go to console.error only: the button did nothing visible and the
+  // card went on saying "Stopped" with no reason given.
+  const [controlErrors, setControlErrors] = useState<Record<string, string>>({});
 
   // Theme and the active view come from Postgres now, not localStorage. Nothing
   // the user chooses in this dashboard lives only in the browser.
@@ -513,46 +551,98 @@ const Dashboard = () => {
   }, [fetchStats, fetchSettings, fetchHealth]);
 
   const control = async (symbol: string, action: 'start' | 'stop') => {
+    setControlBusy(true);
     try {
       await controlBot(symbol, action);
+      setControlErrors(prev => {
+        const next = { ...prev };
+        delete next[symbol];
+        return next;
+      });
+      setPending(null);
       fetchStats();
-    } catch (e) {
-      console.error(`Failed to ${action} ${symbol}`, e);
+    } catch (e: any) {
+      // Reported on the card rather than only to the console. /control answers
+      // 200 with an { error } body when it refuses -- a missing terminal, a
+      // symbol the broker will not select -- and api.ts turns that into a
+      // throw, so a refusal and a dead backend both land here with words.
+      setPending(null);
+      setControlErrors(prev => ({
+        ...prev,
+        [symbol]: e instanceof ApiError ? e.message : `Could not ${action} ${symbol}.`,
+      }));
+    } finally {
+      setControlBusy(false);
     }
   };
 
+  // Start always confirms: it is the one control on this dashboard that begins
+  // placing real orders, and it has no authentication in front of it.
+  //
+  // Stop confirms only while a position is open. Stopping an idle bot is
+  // reversible with the button next to it, but stopping one that holds a trade
+  // leaves that trade with nothing to fire its scale-out or pull its stop to
+  // break-even -- and that consequence is invisible from the button.
+  const requestControl = (symbol: string, action: 'start' | 'stop') => {
+    const openPositions = settings[symbol]?.open_positions || 0;
+    if (action === 'stop' && !openPositions) {
+      control(symbol, 'stop');
+      return;
+    }
+    setPending({ symbol, action });
+  };
+
+  // The header is the same object in all three states (loading, error, loaded)
+  // and on all three views, so it is built once. `interactive` is the only
+  // difference: nothing on it can be pressed before the stored view arrives.
   const header = (interactive: boolean) => (
-    <header className="dashboard-header">
-      <div className="header-left">
-        <div className="brand">
-          <span className="brand-mark">NW</span>
-          <div className="brand-text">
-            <h1>Nadaraya-Watson Desk</h1>
-            <span className="brand-sub">Kernel-regression execution terminal</span>
+    <>
+      <header className="app-header">
+        <div className="container header-inner">
+          <div className="header-left">
+            <div className="brand">
+              <span className="brand-mark">NW</span>
+              <div className="brand-text">
+                <h1>Nadaraya-Watson Desk</h1>
+                <span className="brand-sub">Kernel-regression execution terminal</span>
+              </div>
+            </div>
+            <nav className="toggle-group">
+              {VIEWS.map(v => (
+                <button
+                  key={v}
+                  className={`toggle ${view === v ? 'active' : ''}`}
+                  onClick={() => setView(v)}
+                  disabled={!interactive}
+                  aria-pressed={view === v}
+                >
+                  {VIEW_LABELS[v]}
+                </button>
+              ))}
+            </nav>
           </div>
-        </div>
-        <nav className="nav-links">
-          {VIEWS.map(v => (
-            <button
-              key={v}
-              className={`nav-btn ${view === v ? 'active' : ''}`}
-              onClick={() => setView(v)}
-              disabled={!interactive}
+          {interactive ? (
+            <label
+              className="switch"
+              title={theme === 'light' ? 'Switch to dark mode' : 'Switch to light mode'}
             >
-              {VIEW_LABELS[v]}
-            </button>
-          ))}
-        </nav>
-      </div>
-      {interactive ? (
-        <label className="theme-switch" title={theme === 'light' ? 'Switch to dark mode' : 'Switch to light mode'}>
-          <input type="checkbox" checked={theme === 'dark'} onChange={toggleTheme} />
-          <span className="switch-slider"></span>
-        </label>
-      ) : (
-        <Skeleton className="theme-toggle-skeleton" />
-      )}
-    </header>
+              <input
+                type="checkbox"
+                checked={theme === 'dark'}
+                onChange={toggleTheme}
+                aria-label="Dark mode"
+              />
+              <span className="switch-track">
+                <span className="switch-thumb" />
+              </span>
+            </label>
+          ) : (
+            <Skeleton className="sk-switch" />
+          )}
+        </div>
+      </header>
+      <EnvelopeCurve />
+    </>
   );
 
   // `prefs.ready` is part of the gate on purpose: rendering before the stored
@@ -560,37 +650,45 @@ const Dashboard = () => {
   // ones. The skeleton already existed for the /stats fetch; this reuses it.
   if (loading || !prefs.ready) {
     return (
-      <div className="dashboard-container">
+      <div className="app-shell">
         {header(false)}
-        <EnvelopeCurve />
-        <div className="stats-grid">
-          {[...Array(4)].map((_, i) => <StatCardSkeleton key={i} />)}
-        </div>
-        <div className="profit-section">
-          <Skeleton className="section-title-skeleton" />
-          <div className="profit-chips">
-            {[...Array(4)].map((_, i) => <Skeleton key={i} className="profit-chip-skeleton" />)}
+        <main className="container page">
+          <div className="card">
+            <div className="card-header">
+              <Skeleton className="sk-title" />
+            </div>
+            <div className="card-content">
+              <div className="stat-grid">
+                {[...Array(4)].map((_, i) => <StatSkeleton key={i} />)}
+              </div>
+            </div>
           </div>
-        </div>
-        <div className="bot-grid">
-          {[...Array(3)].map((_, i) => <BotCardSkeleton key={i} />)}
-        </div>
+          <div className="bot-grid">
+            {[...Array(2)].map((_, i) => <BotCardSkeleton key={i} />)}
+          </div>
+        </main>
       </div>
     );
   }
 
   if (error) {
     return (
-      <div className="dashboard-container">
+      <div className="app-shell">
         {header(true)}
-        <EnvelopeCurve />
-        <div className="error-banner">
-          <span>⚠️</span>
-          <p>{error}</p>
-          <button className="btn btn-start" onClick={() => { fetchStats(); fetchSettings(); fetchHealth(); }}>
-            Retry
-          </button>
-        </div>
+        <main className="container page">
+          <div className="alert alert-destructive">
+            <span className="alert-icon">⚠️</span>
+            <div className="alert-body">
+              <p>{error}</p>
+            </div>
+            <button
+              className="btn btn-outline btn-sm"
+              onClick={() => { fetchStats(); fetchSettings(); fetchHealth(); }}
+            >
+              Retry
+            </button>
+          </div>
+        </main>
       </div>
     );
   }
@@ -601,219 +699,342 @@ const Dashboard = () => {
   const symbols = Object.keys(data?.bots || {});
 
   return (
-    <div className="dashboard-container">
+    <div className="app-shell">
       {header(true)}
-      <EnvelopeCurve />
-
-      <DatabaseBanner health={health} />
-      {prefs.ready && !prefs.available && (
-        <div className="error-banner db-banner">
-          <span>💾</span>
-          <p>
-            Your dashboard preferences are not being saved
-            {prefs.error ? ` — ${prefs.error}` : '.'}
-          </p>
-        </div>
-      )}
-
-      {view === 'backtest' ? (
-        <BacktestPage prefs={prefs} />
-      ) : view === 'trades' ? (
-        <TradesPage symbols={symbols} />
-      ) : (
-        <>
-          {/* Account Overview */}
-          <p className="eyebrow">Account Overview</p>
-          <div className="stats-grid">
-            {data?.account && Object.entries(data.account).map(([key, val]: any) => {
-              // captured_at, age_seconds and stale describe the snapshot, not
-              // the account, and are reported in the note under the grid.
-              if (key === 'time_profits' || key === 'captured_at'
-                  || key === 'age_seconds' || key === 'stale') return null;
-              const displayValue = typeof val === 'number' ? val.toLocaleString(undefined, { maximumFractionDigits: 2 }) : val;
-              return (
-                <div key={key} className="stat-card">
-                  <div className="stat-label">{key.replace('_', ' ')}</div>
-                  <div className="stat-value">{displayValue}</div>
-                </div>
-              );
-            })}
-          </div>
-          {data?.account?.captured_at && (
-            data.account.stale ? (
-              // Past the throttle with no fresh capture means MT5 did not
-              // answer, so these numbers are frozen. The balance is still worth
-              // showing -- it is the last one that was true -- but the note that
-              // used to sit here promised a once-a-minute refresh, which turned
-              // a dead terminal into what looked like a clock bug.
-              <p className="snapshot-note stale">
-                ⚠ Not refreshing. This reading is{' '}
-                {snapshotAge(data.account.age_seconds || 0)} old, taken{' '}
-                {utcStamp(data.account.captured_at)} UTC — the MT5 terminal is not
-                answering, so the balance, equity and profit periods above are the
-                last ones that were true, not the current ones. The bot cards below
-                are read from Postgres and are unaffected.
+      <main className="container page">
+        <DatabaseBanner health={health} />
+        {prefs.ready && !prefs.available && (
+          <div className="alert alert-destructive">
+            <span className="alert-icon">💾</span>
+            <div className="alert-body">
+              <p>
+                Your dashboard preferences are not being saved
+                {prefs.error ? ` — ${prefs.error}` : '.'}
               </p>
-            ) : (
-              <p className="snapshot-note">
-                Account snapshot taken {utcStamp(data.account.captured_at)} UTC —
-                refreshed at most once a minute, because the period profits behind it are
-                four year-long history scans over IPC.
-              </p>
-            )
-          )}
-
-          {/* Time-based Profits */}
-          <div className="profit-section">
-            <h3>Profit Periods</h3>
-            <div className="profit-chips">
-              {data?.account?.time_profits && Object.entries(data.account.time_profits).map(([period, amount]: any) => (
-                <div key={period} className="profit-chip">
-                  <span>{period}:</span>
-                  <b className={amount >= 0 ? 'profit-positive' : 'profit-negative'}>${amount.toFixed(2)}</b>
-                </div>
-              ))}
-              {!data?.account?.time_profits && <span className="empty-state">No profit data available</span>}
             </div>
           </div>
+        )}
 
-          {/* Bot Control */}
-          <div className="bot-grid">
-            {data?.bots && Object.keys(data.bots).length > 0 ? (
-              Object.entries(data.bots).map(([symbol, stats]: any) => (
-                <div key={symbol} className="bot-card">
-                  <div className="bot-header">
-                    <h2>{symbol}</h2>
-                    <span className={`status-badge ${stats.status === 'Running' ? 'status-running' : 'status-stopped'}`}>
-                      <span className="live-dot" />
-                      {stats.status}
-                    </span>
-                  </div>
+        {view === 'backtest' ? (
+          <BacktestPage prefs={prefs} />
+        ) : view === 'trades' ? (
+          <TradesPage symbols={symbols} />
+        ) : (
+          <>
+            {/* Account overview. One card, two blocks: the readings, then the
+                period profits — they come from the same throttled snapshot, so
+                separating them into two cards would imply two refresh rates. */}
+            <section className="card">
+              <div className="card-header">
+                <div>
+                  <p className="eyebrow">Account</p>
+                  <h2 className="card-title">Account overview</h2>
+                  <p className="card-desc">
+                    Read from the MT5 terminal and stored as a snapshot, so the equity
+                    curve survives a restart.
+                  </p>
+                </div>
+              </div>
+              <div className="card-content">
+                <div className="stat-grid">
+                  {data?.account && Object.entries(data.account).map(([key, val]: any) => {
+                    // captured_at, age_seconds and stale describe the snapshot, not
+                    // the account, and are reported in the note under the grid.
+                    if (key === 'time_profits' || key === 'captured_at'
+                        || key === 'age_seconds' || key === 'stale') return null;
+                    const displayValue = typeof val === 'number' ? val.toLocaleString(undefined, { maximumFractionDigits: 2 }) : val;
+                    return (
+                      <div key={key} className="stat">
+                        <span className="stat-label">{key.replace('_', ' ')}</span>
+                        <span className="stat-value">{displayValue}</span>
+                      </div>
+                    );
+                  })}
+                </div>
 
-                  {/* Both are reported because they can legitimately disagree --
-                      the process restarted, or the thread crashed. A single word
-                      is how a dead bot came to report "Running". */}
-                  {stats.desired_state === 'running' && stats.status !== 'Running' && (
-                    <ResumeNotice symbol={symbol} onStart={() => control(symbol, 'start')} />
-                  )}
-                  {stats.error && <p className="sizing-msg err">{stats.error}</p>}
-                  {stats.detail && <p className="sizing-msg warn">{stats.detail}</p>}
-
-                  {/* Indicator Stats */}
-                  <div className="indicator-grid">
-                    <div className="indicator-item">
-                      <span className="indicator-label">Price</span>
-                      <span className="indicator-value">{stats.last_close?.toFixed(2) || 'N/A'}</span>
-                    </div>
-                    <div className="indicator-item">
-                      <span className="indicator-label">Mean</span>
-                      <span className="indicator-value">{stats.out?.toFixed(2) || 'N/A'}</span>
-                    </div>
-                    <div className="indicator-item danger">
-                      <span className="indicator-label">Upper</span>
-                      <span className="indicator-value">{stats.upper?.toFixed(2) || 'N/A'}</span>
-                    </div>
-                    <div className="indicator-item success">
-                      <span className="indicator-label">Lower</span>
-                      <span className="indicator-value">{stats.lower?.toFixed(2) || 'N/A'}</span>
-                    </div>
-                  </div>
-
-                  {/* Performance Stats. Wins/losses are per POSITION and decided
-                      on net profit -- the old per-closing-deal count booked a
-                      scale-out as its own win. */}
-                  <div className="performance-grid">
-                    <div className="perf-item">
-                      <span className="perf-label">Total Trades</span>
-                      <span className="perf-value">{stats.trades_opened || 0}</span>
-                    </div>
-                    <div className="perf-item success">
-                      <span className="perf-label">Wins</span>
-                      <span className="perf-value">{stats.wins || 0}</span>
-                    </div>
-                    <div className="perf-item danger">
-                      <span className="perf-label">Losses</span>
-                      <span className="perf-value">{stats.losses || 0}</span>
-                    </div>
-                    <div className={`perf-item ${stats.total_pl >= 0 ? 'success' : 'danger'}`}>
-                      <span className="perf-label">Total P&L</span>
-                      <span className="perf-value">${stats.total_pl?.toFixed(2) || '0.00'}</span>
-                    </div>
-                  </div>
-                  <div className="performance-grid secondary">
-                    <div className="perf-item">
-                      <span className="perf-label">Win rate</span>
-                      <span className="perf-value">
-                        {stats.win_rate !== undefined ? `${stats.win_rate.toFixed(1)}%` : '—'}
-                      </span>
-                    </div>
-                    <div className="perf-item">
-                      <span className="perf-label" title="Trades that closed exactly flat — the designed outcome of the break-even stop">
-                        Break-even
-                      </span>
-                      <span className="perf-value">{stats.breakeven ?? 0}</span>
-                    </div>
-                    <div className="perf-item">
-                      <span className="perf-label" title="Trades where the scale-out fired">Scaled out</span>
-                      <span className="perf-value">{stats.scaled_out ?? 0}</span>
-                    </div>
-                    <div className="perf-item danger">
-                      <span className="perf-label" title="Deepest peak-to-trough of the closed-trade equity curve, in account currency">
-                        Max DD
-                      </span>
-                      <span className="perf-value">${(stats.max_drawdown ?? 0).toFixed(2)}</span>
-                    </div>
-                  </div>
-                  {stats.costs !== undefined && stats.trades_closed > 0 && (
-                    <p className="perf-note">
-                      Net of ${Math.abs(stats.costs).toFixed(2)} in commission and swap
-                      across {stats.trades_closed} closed trade{stats.trades_closed === 1 ? '' : 's'}
-                      {stats.trades_open ? ` · ${stats.trades_open} open` : ''}
+                {data?.account?.captured_at && (
+                  data.account.stale ? (
+                    // Past the throttle with no fresh capture means MT5 did not
+                    // answer, so these numbers are frozen. The balance is still worth
+                    // showing -- it is the last one that was true -- but the note that
+                    // used to sit here promised a once-a-minute refresh, which turned
+                    // a dead terminal into what looked like a clock bug.
+                    <p className="note warn">
+                      ⚠ Not refreshing. This reading is{' '}
+                      {snapshotAge(data.account.age_seconds || 0)} old, taken{' '}
+                      {utcStamp(data.account.captured_at)} UTC — the MT5 terminal is not
+                      answering, so the balance, equity and profit periods above are the
+                      last ones that were true, not the current ones. The bot cards below
+                      are read from Postgres and are unaffected.
                     </p>
-                  )}
-
-                  {settingsError && (
-                    <p className="sizing-msg err">
-                      Sizing and exit rules could not be refreshed — {settingsError}
-                      {settings[symbol] ? ' The values below are from the last good read.' : ''}
+                  ) : (
+                    <p className="note">
+                      Account snapshot taken {utcStamp(data.account.captured_at)} UTC —
+                      refreshed at most once a minute, because the period profits behind it are
+                      four year-long history scans over IPC.
                     </p>
-                  )}
-                  {settings[symbol] && !settings[symbol].error && (
-                    <SizingEditor
-                      symbol={symbol}
-                      sizing={settings[symbol]}
-                      onSaved={fetchSettings}
-                    />
-                  )}
+                  )
+                )}
 
-                  <div className="button-group">
-                    <button
-                      onClick={() => control(symbol, 'start')}
-                      disabled={stats.status === 'Running'}
-                      className="btn btn-start"
-                    >
-                      Start
-                    </button>
-                    <button
-                      onClick={() => control(symbol, 'stop')}
-                      disabled={stats.status === 'Stopped'}
-                      className="btn btn-stop"
-                    >
-                      Stop
-                    </button>
+                <hr className="separator" />
+
+                <div className="stack">
+                  <div className="panel-head">
+                    <span className="panel-title">Profit periods</span>
+                  </div>
+                  {data?.account?.time_profits ? (
+                    <div className="metric-grid">
+                      {Object.entries(data.account.time_profits).map(([period, amount]: any) => (
+                        <div
+                          key={period}
+                          className={`metric ${amount >= 0 ? 'success' : 'danger'}`}
+                        >
+                          <span className="metric-label">{period}</span>
+                          <span className="metric-value">{money(amount)}</span>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="hint muted">No profit data available.</p>
+                  )}
+                </div>
+              </div>
+            </section>
+
+            {/* Bot control */}
+            <div className="bot-grid">
+              {data?.bots && Object.keys(data.bots).length > 0 ? (
+                Object.entries(data.bots).map(([symbol, stats]: any) => (
+                  <section key={symbol} className="card bot-card">
+                    <div className="card-header">
+                      <div>
+                        <h2 className="card-title mono">{symbol}</h2>
+                        <p className="card-desc">
+                          {settings[symbol] && !settings[symbol].error
+                            ? `Stop ${settings[symbol].sl_pips} pips · target ${settings[symbol].tp_pips} pips`
+                            : 'Live envelope reading and controls'}
+                        </p>
+                      </div>
+                      <span
+                        className={`badge ${stats.status === 'Running' ? 'badge-success' : 'badge-outline'}`}
+                      >
+                        <span className="status-dot" />
+                        {stats.status}
+                      </span>
+                    </div>
+
+                    <div className="card-content">
+                      {/* Both are reported because they can legitimately disagree --
+                          the process restarted, or the thread crashed. A single word
+                          is how a dead bot came to report "Running". */}
+                      {stats.desired_state === 'running' && stats.status !== 'Running' && (
+                        <ResumeNotice
+                          symbol={symbol}
+                          onStart={() => requestControl(symbol, 'start')}
+                        />
+                      )}
+                      {controlErrors[symbol] && (
+                        <p className="msg err">{controlErrors[symbol]}</p>
+                      )}
+                      {stats.error && <p className="msg err">{stats.error}</p>}
+                      {stats.detail && <p className="msg warn">{stats.detail}</p>}
+
+                      {/* Indicator stats */}
+                      <div className="stack">
+                        <div className="panel-head">
+                          <span className="panel-title">Envelope</span>
+                        </div>
+                        <div className="metric-grid">
+                          <div className="metric">
+                            <span className="metric-label">Price</span>
+                            <span className="metric-value">{stats.last_close?.toFixed(2) || 'N/A'}</span>
+                          </div>
+                          <div className="metric">
+                            <span className="metric-label">Mean</span>
+                            <span className="metric-value">{stats.out?.toFixed(2) || 'N/A'}</span>
+                          </div>
+                          <div className="metric danger">
+                            <span className="metric-label">Upper</span>
+                            <span className="metric-value">{stats.upper?.toFixed(2) || 'N/A'}</span>
+                          </div>
+                          <div className="metric success">
+                            <span className="metric-label">Lower</span>
+                            <span className="metric-value">{stats.lower?.toFixed(2) || 'N/A'}</span>
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Performance stats. Wins/losses are per POSITION and decided
+                          on net profit -- the old per-closing-deal count booked a
+                          scale-out as its own win. */}
+                      <div className="stack">
+                        <div className="panel-head">
+                          <span className="panel-title">Performance</span>
+                        </div>
+                        <div className="metric-grid">
+                          <div className="metric">
+                            <span className="metric-label">Trades</span>
+                            <span className="metric-value">{stats.trades_opened || 0}</span>
+                          </div>
+                          <div className="metric success">
+                            <span className="metric-label">Wins</span>
+                            <span className="metric-value">{stats.wins || 0}</span>
+                          </div>
+                          <div className="metric danger">
+                            <span className="metric-label">Losses</span>
+                            <span className="metric-value">{stats.losses || 0}</span>
+                          </div>
+                          <div className={`metric ${stats.total_pl >= 0 ? 'success' : 'danger'}`}>
+                            <span className="metric-label">Total P&L</span>
+                            <span className="metric-value">{money(stats.total_pl ?? 0)}</span>
+                          </div>
+                          <div className="metric">
+                            <span className="metric-label">Win rate</span>
+                            <span className="metric-value">
+                              {stats.win_rate !== undefined ? `${stats.win_rate.toFixed(1)}%` : '—'}
+                            </span>
+                          </div>
+                          <div className="metric">
+                            <span
+                              className="metric-label"
+                              title="Trades that closed exactly flat — the designed outcome of the break-even stop"
+                            >
+                              Break-even
+                            </span>
+                            <span className="metric-value">{stats.breakeven ?? 0}</span>
+                          </div>
+                          <div className="metric">
+                            <span className="metric-label" title="Trades where the scale-out fired">
+                              Scaled out
+                            </span>
+                            <span className="metric-value">{stats.scaled_out ?? 0}</span>
+                          </div>
+                          <div className="metric danger">
+                            <span
+                              className="metric-label"
+                              title="Deepest peak-to-trough of the closed-trade equity curve, in account currency"
+                            >
+                              Max DD
+                            </span>
+                            <span className="metric-value">${(stats.max_drawdown ?? 0).toFixed(2)}</span>
+                          </div>
+                        </div>
+                        {stats.costs !== undefined && stats.trades_closed > 0 && (
+                          <p className="note">
+                            Net of ${Math.abs(stats.costs).toFixed(2)} in commission and swap
+                            across {stats.trades_closed} closed trade{stats.trades_closed === 1 ? '' : 's'}
+                            {stats.trades_open ? ` · ${stats.trades_open} open` : ''}
+                          </p>
+                        )}
+                      </div>
+
+                      {settingsError && (
+                        <p className="msg err">
+                          Sizing and exit rules could not be refreshed — {settingsError}
+                          {settings[symbol] ? ' The values below are from the last good read.' : ''}
+                        </p>
+                      )}
+                      {settings[symbol] && !settings[symbol].error && (
+                        <SizingEditor
+                          symbol={symbol}
+                          sizing={settings[symbol]}
+                          onSaved={fetchSettings}
+                        />
+                      )}
+                    </div>
+
+                    <div className="card-footer split">
+                      <button
+                        onClick={() => requestControl(symbol, 'start')}
+                        disabled={stats.status === 'Running' || controlBusy}
+                        className="btn btn-primary"
+                      >
+                        Start
+                      </button>
+                      <button
+                        onClick={() => requestControl(symbol, 'stop')}
+                        disabled={stats.status === 'Stopped' || controlBusy}
+                        className="btn btn-outline-destructive"
+                      >
+                        Stop
+                      </button>
+                    </div>
+                  </section>
+                ))
+              ) : (
+                <div className="card">
+                  <div className="empty-state">
+                    <div className="empty-icon">🤖</div>
+                    <h3>No bots configured</h3>
+                    <p>Start by configuring trading bots in your MT5 terminal.</p>
                   </div>
                 </div>
-              ))
-            ) : (
-              <div className="empty-state-card">
-                <div className="empty-icon">🤖</div>
-                <h3>No bots configured</h3>
-                <p>Start by configuring trading bots in your MT5 terminal</p>
-              </div>
-            )}
-          </div>
-        </>
-      )}
+              )}
+            </div>
+          </>
+        )}
+      </main>
+
+      {/* One instance for the whole grid: the pending press names its own
+          symbol, so a dialog per card would be N copies of the same thing with
+          only one of them ever open. */}
+      <ConfirmDialog
+        open={!!pending}
+        title={
+          pending?.action === 'start'
+            ? `Start live trading on ${pending.symbol}?`
+            : `Stop ${pending?.symbol} with a position open?`
+        }
+        description={
+          pending?.action === 'start' ? (
+            <>
+              <p>
+                This places <b>real orders</b> with real money on the next closed bar
+                that meets the envelope rule.
+              </p>
+              <p>
+                {settings[pending.symbol] && !settings[pending.symbol].error ? (
+                  <>
+                    At the stored size of {settings[pending.symbol].lot_size} lots, each
+                    trade risks about{' '}
+                    <b>
+                      ~$
+                      {(
+                        settings[pending.symbol].risk_per_lot *
+                        settings[pending.symbol].lot_size
+                      ).toFixed(0)}
+                    </b>{' '}
+                    to its stop. There is no daily loss cap and no margin check.
+                  </>
+                ) : (
+                  <>
+                    The size this will trade with could not be read, so the risk per
+                    trade cannot be shown here.
+                  </>
+                )}
+              </p>
+            </>
+          ) : (
+            <>
+              <p>
+                Stopping does <b>not</b> close the{' '}
+                {pending ? settings[pending.symbol]?.open_positions || 0 : 0} open
+                position.
+              </p>
+              <p>
+                The broker-side stop and target stay where they are, but nothing will
+                fire the scale-out or pull the stop to break-even while the bot is
+                stopped.
+              </p>
+            </>
+          )
+        }
+        confirmLabel={pending?.action === 'start' ? 'Start trading' : 'Stop anyway'}
+        tone={pending?.action === 'start' ? 'default' : 'destructive'}
+        busy={controlBusy}
+        onConfirm={() => pending && control(pending.symbol, pending.action)}
+        onCancel={() => setPending(null)}
+      />
     </div>
   );
 };

@@ -31,7 +31,7 @@ PORT = int(os.environ.get("BOT_PORT", "8000"))
 ALLOWED_ORIGINS = [
     o.strip()
     for o in os.environ.get(
-        "BOT_ALLOWED_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000"
+        "BOT_ALLOWED_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000,http://0.0.0.0:3000"
     ).split(",")
     if o.strip()
 ]
