@@ -45,41 +45,51 @@ const DealRows = ({ positionId }: { positionId: number }) => {
     };
   }, [positionId]);
 
-  if (error) return <p className="trade-detail-msg err">{error}</p>;
-  if (!deals) return <p className="trade-detail-msg">Loading deals…</p>;
-  if (!deals.length) return <p className="trade-detail-msg">No deals recorded.</p>;
+  if (error) return <p className="detail-msg err">{error}</p>;
+  if (!deals) return <p className="detail-msg">Loading deals…</p>;
+  if (!deals.length) return <p className="detail-msg">No deals recorded.</p>;
 
   return (
-    <table className="deal-table">
-      <thead>
-        <tr>
-          <th>Deal</th>
-          <th>Kind</th>
-          <th>Type</th>
-          <th className="num">Volume</th>
-          <th className="num">Price</th>
-          <th className="num">Profit</th>
-          <th className="num">Costs</th>
-          <th>Time</th>
-          <th>Comment</th>
-        </tr>
-      </thead>
-      <tbody>
-        {deals.map(d => (
-          <tr key={d.ticket}>
-            <td className="mono">#{d.ticket}</td>
-            <td>{d.entry_kind}</td>
-            <td>{d.deal_type}</td>
-            <td className="num">{d.volume.toFixed(2)}</td>
-            <td className="num mono">{price(d.price)}</td>
-            <td className={`num ${d.profit >= 0 ? 'positive' : 'negative'}`}>{money(d.profit)}</td>
-            <td className="num">{money(d.commission + d.swap + d.fee)}</td>
-            <td>{when(d.dealt_at)}</td>
-            <td className="deal-comment">{d.comment || '—'}</td>
+    // The only table in the app that keeps its own border, because it is nested
+    // inside a row of another one: flush, it would read as a continuation of
+    // the trade table rather than as the detail of one row of it.
+    <div className="table-wrap bordered">
+      <table className="data-table">
+        <caption className="sr-only">
+          Broker deals making up position #{positionId}
+        </caption>
+        <thead>
+          <tr>
+            <th scope="col">Deal</th>
+            <th scope="col">Kind</th>
+            <th scope="col">Type</th>
+            <th scope="col" className="num">Volume</th>
+            <th scope="col" className="num">Price</th>
+            <th scope="col" className="num">Profit</th>
+            <th scope="col" className="num">Costs</th>
+            <th scope="col">Time</th>
+            <th scope="col">Comment</th>
           </tr>
-        ))}
-      </tbody>
-    </table>
+        </thead>
+        <tbody>
+          {deals.map(d => (
+            <tr key={d.ticket}>
+              <td className="mono">#{d.ticket}</td>
+              <td>{d.entry_kind}</td>
+              <td>{d.deal_type}</td>
+              <td className="num">{d.volume.toFixed(2)}</td>
+              <td className="num mono">{price(d.price)}</td>
+              <td className={`num ${d.profit >= 0 ? 'positive' : 'negative'}`}>{money(d.profit)}</td>
+              <td className="num">{money(d.commission + d.swap + d.fee)}</td>
+              <td>{when(d.dealt_at)}</td>
+              <td className="deal-comment" title={d.comment || undefined}>
+                {d.comment || '—'}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
   );
 };
 
@@ -140,66 +150,84 @@ const TradesPage = ({ symbols = [] }: { symbols?: string[] }) => {
 
   const page = Math.floor(offset / PAGE_SIZE) + 1;
   const pages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+  const columns = symbols.length > 1 ? 12 : 11;
 
   return (
-    <div className="trades-container">
-      <div className="trades-card">
-        <p className="eyebrow">History</p>
-        <div className="trades-head">
-          <div>
-            <h2>Trade History</h2>
-            <p className="trades-sub">
-              One row per position, stored in Postgres. A trade that scaled out and
-              then closed is <b>one</b> trade — won or lost on its net result, costs
-              included.
-            </p>
-          </div>
-          <button className="btn btn-reset" onClick={resync} disabled={refreshing}>
-            {refreshing ? 'Re-reading…' : 'Re-read from MT5'}
-          </button>
+    <>
+      <div className="page-head">
+        <div>
+          <p className="eyebrow">History</p>
+          <h2 className="page-title">Trade History</h2>
+          <p className="page-desc">
+            One row per position, stored in Postgres. A trade that scaled out and then
+            closed is <b>one</b> trade — won or lost on its net result, costs included.
+            Select a row for the broker deals behind it.
+          </p>
         </div>
+        <button className="btn btn-outline" onClick={resync} disabled={refreshing}>
+          {refreshing ? 'Re-reading…' : 'Re-read from MT5'}
+        </button>
+      </div>
 
-        <div className="trades-filters">
-          {(['all', 'open', 'closed'] as StatusFilter[]).map(s => (
-            <button
-              key={s}
-              className={`preset-btn ${status === s ? 'active' : ''}`}
-              onClick={() => setStatus(s)}
-            >
-              {s === 'all' ? 'All' : s === 'open' ? 'Open' : 'Closed'}
-            </button>
-          ))}
-          {symbols.length > 1 && (
-            <>
-              <span className="filter-divider" aria-hidden="true" />
-              <button
-                className={`preset-btn ${symbol === undefined ? 'active' : ''}`}
-                onClick={() => setSymbol(undefined)}
-              >
-                All symbols
-              </button>
-              {symbols.map(s => (
+      <section className="card">
+        <div className="card-header">
+          <div className="filter-bar">
+            <div className="toggle-group">
+              {(['all', 'open', 'closed'] as StatusFilter[]).map(s => (
                 <button
                   key={s}
-                  className={`preset-btn ${symbol === s ? 'active' : ''}`}
-                  onClick={() => setSymbol(s)}
+                  type="button"
+                  className={`toggle ${status === s ? 'active' : ''}`}
+                  onClick={() => setStatus(s)}
+                  aria-pressed={status === s}
                 >
-                  {s}
+                  {s === 'all' ? 'All' : s === 'open' ? 'Open' : 'Closed'}
                 </button>
               ))}
-            </>
-          )}
-          <span className="trades-count">
+            </div>
+            {symbols.length > 1 && (
+              <div className="toggle-group">
+                <button
+                  type="button"
+                  className={`toggle ${symbol === undefined ? 'active' : ''}`}
+                  onClick={() => setSymbol(undefined)}
+                  aria-pressed={symbol === undefined}
+                >
+                  All symbols
+                </button>
+                {symbols.map(s => (
+                  <button
+                    key={s}
+                    type="button"
+                    className={`toggle mono ${symbol === s ? 'active' : ''}`}
+                    onClick={() => setSymbol(s)}
+                    aria-pressed={symbol === s}
+                  >
+                    {s}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+          <span className="badge badge-secondary">
             {total} trade{total === 1 ? '' : 's'}
           </span>
         </div>
 
-        {error && <div className="error-msg">{error}</div>}
+        {error && (
+          <div className="card-content">
+            <p className="msg err">{error}</p>
+          </div>
+        )}
 
         {loading ? (
-          <p className="trade-detail-msg">Loading…</p>
+          <div className="sk-rows" aria-busy="true" aria-label="Loading trades">
+            {[...Array(6)].map((_, i) => (
+              <div key={i} className="skeleton sk-row" />
+            ))}
+          </div>
         ) : !trades.length ? (
-          <div className="empty-state-card">
+          <div className="empty-state">
             <div className="empty-icon">📄</div>
             <h3>No trades recorded</h3>
             <p>
@@ -208,22 +236,26 @@ const TradesPage = ({ symbols = [] }: { symbols?: string[] }) => {
             </p>
           </div>
         ) : (
-          <div className="table-scroll">
-            <table className="trade-table">
+          <div className="table-wrap">
+            <table className="data-table">
+              <caption className="sr-only">
+                Stored trades, one row per position. Activate a row to show the broker
+                deals behind it.
+              </caption>
               <thead>
                 <tr>
-                  <th>Position</th>
-                  {symbols.length > 1 && <th>Symbol</th>}
-                  <th>Side</th>
-                  <th>Status</th>
-                  <th>Opened</th>
-                  <th>Closed</th>
-                  <th className="num">Entry</th>
-                  <th className="num">Exit</th>
-                  <th className="num">Lots</th>
-                  <th className="num">Exits</th>
-                  <th className="num">Costs</th>
-                  <th className="num">Net</th>
+                  <th scope="col">Position</th>
+                  {symbols.length > 1 && <th scope="col">Symbol</th>}
+                  <th scope="col">Side</th>
+                  <th scope="col">Status</th>
+                  <th scope="col">Opened</th>
+                  <th scope="col">Closed</th>
+                  <th scope="col" className="num">Entry</th>
+                  <th scope="col" className="num">Exit</th>
+                  <th scope="col" className="num">Lots</th>
+                  <th scope="col" className="num">Exits</th>
+                  <th scope="col" className="num">Costs</th>
+                  <th scope="col" className="num">Net</th>
                 </tr>
               </thead>
               <tbody>
@@ -234,18 +266,39 @@ const TradesPage = ({ symbols = [] }: { symbols?: string[] }) => {
                   return (
                     <React.Fragment key={t.position_id}>
                       <tr
-                        className={`trade-row ${isExpanded ? 'expanded' : ''}`}
+                        className={`row-clickable ${isExpanded ? 'expanded' : ''}`}
+                        // Expanding was mouse-only and announced nothing: a
+                        // screen reader had no way to know the row had a
+                        // detail, let alone that it was open.
+                        tabIndex={0}
+                        aria-expanded={isExpanded}
                         onClick={() => setExpanded(isExpanded ? null : t.position_id)}
+                        onKeyDown={e => {
+                          if (e.key === 'Enter' || e.key === ' ') {
+                            e.preventDefault();
+                            setExpanded(isExpanded ? null : t.position_id);
+                          }
+                        }}
                       >
-                        <td className="mono">#{t.position_id}</td>
+                        <td className="mono">
+                          {/* The rows were clickable with nothing on them to
+                              say so. A caret is the cheapest thing that both
+                              invites the click and shows the current state. */}
+                          <span className="disclosure" aria-hidden="true">
+                            ▶
+                          </span>
+                          #{t.position_id}
+                        </td>
                         {symbols.length > 1 && <td className="mono">{t.symbol}</td>}
                         <td>
-                          <span className={`side-badge ${t.side}`}>
+                          <span className={`badge badge-outline ${t.side === 'long' ? 'badge-long' : 'badge-short'}`}>
                             {t.side === 'long' ? 'Long' : 'Short'}
                           </span>
                         </td>
                         <td>
-                          <span className={`trade-status ${t.status}`}>{t.status}</span>
+                          <span className={`badge ${open ? 'badge-secondary' : 'badge-outline'}`}>
+                            {t.status}
+                          </span>
                         </td>
                         <td>{when(t.opened_at)}</td>
                         <td>{when(t.closed_at)}</td>
@@ -270,8 +323,8 @@ const TradesPage = ({ symbols = [] }: { symbols?: string[] }) => {
                         </td>
                       </tr>
                       {isExpanded && (
-                        <tr className="trade-detail-row">
-                          <td colSpan={symbols.length > 1 ? 12 : 11}>
+                        <tr className="detail-row">
+                          <td colSpan={columns}>
                             <DealRows positionId={t.position_id} />
                           </td>
                         </tr>
@@ -285,19 +338,20 @@ const TradesPage = ({ symbols = [] }: { symbols?: string[] }) => {
         )}
 
         {pages > 1 && (
-          <div className="pager">
+          <div className="card-footer pager">
             <button
-              className="preset-btn"
+              className="btn btn-outline btn-sm"
               disabled={offset === 0}
               onClick={() => setOffset(Math.max(0, offset - PAGE_SIZE))}
             >
               Previous
             </button>
             <span className="pager-label">
-              Page {page} of {pages}
+              {offset + 1}–{Math.min(offset + PAGE_SIZE, total)} of {total} · page {page} of{' '}
+              {pages}
             </span>
             <button
-              className="preset-btn"
+              className="btn btn-outline btn-sm"
               disabled={offset + PAGE_SIZE >= total}
               onClick={() => setOffset(offset + PAGE_SIZE)}
             >
@@ -305,14 +359,14 @@ const TradesPage = ({ symbols = [] }: { symbols?: string[] }) => {
             </button>
           </div>
         )}
+      </section>
 
-        <p className="result-note">
-          Open trades show no net result on purpose — a scale-out is not a close, and
-          dating a trade by its partial exit would drop it into the closed-trade
-          equity curve early. Click a row for the underlying deals.
-        </p>
-      </div>
-    </div>
+      <p className="page-note">
+        Open trades show no net result on purpose — a scale-out is not a close, and
+        dating a trade by its partial exit would drop it into the closed-trade equity
+        curve early.
+      </p>
+    </>
   );
 };
 

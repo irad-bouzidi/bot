@@ -468,3 +468,215 @@ test('a fresh account snapshot keeps the ordinary throttle note', async () => {
   expect(screen.queryByText(/not refreshing/i)).not.toBeInTheDocument();
 });
 
+// --- actions: nothing consequential happens on one click -------------------
+//
+// Three of the controls on this dashboard cannot be undone by pressing the
+// button again: Start places real orders, Stop can leave a live position with
+// nothing managing it, and Delete drops the only record of a computed run.
+// These pin that each one is a REQUEST until it is confirmed, and that the
+// confirmation says which object and what it costs.
+
+const storedRun = {
+  id: 7,
+  symbol: 'XAUUSDm',
+  symbols: ['XAUUSDm'],
+  created_at: '2026-09-01T10:20:00',
+  start_date: '2026-08-01T00:00:00',
+  end_date: '2026-09-01T23:59:59',
+  initial_balance: 1000,
+  lot_size: 0.1,
+  scale_out_lots: 0.05,
+  sizing: {},
+  engine: 'legacy',
+  status: 'ok',
+  error: null,
+  result: { total_pl: -12.5, win_rate: 51.2, trades_opened: 40 },
+};
+
+const storedTrade = {
+  position_id: 512300,
+  symbol: 'XAUUSDm',
+  side: 'short',
+  status: 'closed',
+  opened_at: '2026-09-04T09:15:00',
+  closed_at: '2026-09-04T13:20:00',
+  entry_price: 4485.183,
+  exit_price: 4479.196,
+  volume_in: 0.1,
+  volume_out: 0.05,
+  exit_count: 2,
+  commission: -0.21,
+  swap: -0.04,
+  fee: 0,
+  net_profit: 12.4,
+};
+
+/** mockApi, plus canned bodies for the routes a given test needs to control. */
+function mockApiWith(
+  preferences: Record<string, any>,
+  overrides: Array<[string, unknown]>,
+  settingsBody?: Record<string, any>,
+  statsBody?: Record<string, any>,
+) {
+  const base = mockApi(preferences, true, settingsBody, statsBody);
+  const seen: Array<{ url: string; method: string; body: any }> = [];
+  const fetchMock = jest.fn((input: any, init?: any) => {
+    const url = String(input);
+    const method = init?.method || 'GET';
+    seen.push({ url, method, body: init?.body ? JSON.parse(init.body) : null });
+    const hit = overrides.find(([path]) => url.includes(path));
+    if (hit && method === 'GET') {
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve(hit[1]),
+      } as Response);
+    }
+    if (method !== 'GET') {
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve({ message: 'ok', deleted: 1 }),
+      } as Response);
+    }
+    return base(input);
+  });
+  return { fetchMock, seen };
+}
+
+test('deleting a stored run asks first, and only then sends the DELETE', async () => {
+  const { fetchMock, seen } = mockApiWith({ theme: 'light', view: 'backtest' }, [
+    ['/backtests', { runs: [storedRun] }],
+  ]);
+  global.fetch = fetchMock as any;
+
+  render(<App />);
+
+  // Icon-only, so the accessible name has to identify the run -- "Delete"
+  // fifteen times down a column names nothing.
+  const trash = await screen.findByRole('button', {
+    name: /delete the backtest run: XAUUSDm, 2026-08-01 to 2026-09-01/i,
+  });
+  fireEvent.click(trash);
+
+  const dialog = await screen.findByRole('alertdialog');
+  expect(dialog).toHaveTextContent(/removed for good/i);
+  expect(seen.some(c => c.method === 'DELETE')).toBe(false);
+
+  // Cancel is the safe direction, and it must really be a no-op.
+  fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+  await waitFor(() => expect(screen.queryByRole('alertdialog')).toBeNull());
+  expect(seen.some(c => c.method === 'DELETE')).toBe(false);
+
+  fireEvent.click(
+    screen.getByRole('button', { name: /delete the backtest run/i }),
+  );
+  fireEvent.click(await screen.findByRole('button', { name: 'Delete run' }));
+
+  await waitFor(() =>
+    expect(
+      seen.some(c => c.url.includes('/backtests/7') && c.method === 'DELETE'),
+    ).toBe(true),
+  );
+});
+
+test('Start places no order until the dialog is confirmed, and names the risk', async () => {
+  const { fetchMock, seen } = mockApiWith({ theme: 'light', view: 'dashboard' }, []);
+  global.fetch = fetchMock as any;
+
+  render(<App />);
+
+  const starts = await screen.findAllByRole('button', { name: 'Start' });
+  fireEvent.click(starts[0]);
+
+  expect(seen.some(c => c.url.includes('/control'))).toBe(false);
+
+  const dialog = await screen.findByRole('alertdialog');
+  // The dollar risk of the size it will ACTUALLY trade with, read from
+  // /settings rather than assumed: 0.1 lots of gold over a 7.00 stop is ~$70.
+  expect(dialog).toHaveTextContent(/~\$70/);
+  expect(dialog).toHaveTextContent(/real orders/i);
+
+  fireEvent.click(screen.getByRole('button', { name: 'Start trading' }));
+
+  await waitFor(() =>
+    expect(seen.filter(c => c.url.includes('/control')).map(c => c.body)).toEqual([
+      { symbol: 'XAUUSDm', action: 'start' },
+    ]),
+  );
+});
+
+test('Stop is immediate with no position, and confirms when one is open', async () => {
+  const running = {
+    account: stats.account,
+    bots: { XAUUSDm: { ...bot('XAUUSDm', 3300.5), status: 'Running' } },
+  };
+
+  // Nothing open: stopping is reversible with the button beside it, so a
+  // confirmation would be a click for its own sake.
+  const idle = mockApiWith(
+    { theme: 'light', view: 'dashboard' },
+    [],
+    { XAUUSDm: sizing('XAUUSDm', 0.1, 70, 100) },
+    running,
+  );
+  global.fetch = idle.fetchMock as any;
+
+  const first = render(<App />);
+  fireEvent.click(await screen.findByRole('button', { name: 'Stop' }));
+  await waitFor(() =>
+    expect(idle.seen.filter(c => c.url.includes('/control')).map(c => c.body)).toEqual([
+      { symbol: 'XAUUSDm', action: 'stop' },
+    ]),
+  );
+  expect(screen.queryByRole('alertdialog')).toBeNull();
+  first.unmount();
+
+  // A position open: stopping strands it -- the broker-side SL/TP stay, but
+  // nothing will fire the scale-out or pull the stop to break-even.
+  const held = mockApiWith(
+    { theme: 'light', view: 'dashboard' },
+    [],
+    { XAUUSDm: { ...sizing('XAUUSDm', 0.1, 70, 100), open_positions: 1, locked: true } },
+    running,
+  );
+  global.fetch = held.fetchMock as any;
+
+  render(<App />);
+  fireEvent.click(await screen.findByRole('button', { name: 'Stop' }));
+
+  const dialog = await screen.findByRole('alertdialog');
+  expect(dialog).toHaveTextContent(/does not close the 1 open position/i);
+  expect(held.seen.some(c => c.url.includes('/control'))).toBe(false);
+});
+
+test('a trade row expands from the keyboard and reports whether it is open', async () => {
+  // It was a <tr onClick> with no tabIndex and no aria-expanded, so the deals
+  // behind every trade were mouse-only and a screen reader had no way to know
+  // the row had a detail at all.
+  const { fetchMock } = mockApiWith({ theme: 'light', view: 'trades' }, [
+    ['/trades/512300', { position_id: 512300, deals: [] }],
+    ['/trades', { trades: [storedTrade], total: 1, limit: 50, offset: 0 }],
+  ]);
+  global.fetch = fetchMock as any;
+
+  render(<App />);
+
+  await screen.findByText('Trade History');
+  const row = (await waitFor(() => {
+    const found = screen
+      .getAllByRole('row')
+      .find(r => r.getAttribute('aria-expanded') !== null);
+    if (!found) throw new Error('no expandable row');
+    return found;
+  })) as HTMLElement;
+
+  expect(row).toHaveAttribute('aria-expanded', 'false');
+  expect(row).toHaveAttribute('tabindex', '0');
+
+  fireEvent.keyDown(row, { key: 'Enter' });
+  await waitFor(() => expect(row).toHaveAttribute('aria-expanded', 'true'));
+
+  fireEvent.keyDown(row, { key: ' ' });
+  await waitFor(() => expect(row).toHaveAttribute('aria-expanded', 'false'));
+});
