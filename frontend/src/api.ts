@@ -78,6 +78,14 @@ export interface Trade {
   swap: number;
   fee: number;
   net_profit: number;
+  // The result as a PRICE distance, in this symbol's pips: $1 of gold and $100
+  // of Bitcoin are both 10. Null is a real answer and not a zero -- nothing has
+  // been exited yet, or the backend has no pip for the symbol -- so render it as
+  // an em dash rather than "0.0 pips", which claims the trade closed flat.
+  //
+  // GROSS. A price distance cannot carry commission or swap, so this can be
+  // positive on a trade whose `net_profit` is negative.
+  pips: number | null;
   comment: string | null;
 }
 

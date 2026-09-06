@@ -211,11 +211,36 @@ CREATE TABLE IF NOT EXISTS trades (
     swap           DOUBLE PRECISION NOT NULL DEFAULT 0,
     fee            DOUBLE PRECISION NOT NULL DEFAULT 0,
     net_profit     DOUBLE PRECISION NOT NULL DEFAULT 0,
+    -- The trade's result as a PRICE distance, in this symbol's pips (schema
+    -- version 4). Nullable, and the three reasons it can be NULL are all real:
+    -- the position has not been exited at all, so there is no distance yet; the
+    -- symbol is no longer in SYMBOL_CONFIG, so nothing here knows what a pip of
+    -- it is; or the row predates the column and has not been re-folded. A
+    -- DEFAULT 0 would render every one of those as "closed flat".
+    --
+    -- Derived from the volume-weighted entry and exit prices, so a scaled-out
+    -- trade reports the average distance it actually left at -- the same basis
+    -- `exit_price` above uses. It is GROSS: a price distance cannot carry
+    -- commission or swap, so a trade can be positive here and a loss on
+    -- `net_profit`. That divergence is the point of reporting both.
+    pips           DOUBLE PRECISION,
     comment        TEXT,
     updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT trades_side CHECK (side IN ('long', 'short')),
     CONSTRAINT trades_status CHECK (status IN ('open', 'closed'))
 );
+
+-- Schema version 4, for an existing volume. No-op on a fresh one, where the
+-- column is already in the CREATE above.
+--
+-- It arrives NULL on every existing row and stays NULL until the deals are
+-- re-folded, which needs no separate backfill: reconcile_all(full=True) runs on
+-- every API boot and rebuild_trades() re-folds a symbol's WHOLE history, so the
+-- first start after migrating fills the column in. A backfill UPDATE here could
+-- not do it anyway -- the pip size lives in SYMBOL_CONFIG, in code, and putting
+-- a per-symbol constant into this file would be a second copy of it that a new
+-- symbol would silently not appear in.
+ALTER TABLE trades ADD COLUMN IF NOT EXISTS pips DOUBLE PRECISION;
 
 CREATE INDEX IF NOT EXISTS trades_symbol_opened_idx
     ON trades (symbol, opened_at DESC);
@@ -348,5 +373,10 @@ CREATE INDEX IF NOT EXISTS account_snapshots_captured_idx
 --    plus the two matching settings_audit columns. Applying this version
 --    CHANGES LIVE BEHAVIOUR: the rule was hardcoded on before it, and existing
 --    rows get FALSE.
-INSERT INTO schema_version (version) VALUES (1), (2), (3)
+-- 4: trades.pips -- each trade's result as a price distance. Changes no
+--    behaviour and no money figure; it adds a column the reporting queries
+--    NAME, so an un-migrated database fails /trades with an UndefinedColumn
+--    rather than quietly serving a history with no pips in it. That is why
+--    REQUIRED_SCHEMA_VERSION moved with it.
+INSERT INTO schema_version (version) VALUES (1), (2), (3), (4)
 ON CONFLICT (version) DO NOTHING;

@@ -23,6 +23,11 @@ saved run says what produced it.
 Three cost scenarios are always reported. The CENTRAL column is the decision
 basis: entries fire during volatility expansions, when spreads are widest, so a
 median spread understates what this strategy actually pays.
+
+Every scenario also reports PIPS won and lost, from the symbol's own pip in
+SYMBOL_CONFIG. They are gross price distance -- a distance cannot carry a
+spread -- so read them against the money figures rather than as a version of
+them: the difference between the two is what the cost scenario charged.
 """
 
 import argparse
@@ -76,7 +81,7 @@ def run_one(barset, args, spread_mult, slip_mult, legacy=False):
     eng = BacktestEngine(
         build_strategy(args), spec, costs=costs,
         cfg=BacktestConfig(initial_balance=args.balance, volume=args.volume,
-                           legacy_mode=legacy),
+                           legacy_mode=legacy, pip_size=args.pip_size),
     )
     return eng.run(barset)
 
@@ -106,6 +111,17 @@ def print_report(name, m):
         ("Avg win", "avg_win"), ("Avg loss", "avg_loss"),
         ("Realized R:R", "realized_rr"),
         ("Largest win", "largest_win"), ("Largest loss", "largest_loss"),
+        # Pips are GROSS price distance and the money above is net of the cost
+        # model, so these two blocks are meant to be read against each other:
+        # the gap between "positive on pips" and "positive on P&L" is what the
+        # spread and commission took. pips_lost prints negative, so net_pips is
+        # the two added.
+        ("Pips won", "pips_won"), ("Pips lost", "pips_lost"),
+        ("Net pips", "net_pips"),
+        ("  pip wins / losses", None),
+        ("Avg win (pips)", "avg_win_pips"), ("Avg loss (pips)", "avg_loss_pips"),
+        ("Largest win (pips)", "largest_win_pips"),
+        ("Largest loss (pips)", "largest_loss_pips"),
         ("Max drawdown %", "max_drawdown"),
         ("Max consec. wins", "max_consecutive_wins"),
         ("Max consec. losses", "max_consecutive_losses"),
@@ -117,8 +133,18 @@ def print_report(name, m):
         ("Long win rate %", "long_win_rate"), ("Short win rate %", "short_win_rate"),
         ("Long P&L", "long_pl"), ("Short P&L", "short_pl"),
     ]
+    pairs = {
+        "Wins / Losses": ("wins", "losses"),
+        # Its own pair, and not a restatement of the one above: a trade decided
+        # by the spread lands in a different bucket in each.
+        "  pip wins / losses": ("pip_wins", "pip_losses"),
+    }
     for label, key in rows:
-        val = "%s / %s" % (m.get("wins"), m.get("losses")) if key is None else g(key)
+        if key is None:
+            a, b = pairs[label]
+            val = "%s / %s" % (m.get(a), m.get(b))
+        else:
+            val = g(key)
         print("  %-22s %s" % (label, val))
     print("  %-22s %s" % ("Exit reasons", m.get("exit_reason_counts")))
     for note in ("sharpe_note", "sample_note", "max_consecutive_losses_note"):
@@ -157,6 +183,19 @@ def _apply_symbol_defaults(args):
                  "pip=%g sl=%g tp=%g pips" % (levels["pip"],
                                               SYMBOL_CONFIG[args.symbol]["sl_pips"],
                                               SYMBOL_CONFIG[args.symbol]["tp_pips"])))
+
+    # Resolved here for the same reason --sl/--tp are: the pip DEFINITION lives
+    # in SYMBOL_CONFIG (gold 0.1, Bitcoin 10.0 -- $1 and $100 respectively are
+    # 10 pips) and the engine deliberately does not import it, so that
+    # backend/backtest/ stays runnable with nothing but `data/`. Unlike the stop
+    # distances this is not a SystemExit for an unknown symbol: it decides how a
+    # result is REPORTED, never how it is traded, so 0.0 -- "no pips in this
+    # report" -- is a safe answer where guessing a stop distance would not be.
+    args.pip_size = float(SYMBOL_CONFIG.get(args.symbol, {}).get("pip", 0.0) or 0.0)
+    print("pips: %s"
+          % ("1 pip = %g of price (SYMBOL_CONFIG[%s])" % (args.pip_size, args.symbol)
+             if args.pip_size else
+             "not reported -- %s has no pip in SYMBOL_CONFIG" % args.symbol))
 
     # Not part of the loop above: this one is a flag, not a price level, and an
     # unconfigured symbol gets a usable default rather than a SystemExit. FALSE

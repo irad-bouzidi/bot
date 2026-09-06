@@ -19,7 +19,23 @@ price distance -- not the broker's `point`. The product is what goes on the
 order:
 
     XAUUSDm   70 x 0.1  =    7.00 stop,  100 x 0.1  =   10.00 target
-    BTCUSDm  700 x 1.0  =  700.00 stop, 1000 x 1.0  = 1000.00 target
+    BTCUSDm   70 x 10.0 =  700.00 stop,  100 x 10.0 = 1000.00 target
+
+`pip` is the DEFINITION a pip result is reported in, everywhere: $1 of gold is
+10 pips, $100 of Bitcoin is 10 pips. Bitcoin's used to be 1.0 with the counts
+ten times larger (700/1000/500), which multiplied out to the identical price
+levels but reported ten Bitcoin pips for every one this definition gives. The
+price geometry is unchanged by that edit -- only what a pip is called.
+
+The pip counts are therefore now identical across both symbols, which is the
+"one rule, two instruments" this table has always claimed and, until the pip
+definitions were reconciled, did not show. A consequence worth knowing before
+reading a pips figure: `pip * profit_mult` -- the money one pip moves per lot --
+is 10.0 on BOTH symbols (0.1 x 100 oz, 10.0 x 1 BTC), so at equal lot sizes a
+gold pip and a Bitcoin pip are worth the same. That is a coincidence of these
+two contract sizes in exactly the way the equal $70 risk below is, and a third
+symbol will not inherit it. `price_levels()` returns it as `pip_value_per_lot`
+rather than leaving each caller to multiply.
 
 `profit_mult` is the contract size -- account currency per 1.0 price unit per
 1.0 lot -- so P&L is `price_diff * lot_size * profit_mult`. Gold is 100 oz per
@@ -64,21 +80,24 @@ SYMBOL_CONFIG = {
         "partial_fraction": 0.5,    # 0.05 out at +5.00, 0.05 runs to the target
         "exit_at_mean": False,      # centre line ~6.00 out: inside the target
     },
-    # Same shape as gold, one pip = $1. A long at 80500 therefore targets 81500,
-    # stops at 79800, and banks half at 81000 with the stop pulled to 80500 --
-    # the worked example this symbol was added from.
+    # Same shape as gold and, now, the same pip COUNTS: one pip is $10, so $100
+    # of Bitcoin is 10 pips exactly as $1 of gold is. A long at 80500 therefore
+    # targets 81500, stops at 79800, and banks half at 81000 with the stop
+    # pulled to 80500 -- the worked example this symbol was added from, and
+    # unchanged by the pip redefinition, because 70 x 10.0 is the same 700.00 of
+    # price that 700 x 1.0 was.
     #
-    # Bitcoin is 1 BTC per lot, so 0.1 lots over the 700-point stop is ~$70,
+    # Bitcoin is 1 BTC per lot, so 0.1 lots over the 700.00 stop is ~$70,
     # which happens to match gold's exposure at the same nominal size. Do not
     # read that as a rule (see the module docstring): it comes from the contract
     # size, and a third symbol will not inherit it.
     "BTCUSDm": {
-        "pip": 1.0,
-        "lot_size": 0.1,            # risks ~$70/trade at the 700-point stop
-        "sl_pips": 700,
-        "tp_pips": 1000,
+        "pip": 10.0,
+        "lot_size": 0.1,            # risks ~$70/trade at the 70-pip stop
+        "sl_pips": 70,
+        "tp_pips": 100,
         "profit_mult": 1,           # 1 BTC per lot
-        "be_trigger_pips": 500,     # 500.00 in price -- half of the target
+        "be_trigger_pips": 50,      # 500.00 in price -- half of the target
         "partial_fraction": 0.5,    # 0.05 out at +500, 0.05 runs to the target
         "exit_at_mean": False,      # centre line ~600 out: inside the target
     },
@@ -133,5 +152,42 @@ def price_levels(symbol):
         "be_trigger_tp_fraction": (
             float(cfg.get("be_trigger_pips", 0)) / float(cfg["tp_pips"])
             if cfg.get("tp_pips") else 0.0),
+        # Account currency per pip, per 1.0 lot. Derived here so no caller has
+        # to remember that a pip result becomes money by way of the CONTRACT
+        # size and not the lot size alone.
+        "pip_value_per_lot": pip * cfg["profit_mult"],
         "risk_per_lot": cfg["sl_pips"] * pip * cfg["profit_mult"],
     }
+
+
+def pip_size(symbol):
+    # type: (str) -> float
+    """The price distance of one pip, or 0.0 for a symbol not in the table.
+
+    0.0 rather than a raise, and rather than gold's 0.1, because the callers are
+    the REPORTING paths: a deal folded for a symbol that has since been removed
+    from SYMBOL_CONFIG must yield "no pip figure", not a pip figure computed
+    from another instrument's definition. `to_pips` below turns that 0.0 into
+    None, which is what a report renders as an em dash.
+    """
+    cfg = SYMBOL_CONFIG.get(symbol)
+    return float(cfg["pip"]) if cfg else 0.0
+
+
+def to_pips(symbol, price_diff):
+    # type: (str, float) -> float
+    """A SIGNED price distance expressed in this symbol's pips.
+
+    The single conversion for every pips figure this project reports -- the
+    trade fold, both backtest engines and the dashboard all come through here or
+    through `pip_size` -- so "how many pips" cannot come to mean two things in
+    two places. Returns None when the symbol has no pip defined, so an unknown
+    instrument reports nothing rather than gold's arithmetic.
+
+    Sign is the caller's: pass `(exit - entry) * side_sign`, so a winner is
+    positive on both sides of the market.
+    """
+    pip = pip_size(symbol)
+    if not pip:
+        return None
+    return float(price_diff) / pip

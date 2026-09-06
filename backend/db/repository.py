@@ -19,7 +19,7 @@ Two rules this module exists to enforce:
 
 import os
 
-from backend.core.symbols import BOOL_KEYS, EDITABLE_KEYS
+from backend.core.symbols import BOOL_KEYS, EDITABLE_KEYS, pip_size
 from backend.db import pool
 from backend.db.pool import cursor, json_param
 
@@ -497,7 +497,7 @@ WITH scoped AS (
 INSERT INTO trades (
     position_id, symbol, magic, side, status, opened_at, closed_at,
     entry_price, exit_price, volume_in, volume_out, exit_count,
-    gross_profit, commission, swap, fee, net_profit, comment, updated_at)
+    gross_profit, commission, swap, fee, net_profit, pips, comment, updated_at)
 SELECT
     position_id, symbol, magic,
     CASE WHEN entry_type = 'buy' THEN 'long' ELSE 'short' END,
@@ -515,6 +515,21 @@ SELECT
     -- so this is a sum and not a subtraction. Getting that backwards turns
     -- every cost into a credit.
     gross_profit + commission + swap + fee,
+    -- The result as a price distance, in pips. NULL rather than 0 whenever it
+    -- cannot be stated: nothing has been exited yet, or the symbol is not in
+    -- SYMBOL_CONFIG so nothing here knows what a pip of it is. A 0 would read
+    -- as "closed flat", which is a claim.
+    --
+    -- The sign comes from the ENTRY deal, on the same `entry_type` the `side`
+    -- column above is derived from. Taking it from the exit would invert every
+    -- short: the closing deal of a short is a buy, so its own direction says
+    -- nothing about which way the trade needed price to go.
+    --
+    -- Volume-weighted through `exit_price`, so a scaled-out trade reports the
+    -- average distance it actually left at rather than its last leg's.
+    CASE WHEN %(pip)s > 0 AND entry_price IS NOT NULL AND exit_price IS NOT NULL
+         THEN (CASE WHEN entry_type = 'buy' THEN 1 ELSE -1 END)
+              * (exit_price - entry_price) / %(pip)s END,
     comment, now()
 FROM folded
 WHERE opened_at IS NOT NULL
@@ -535,6 +550,7 @@ ON CONFLICT (position_id) DO UPDATE SET
     swap = EXCLUDED.swap,
     fee = EXCLUDED.fee,
     net_profit = EXCLUDED.net_profit,
+    pips = EXCLUDED.pips,
     comment = EXCLUDED.comment,
     updated_at = now()
 """
@@ -555,11 +571,20 @@ def rebuild_trades(symbol):
     loss never counted. The scan is a grouped index scan over one symbol's
     deals -- a few thousand rows after years of trading -- so the whole-table
     fold is the cheap option as well as the correct one.
+
+    The pip size is passed IN, from SYMBOL_CONFIG. It is deliberately not a
+    column and not a constant in schema.sql: a pip is part of the instrument's
+    definition, which lives in code and is backtested, and a copy of it in the
+    database would be one more place a row could contradict the config -- the
+    same reason `load_settings()` cannot reach a stop or a symbol. 0.0 for an
+    unconfigured symbol makes the fold write NULL pips rather than another
+    instrument's arithmetic.
     """
     with pool.connection() as conn:
         cur = conn.cursor()
         try:
-            cur.execute(_REBUILD_TRADES, {"symbol": symbol, "eps": _EPS})
+            cur.execute(_REBUILD_TRADES, {"symbol": symbol, "eps": _EPS,
+                                          "pip": pip_size(symbol)})
             return cur.rowcount
         finally:
             cur.close()
@@ -597,6 +622,16 @@ def trade_stats(symbol):
     balance moves for deposits too, so dividing by it would make the figure
     move without a trade happening. The live stat it replaces was initialised
     to 0.0 and never written at all.
+
+    The pips figures are bucketed by the SIGN OF THE PIPS, not by the sign of
+    the money -- so `pips_won` is never negative and `pips_lost` never positive,
+    and the pair reads the way a trader reads it. `pip_wins`/`pip_losses` are
+    returned beside them because that makes the two buckets disagree with
+    `wins`/`losses` VISIBLY rather than by implication: pips are a gross price
+    distance and cannot carry commission or swap, so a trade that gained a pip
+    and lost the pip to costs is a pip win and a money loss. Both statements are
+    true; reporting either alone under one set of counts would make the other a
+    silent contradiction.
     """
     with cursor() as cur:
         cur.execute("""
@@ -631,16 +666,30 @@ def trade_stats(symbol):
                 (SELECT COALESCE(SUM(commission + swap + fee), 0) FROM scoped WHERE status = 'closed') AS costs,
                 (SELECT COALESCE(AVG(net_profit), 0) FROM scoped WHERE status = 'closed' AND net_profit > 0) AS avg_win,
                 (SELECT COALESCE(AVG(net_profit), 0) FROM scoped WHERE status = 'closed' AND net_profit < 0) AS avg_loss,
+                (SELECT COUNT(*) FROM scoped WHERE status = 'closed' AND pips > 0) AS pip_wins,
+                (SELECT COUNT(*) FROM scoped WHERE status = 'closed' AND pips < 0) AS pip_losses,
+                (SELECT COALESCE(SUM(pips), 0) FROM scoped WHERE status = 'closed' AND pips > 0) AS pips_won,
+                (SELECT COALESCE(SUM(pips), 0) FROM scoped WHERE status = 'closed' AND pips < 0) AS pips_lost,
+                (SELECT COALESCE(SUM(pips), 0) FROM scoped WHERE status = 'closed') AS net_pips,
+                (SELECT COALESCE(AVG(pips), 0) FROM scoped WHERE status = 'closed' AND pips > 0) AS avg_win_pips,
+                (SELECT COALESCE(AVG(pips), 0) FROM scoped WHERE status = 'closed' AND pips < 0) AS avg_loss_pips,
+                -- Closed trades with no pip figure at all: rows folded before
+                -- schema version 4 and not yet re-folded, or a symbol dropped
+                -- out of SYMBOL_CONFIG. Returned so the sums above can be read
+                -- as covering every closed trade or explicitly not.
+                (SELECT COUNT(*) FROM scoped WHERE status = 'closed' AND pips IS NULL) AS pips_unknown,
                 (SELECT COALESCE(MAX(peak - cum), 0) FROM peaked) AS max_drawdown,
                 (SELECT MAX(closed_at) FROM scoped WHERE status = 'closed') AS last_closed_at
         """, {"symbol": symbol})
         row = dict(cur.fetchone())
 
     for key in ("trades_total", "trades_open", "trades_closed", "wins",
-                "losses", "breakeven", "scaled_out"):
+                "losses", "breakeven", "scaled_out", "pip_wins", "pip_losses",
+                "pips_unknown"):
         row[key] = int(row[key] or 0)
     for key in ("total_pl", "gross_pl", "costs", "avg_win", "avg_loss",
-                "max_drawdown"):
+                "max_drawdown", "pips_won", "pips_lost", "net_pips",
+                "avg_win_pips", "avg_loss_pips"):
         row[key] = float(row[key] or 0.0)
 
     decided = row["wins"] + row["losses"]
@@ -657,8 +706,8 @@ def list_trades(symbol=None, status=None, limit=200, offset=0):
         cur.execute("""
             SELECT position_id, symbol, magic, side, status, opened_at, closed_at,
                    entry_price, exit_price, volume_in, volume_out, exit_count,
-                   gross_profit, commission, swap, fee, net_profit, comment,
-                   updated_at
+                   gross_profit, commission, swap, fee, net_profit, pips,
+                   comment, updated_at
             FROM trades
             WHERE (%(symbol)s IS NULL OR symbol = %(symbol)s)
               AND (%(status)s IS NULL OR status = %(status)s)

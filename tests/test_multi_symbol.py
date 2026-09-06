@@ -9,6 +9,11 @@ send a $0.70 stop on an $81,000 instrument and report a healthy bot. So the
 worked example the symbol was added from (long 80500 -> TP 81500, SL 79800,
 scale-out at 81000) is asserted directly against the config.
 
+That example is also what pins Bitcoin's pip through its redefinition from 1.0
+(counts 700/1000/500) to 10.0 (counts 70/100/50): the two multiply out to the
+identical prices, so the levels asserted below are the check that only the
+NAMING of a pip moved and none of the geometry did.
+
 `combine_legacy_results` merges symbols onto ONE account. Its whole reason to
 exist is that the combined drawdown is not recoverable from finished per-symbol
 summaries, so the test that matters is the one where the merged trough is deeper
@@ -19,7 +24,9 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from backend.core.symbols import SYMBOL_CONFIG, SUPPORTED_SYMBOLS, price_levels
+from backend.core.symbols import (
+    SYMBOL_CONFIG, SUPPORTED_SYMBOLS, pip_size, price_levels, to_pips,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -64,8 +71,8 @@ def test_the_scale_out_trigger_is_half_the_target(symbol):
 @pytest.mark.parametrize("symbol", SUPPORTED_SYMBOLS)
 def test_the_stop_is_shorter_than_the_target(symbol):
     """R:R above 1 for every configured symbol. `Trading Bot.md` forbids adding a
-    symbol whose geometry does not work, and 700/1000 is the same 1:1.43 as
-    gold's 7/10."""
+    symbol whose geometry does not work, and Bitcoin's 700/1000 of price is the
+    same 1:1.43 as gold's 7/10."""
     levels = price_levels(symbol)
     assert 0 < levels["sl_price"] < levels["tp_price"]
 
@@ -75,6 +82,56 @@ def test_price_levels_does_not_reuse_golds_pip():
     a 700-point stop into $70 of price, which no exception would catch."""
     assert price_levels("XAUUSDm")["sl_price"] == pytest.approx(7.0)
     assert price_levels("BTCUSDm")["sl_price"] == pytest.approx(700.0)
+
+
+@pytest.mark.parametrize("symbol,dollars", [("XAUUSDm", 1.0), ("BTCUSDm", 100.0)])
+def test_the_pip_definition_is_the_one_the_reports_are_read_in(symbol, dollars):
+    """$1 of gold is 10 pips; $100 of Bitcoin is 10 pips.
+
+    This is the whole definition, and it is asserted rather than left to the
+    table because it is what every pips figure in this project means -- the
+    trade fold, both engines, all three UI pages. Bitcoin's pip was 1.0 before
+    the figures existed, which multiplied out to the same stop and target and
+    would have reported every Bitcoin result as ten times the pips.
+    """
+    assert to_pips(symbol, dollars) == pytest.approx(10.0)
+    # Symmetric: a loss is the same distance the other way.
+    assert to_pips(symbol, -dollars) == pytest.approx(-10.0)
+
+
+def test_an_unconfigured_symbol_reports_no_pips_rather_than_golds():
+    """The mirror of `price_levels` refusing to reuse gold's pip, on the
+    REPORTING side. There is nothing to raise about here -- a pips column is not
+    a stop -- so the answer is None, which every caller renders as an em dash."""
+    assert to_pips("EURUSDm", 1.0) is None
+    assert pip_size("EURUSDm") == 0.0
+
+
+def test_a_pip_is_worth_the_same_on_both_symbols_at_equal_lots():
+    """$10 per pip per lot on gold AND Bitcoin -- 0.1 x 100oz and 10.0 x 1 BTC.
+
+    Asserted because the Backtest page's combined view adds two symbols' pips
+    together, and this is the fact that makes that sum readable rather than
+    merely well-defined. Like the equal $70 risk below it is a coincidence of
+    the two contract sizes: a third symbol will land wherever its own puts it,
+    which is why the page says the sum is movement and not money.
+    """
+    values = {s: price_levels(s)["pip_value_per_lot"] for s in ("XAUUSDm", "BTCUSDm")}
+    assert values == {"XAUUSDm": pytest.approx(10.0), "BTCUSDm": pytest.approx(10.0)}
+    # And it is the same statement as the stop being 70 pips on both.
+    for symbol in values:
+        assert price_levels(symbol)["risk_per_lot"] == pytest.approx(
+            SYMBOL_CONFIG[symbol]["sl_pips"] * values[symbol])
+
+
+def test_the_stop_and_target_are_the_same_pip_counts_on_both_symbols():
+    """One rule, two instruments -- now visible in the table rather than only
+    claimed by it. Before the pip definitions were reconciled these read 70/100
+    against 700/1000, so the two symbols traded the same geometry under numbers
+    that looked like different rules."""
+    counts = [(SYMBOL_CONFIG[s]["sl_pips"], SYMBOL_CONFIG[s]["tp_pips"],
+               SYMBOL_CONFIG[s]["be_trigger_pips"]) for s in SUPPORTED_SYMBOLS]
+    assert len(set(counts)) == 1, counts
 
 
 def test_both_symbols_risk_the_same_at_the_shipped_size():
@@ -130,8 +187,12 @@ def _result(trades, trades_opened=None, **extra):
         "trades_opened": trades_opened if trades_opened is not None else len(trades),
         "partials_fired": 0,
         "partial_pl": 0.0,
+        # `pips` defaults to the P&L's own sign at 1 pip per unit unless a third
+        # element gives it, so the merge's pip bucketing is exercised by every
+        # test here without any of them having to care about it.
         "closed_trades": [
-            {"closed_at": pd.Timestamp(t[0]), "pl": t[1], "scaled_out": False}
+            {"closed_at": pd.Timestamp(t[0]), "pl": t[1],
+             "pips": t[2] if len(t) > 2 else t[1], "scaled_out": False}
             for t in trades
         ],
     }
@@ -263,6 +324,120 @@ def test_closed_trades_reconcile_with_the_symbols_own_total():
     assert res["partial_pl"] == pytest.approx(500.0 * 0.05 * 1)
     # ...and the runner scratches at entry, so the trade nets exactly that.
     assert res["closed_trades"][0]["pl"] == pytest.approx(res["partial_pl"])
+
+
+def test_a_full_stop_out_is_exactly_the_configured_pip_count():
+    """70 pips out, on the symbol whose pip was redefined.
+
+    The check that matters after that redefinition: the stop is 700.00 of price
+    on Bitcoin either way, so an engine still dividing by the old 1.0 pip would
+    report this same trade as -700 and look entirely plausible.
+    """
+    close = [80000.0, 79000.0, 78300.0, 78300.0]
+    df = pd.DataFrame({"close": close,
+                       "time": pd.date_range("2026-03-01", periods=len(close),
+                                             freq="5min")})
+    n = len(close)
+    outs = np.full(n, 85000.0)
+    uppers = np.full(n, 90000.0)
+    lowers = np.array([70000.0, 79500.0, 70000.0, 70000.0])
+
+    res = simulate_legacy(df, outs, uppers, lowers,
+                          _btc_config(partial_fraction=0.0), 1000.0)
+
+    assert res["pips_lost"] == pytest.approx(-70.0)
+    assert res["pips_won"] == pytest.approx(0.0)
+    assert res["net_pips"] == pytest.approx(-70.0)
+    # And the money is the same trade seen through the contract size.
+    assert res["total_pl"] == pytest.approx(-70.0)
+
+
+def test_a_scale_out_reports_the_distance_the_POSITION_travelled():
+    """Half banked at +50 pips, the runner scratched at entry -> 25, not 50.
+
+    Volume-weighted, matching the live trade fold's volume-weighted exit price.
+    Counting each leg's distance in full would report a trade that banked half
+    way to a 100-pip target and gave the rest back as a 50-pip winner.
+    """
+    close = [80000.0, 79000.0, 79600.0, 79000.0, 79000.0, 79000.0]
+    df = pd.DataFrame({"close": close,
+                       "time": pd.date_range("2026-01-01", periods=len(close),
+                                             freq="5min")})
+    n = len(close)
+    outs = np.full(n, 85000.0)
+    uppers = np.full(n, 90000.0)
+    lowers = np.array([70000.0, 79500.0, 70000.0, 70000.0, 70000.0, 70000.0])
+
+    res = simulate_legacy(df, outs, uppers, lowers, _btc_config(), 1000.0)
+
+    assert res["partials_fired"] == 1
+    # The trigger is 500 of price = 50 pips above entry, on half the position.
+    assert res["partial_pips"] == pytest.approx(25.0)
+    assert res["closed_trades"][0]["pips"] == pytest.approx(25.0)
+    assert res["net_pips"] == pytest.approx(25.0)
+    assert res["pips_won"] == pytest.approx(25.0)
+
+
+def test_pips_do_not_move_with_the_lot_size_and_the_money_does():
+    """The reason both are reported. A pips figure is a statement about PRICE,
+    so it is the number that stays comparable between two runs sized
+    differently -- which is exactly what the Backtest page's sizing panel
+    invites."""
+    close = [80000.0, 79000.0, 78300.0, 78300.0]
+    df = pd.DataFrame({"close": close,
+                       "time": pd.date_range("2026-03-01", periods=len(close),
+                                             freq="5min")})
+    n = len(close)
+    outs, uppers = np.full(n, 85000.0), np.full(n, 90000.0)
+    lowers = np.array([70000.0, 79500.0, 70000.0, 70000.0])
+
+    small = simulate_legacy(df, outs, uppers, lowers,
+                            _btc_config(lot_size=0.01, partial_fraction=0.0), 1000.0)
+    big = simulate_legacy(df, outs, uppers, lowers,
+                          _btc_config(lot_size=0.1, partial_fraction=0.0), 1000.0)
+
+    assert small["net_pips"] == pytest.approx(big["net_pips"])
+    assert small["total_pl"] == pytest.approx(big["total_pl"] / 10.0)
+
+
+def test_the_two_symbols_report_the_same_pips_for_the_same_rule():
+    """Gold's 70-pip stop and Bitcoin's are the same NUMBER of pips, which is
+    what the reconciled pip definitions bought. Before it, the identical rule
+    read as -70 on one instrument and -700 on the other."""
+    per_symbol = {}
+    for symbol, entry, band in (("XAUUSDm", 3300.0, 0.1), ("BTCUSDm", 80000.0, 1.0)):
+        cfg = dict(SYMBOL_CONFIG[symbol])
+        cfg["partial_fraction"] = 0.0
+        stop = entry - cfg["sl_pips"] * cfg["pip"]
+        close = [entry + 100 * band, entry, stop, stop]
+        df = pd.DataFrame({"close": close,
+                           "time": pd.date_range("2026-03-01", periods=len(close),
+                                                 freq="5min")})
+        n = len(close)
+        outs = np.full(n, entry + 10000 * band)
+        uppers = np.full(n, entry + 20000 * band)
+        lowers = np.array([entry - 20000 * band, entry + band,
+                           entry - 20000 * band, entry - 20000 * band])
+        per_symbol[symbol] = simulate_legacy(df, outs, uppers, lowers, cfg, 1000.0)
+
+    assert per_symbol["XAUUSDm"]["net_pips"] == pytest.approx(-70.0)
+    assert per_symbol["BTCUSDm"]["net_pips"] == pytest.approx(-70.0)
+
+
+def test_combined_pips_are_bucketed_by_their_own_sign_and_split_by_symbol():
+    """Merged pips are re-bucketed from the trade stream, and reported per
+    symbol beside the total -- a pip of gold and a pip of Bitcoin are the same
+    unit and not the same money, so the split has to survive the merge."""
+    gold = _result([("2026-01-01 10:00", -100.0, -70.0),
+                    ("2026-01-01 14:00", +100.0, +100.0)])
+    btc = _result([("2026-01-01 12:00", -100.0, -70.0)])
+
+    combined = combine_legacy_results({"XAUUSDm": gold, "BTCUSDm": btc}, 1000.0)
+
+    assert combined["pips_won"] == pytest.approx(100.0)
+    assert combined["pips_lost"] == pytest.approx(-140.0)
+    assert combined["net_pips"] == pytest.approx(-40.0)
+    assert combined["pips_by_symbol"] == {"XAUUSDm": 30.0, "BTCUSDm": -70.0}
 
 
 def test_a_btc_trade_carries_its_close_time():

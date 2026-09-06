@@ -85,6 +85,14 @@ class TradeRecord:
     swap: float = 0.0
     net_pl: float = 0.0
     pnl_r: float = 0.0                  # net P&L in R units -- the comparable one
+    # The result as a PRICE distance in pips, volume-weighted across the legs.
+    # Gross by construction -- a distance carries no commission or swap -- so a
+    # trade can be positive here and negative on `net_pl`. Both are kept because
+    # that gap is the cost, per trade, and neither number can show it alone.
+    # 0.0 also means "no pip defined for this symbol" (BacktestConfig.pip_size
+    # left at 0), which `pip_size` beside it disambiguates.
+    pips: float = 0.0
+    pip_size: float = 0.0
 
     mae_price: float = 0.0              # worst adverse excursion, price units
     mfe_price: float = 0.0              # best favourable excursion

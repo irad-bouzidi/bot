@@ -35,7 +35,7 @@ This bot places **real market orders**. Read this section before running it.
   0 lots in the dashboard's Position sizing panel.
 - **Both configured symbols backtest NEGATIVE on cached data.** Central costs,
   M5, 2025-09-01 to 2026-09-04, 0.1 lots on $1,000, honest engine: gold at 7/10
-  is -$13,046 (-0.106R, 908% drawdown) and Bitcoin at 700/1000 is -$3,677
+  is -$13,046 (-0.106R, 908% drawdown) and Bitcoin at 700/1000 of price is -$3,677
   (-0.031R, 356% drawdown). Bitcoin is the less bad of the two at the same
   nominal risk; neither is a configuration to fund. Nothing here promises
   profitability — re-measure on your own data.
@@ -170,17 +170,25 @@ instrument's own units:
 
 | | XAUUSDm | BTCUSDm |
 |---|---|---|
-| `pip` | `0.1` | `1.0` |
-| `sl_pips` / `tp_pips` | `70` / `100` → 7.00 / 10.00 | `700` / `1000` → 700 / 1000 |
-| `be_trigger_pips` | `50` → 5.00 | `500` → 500 |
+| `pip` | `0.1` — $1 is 10 pips | `10.0` — $100 is 10 pips |
+| `sl_pips` / `tp_pips` | `70` / `100` → 7.00 / 10.00 | `70` / `100` → 700 / 1000 |
+| `be_trigger_pips` | `50` → 5.00 | `50` → 500 |
 | `profit_mult` (contract size) | `100` oz per lot | `1` BTC per lot |
+| pip value per lot (derived) | $10 | $10 |
 | `lot_size` default | `0.1` (~$70 at risk) | `0.1` (~$70 at risk) |
+
+The pip **counts** are the same on both because that is one rule on two
+instruments; the pip **sizes** are what differ. Bitcoin's `pip` was `1.0` with
+counts of 700/1000/500 before pips became a reported figure — the same 700.00
+and 1000.00 of price, so nothing about how it trades changed, only how many
+pips a Bitcoin result is called.
 
 Worked through on Bitcoin: a long filled at **80500** takes profit at **81500**
 and stops at **79800**; at **81000** — half way to the target — `partial_fraction`
 of the position is closed and the stop moves to **80500**, so the remainder runs
 to the target at no risk. A sell mirrors it: 79500 target, 81200 stop, 80000
-trigger. The same rule on gold is 7.00 / 10.00 / 5.00.
+trigger. The same rule on gold is 7.00 / 10.00 / 5.00 — and on both, it is a
+70-pip stop, a 100-pip target and a 50-pip trigger.
 
 Adding a third symbol is one `SYMBOL_CONFIG` entry — the dashboard reads its
 symbol list from `/settings` — but re-derive its dollar risk from the contract
@@ -244,6 +252,35 @@ Trade statistics are **queries** over `trades`, never counters — so a restart,
 double poll, or a re-scanned history window cannot make them drift. One trade is
 one outcome, decided on net profit: a trade that banks a scale-out and then stops
 at break-even is one row with `exit_count = 2`, not a win plus a flat.
+
+### Pips
+
+Every result surface — the trade history, `POST /backtest`, the dashboard card
+and `run_baseline` — reports **pips won and pips lost** beside the money. One
+definition, from `SYMBOL_CONFIG`: **$1 of gold is 10 pips, $100 of Bitcoin is
+10 pips.**
+
+They are a second measurement rather than a restatement of the P&L:
+
+- **Gross, and blind to the lot size.** A price distance carries no commission
+  or swap, and it does not move when the size does — which makes it the figure
+  that stays comparable between two runs sized differently, and makes the gap
+  between it and the money the cost of the trade.
+- **Bucketed by their own sign.** `pips_won ≥ 0 ≥ pips_lost`, and `net_pips` is
+  the two added. So the pip split can disagree with the win/loss split: a trade
+  that gained a pip and paid more than that in costs is a pip win and a money
+  loss. Both counts are reported, and the dashboard says so out loud when they
+  differ.
+- **An em dash, never a zero, when there is no figure.** `trades.pips` is
+  nullable — nothing exited yet, or a row folded before the column existed.
+  Press **Re-read from MT5** on the Trade History page (or restart the API) to
+  fill those in; the fold recomputes them from the raw deals.
+- **Volume-weighted across a scale-out.** Half banked at +50 pips with the
+  runner scratched at entry is 25 pips, not 50 — the distance the *position*
+  travelled.
+
+Adding pips across symbols in a combined backtest adds **movement, not money**;
+the combined view prints the per-symbol split beside the total for that reason.
 
 ---
 
@@ -360,6 +397,11 @@ also:
 cover several symbols at once. Existing rows are backfilled with their single
 symbol, so nothing needs re-creating — run `migrate` and the columns appear.
 
+**Schema version 4** adds `trades.pips`. It changes nothing about how the bot
+trades, but the reporting queries name the column, so the API refuses to boot
+against a database still at version 3 — run `migrate`. The column arrives empty
+and is filled by the first full reconcile, which happens on the next API start.
+
 `python -m backend.db.migrate --check` reports connectivity and schema version
 and changes nothing.
 
@@ -456,7 +498,8 @@ exit-reason, three cost scenarios, and writes the full trade ledger to
 engine so you can see how much it was overstating results.
 
 `--sl` / `--tp` are **price** units and default to the symbol's own
-`SYMBOL_CONFIG` geometry — 7 / 10 for gold, 700 / 1000 for Bitcoin — printed at
+`SYMBOL_CONFIG` geometry — 7 / 10 for gold, 700 / 1000 for Bitcoin (70 / 100
+pips on each) — printed at
 the top of each report so a saved run says what produced it. Passing gold's 7/10
 for `BTCUSDm` would put a $7 stop on an $81,000 instrument.
 

@@ -20,6 +20,13 @@ const money = (n: number | null | undefined) =>
 const price = (n: number | null | undefined, digits = 2) =>
   n === null || n === undefined ? '—' : n.toFixed(digits);
 
+// Null is not zero here. The backend leaves `pips` NULL when the trade has not
+// been exited, when the symbol has no pip defined, or when the row predates the
+// column and has not been re-folded -- and "0.0" would report all three as a
+// trade that closed exactly flat.
+const pips = (n: number | null | undefined) =>
+  n === null || n === undefined ? '—' : `${n > 0 ? '+' : ''}${n.toFixed(1)}`;
+
 const when = (iso: string | null) => {
   if (!iso) return '—';
   const d = new Date(iso);
@@ -150,7 +157,9 @@ const TradesPage = ({ symbols = [] }: { symbols?: string[] }) => {
 
   const page = Math.floor(offset / PAGE_SIZE) + 1;
   const pages = Math.max(1, Math.ceil(total / PAGE_SIZE));
-  const columns = symbols.length > 1 ? 12 : 11;
+  // Grew by one with the Pips column; a stale count makes the expanded deal
+  // row stop short of the table's edge instead of spanning it.
+  const columns = symbols.length > 1 ? 13 : 12;
 
   return (
     <>
@@ -254,6 +263,17 @@ const TradesPage = ({ symbols = [] }: { symbols?: string[] }) => {
                   <th scope="col" className="num">Exit</th>
                   <th scope="col" className="num">Lots</th>
                   <th scope="col" className="num">Exits</th>
+                  {/* Before Costs and Net on purpose: pips are the GROSS price
+                      distance, and reading them immediately left of what the
+                      costs did to that distance is the comparison worth
+                      making. */}
+                  <th
+                    scope="col"
+                    className="num"
+                    title="Price distance captured, in this symbol's pips — $1 of gold and $100 of Bitcoin are both 10. Gross: costs are in the next column."
+                  >
+                    Pips
+                  </th>
                   <th scope="col" className="num">Costs</th>
                   <th scope="col" className="num">Net</th>
                 </tr>
@@ -317,6 +337,24 @@ const TradesPage = ({ symbols = [] }: { symbols?: string[] }) => {
                               and its footprint should be visible per trade. */}
                           {t.exit_count > 1 ? <span className="scaled-flag" title="Scaled out">◆</span> : null}
                         </td>
+                        {/* Coloured off the PIPS, not off net_profit. They can
+                            disagree -- a trade that gained a pip and lost it to
+                            the spread is a pip win and a money loss -- and
+                            colouring this cell by the other column's sign would
+                            hide exactly that case. */}
+                        <td
+                          className={`num mono ${
+                            open || t.pips === null || t.pips === undefined
+                              ? ''
+                              : t.pips > 0
+                              ? 'positive'
+                              : t.pips < 0
+                              ? 'negative'
+                              : ''
+                          }`}
+                        >
+                          {open ? '—' : pips(t.pips)}
+                        </td>
                         <td className="num">{money(costs)}</td>
                         <td className={`num strong ${open ? '' : t.net_profit >= 0 ? 'positive' : 'negative'}`}>
                           {open ? '—' : money(t.net_profit)}
@@ -364,7 +402,9 @@ const TradesPage = ({ symbols = [] }: { symbols?: string[] }) => {
       <p className="page-note">
         Open trades show no net result on purpose — a scale-out is not a close, and
         dating a trade by its partial exit would drop it into the closed-trade equity
-        curve early.
+        curve early. <b>Pips</b> is the price distance the position travelled,
+        volume-weighted across its exits and <b>gross of costs</b>, so a trade can be
+        green there and red under Net.
       </p>
     </>
   );

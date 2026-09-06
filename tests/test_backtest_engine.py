@@ -258,6 +258,105 @@ def test_a_centre_line_exit_reaches_the_ledger_as_its_own_reason():
     assert list(res.ledger["exit_reason"]) == ["cross_center"]
 
 
+# --- pips: the price distance, reported beside the money --------------------
+
+def _pips_cfg(**over):
+    """A run that reports pips. pip_size=1.0 makes one unit of PRICE one pip, so
+    these tests read in the same units the rest of the file does."""
+    base = dict(initial_balance=1000.0, volume=1.0, pip_size=1.0)
+    base.update(over)
+    return BacktestConfig(**base)
+
+
+def test_a_stop_out_is_reported_as_the_stop_distance_in_pips():
+    bs = bars([(100, 101, 99, 100),
+               (100, 101, 99, 100),      # entry at 100, SL = 90
+               (100, 101, 85, 100)])
+    res = run(bs, EnterOnceStrategy(sl=10.0, tp=10.0), cfg=_pips_cfg())
+    assert res.ledger.iloc[0]["pips"] == pytest.approx(-10.0)
+    assert res.metrics["pips_lost"] == pytest.approx(-10.0)
+    assert res.metrics["net_pips"] == pytest.approx(-10.0)
+    assert res.metrics["pip_losses"] == 1
+
+
+def test_a_short_that_wins_reports_POSITIVE_pips():
+    """The sign is the trade's, not the market's. A short filled at 100 and
+    closed at 90 captured +10 pips; taking `exit - entry` unsigned would report
+    every profitable short as a loss and still add up in money."""
+    bs = bars([(100, 101, 99, 100),
+               (100, 101, 99, 100),      # short at 100, TP = 90
+               (100, 101, 85, 100)])
+    res = run(bs, EnterOnceStrategy(sl=10.0, tp=10.0,
+                                    side=SignalType.ENTER_SHORT),
+              cfg=_pips_cfg())
+    row = res.ledger.iloc[0]
+    assert row["exit_reason"] == EXIT_TP
+    assert row["pips"] == pytest.approx(10.0)
+    assert res.metrics["pips_won"] == pytest.approx(10.0)
+
+
+def test_pips_are_gross_and_the_money_is_not():
+    """The reason both are reported, in the one direction this engine can show
+    it: a commission comes out of `net_pl` and cannot come out of a price
+    distance, so the gap between the two numbers is what the trade paid.
+
+    Commission and not spread, deliberately. This engine charges the spread by
+    moving the FILL PRICE (see test_round_trip_costs_exactly_one_spread_not_two),
+    so a spread is already inside both `gross_pl` and `pips` and would prove
+    nothing here -- which is itself worth knowing before reading a pips column
+    as "before costs".
+    """
+    bs = bars([(100, 101, 99, 100),
+               (100, 101, 99, 100),
+               (100, 115, 99, 100)])
+    costs = CostModel(CostConfig(spread_source="none",
+                                 commission_per_lot_round_turn=3.0), SPEC)
+    res = run(bs, EnterOnceStrategy(sl=10.0, tp=10.0), costs=costs,
+              cfg=_pips_cfg())
+    row = res.ledger.iloc[0]
+    # The full 10.00 target captured, and 3.00 of it handed to the broker.
+    assert row["pips"] == pytest.approx(10.0)
+    assert row["gross_pl"] == pytest.approx(10.0)
+    assert row["net_pl"] == pytest.approx(7.0)
+
+
+def test_a_run_with_no_pip_defined_reports_no_pips_rather_than_zero():
+    """The default BacktestConfig has pip_size=0 -- an unconfigured symbol. Zero
+    pips would read as a strategy that captured no movement, so the metrics are
+    None and the report prints a dash."""
+    bs = bars([(100, 101, 99, 100), (100, 101, 99, 100), (100, 101, 85, 100)])
+    res = run(bs, EnterOnceStrategy(sl=10.0, tp=10.0))
+    assert res.metrics["net_pips"] is None
+    assert res.metrics["pips_won"] is None and res.metrics["pips_lost"] is None
+
+
+def test_the_scaled_out_leg_is_weighted_into_the_pip_result():
+    """Half banked at +5, the rest run to +10 -> 7.5 pips, not 15.
+
+    Same basis as the live trade fold's volume-weighted exit price, so a pip on
+    the Backtest page and a pip on the Trade History page mean one thing.
+    """
+    class ScaleOut(EnterOnceStrategy):
+        def on_bar(self, ctx):
+            if ctx.index == 0 and ctx.position is None:
+                return [Signal(SignalType.ENTER_LONG, "test", ctx.bar.close,
+                               sl_distance=10.0, tp_distance=10.0,
+                               be_trigger_distance=5.0, partial_fraction=0.5)]
+            return []
+
+    bs = bars([(100, 101, 99, 100),
+               (100, 101, 99, 100),      # entry at 100
+               (100, 106, 99, 100),      # trigger at 105 -> half out
+               # The break-even stop is live from HERE, so this bar must not
+               # revisit 100 -- it would scratch the runner before the target
+               # and the weighting would be measured on the wrong two legs.
+               (106, 115, 105, 112)])    # target at 110 -> the runner
+    res = run(bs, ScaleOut(), cfg=_pips_cfg())
+    row = res.ledger.iloc[0]
+    assert row["partial_volume"] == pytest.approx(0.5)
+    assert row["pips"] == pytest.approx(7.5)
+
+
 def test_the_research_default_matches_the_live_bot():
     """Both paths ship the centre-line exit OFF, and drift here is silent.
 

@@ -45,7 +45,7 @@ COOLDOWN_BARS = 3
 # it whenever repository.py starts naming a column that an older database does
 # not have, so init_persistence() can refuse with the migrate command instead of
 # letting psycopg2 raise UndefinedColumn from somewhere deeper.
-REQUIRED_SCHEMA_VERSION = 3
+REQUIRED_SCHEMA_VERSION = 4
 
 # Max price slippage tolerated on a market order, in points.
 DEVIATION_POINTS = 20
@@ -1090,6 +1090,22 @@ class TradingBot(threading.Thread):
         self.running = False
 
 
+def _leg_pips(side, entry_price, exit_price, volume, lot_size, pip):
+    """One leg's contribution to a trade's pip result, WEIGHTED by its share.
+
+    Weighted rather than counted in full, matching how the live trade fold
+    derives pips from a volume-weighted exit price: a scale-out that banks half
+    at +50 pips and runs the rest to +100 moved the position 75 pips, not 150.
+
+    Returns 0.0 when the symbol has no pip or the size is zero -- this function
+    is on a pure path that takes a plain dict, so a synthetic config must not be
+    able to raise ZeroDivisionError inside the loop.
+    """
+    if not pip or not lot_size:
+        return 0.0
+    return side * (exit_price - entry_price) / pip * (volume / lot_size)
+
+
 def simulate_legacy(df, outs, uppers, lowers, config, initial_balance,
                     volume_min=0.01, volume_step=0.01):
     """The ORIGINAL close-only backtest -- now modelling the scale-out rule too.
@@ -1111,6 +1127,14 @@ def simulate_legacy(df, outs, uppers, lowers, config, initial_balance,
     Pure on purpose -- no MT5 calls -- so the rule can be tested against synthetic
     bars, including a proof that partial_fraction=0 reproduces the original engine
     trade for trade.
+
+    Pips are reported alongside the money and are a different measurement, not a
+    restatement of it: a pip figure is the PRICE distance captured, so it is
+    blind to the lot size and, in this engine, identical whether you traded 0.01
+    lots or 10. Both are returned because each answers a question the other
+    cannot -- "was the strategy right about price" against "what did the account
+    do" -- and on a combined run they diverge further still, since the two
+    symbols can be sized differently.
     """
     pip = config["pip"]
     sl_dist = config["sl_pips"] * pip
@@ -1141,6 +1165,15 @@ def simulate_legacy(df, outs, uppers, lowers, config, initial_balance,
     peak_balance = initial_balance
     partials_fired = 0
     partial_pl = 0.0
+    # Bucketed by the sign of the PIPS, so pips_won is never negative and
+    # pips_lost never positive. This engine is cost-free, so here they cannot
+    # disagree with wins/losses the way the live trade fold's can -- but the
+    # buckets are defined the same way in both places on purpose, because a
+    # "pips won" that meant one thing on the Backtest page and another on the
+    # Trade History page is worth less than no pips at all.
+    pips_won = 0.0
+    pips_lost = 0.0
+    partial_pips = 0.0
 
     # One entry per CLOSED trade, in the order they closed. It exists so several
     # symbols can be replayed onto ONE account (combine_legacy_results): a
@@ -1159,6 +1192,13 @@ def simulate_legacy(df, outs, uppers, lowers, config, initial_balance,
     open_volume = 0.0     # lots still running; the scale-out reduces it
     be_armed = False      # trigger reached: stop is at entry, partial already taken
     trade_pl = 0.0        # realised on THIS trade so far, partial included
+    # Volume-WEIGHTED, matching how the live trade fold derives its pips from a
+    # volume-weighted exit price. A scale-out banks half the position at the
+    # trigger, so counting the trigger's distance in full and the runner's in
+    # full would report a trade that moved 5.00 and then 10.00 as 150 pips of a
+    # 100-pip target. The weighted answer is the distance the position as a
+    # whole travelled.
+    trade_pips = 0.0
 
     for i in range(len(df)):
         price = df['close'].iloc[i]
@@ -1176,6 +1216,7 @@ def simulate_legacy(df, outs, uppers, lowers, config, initial_balance,
                 open_volume = lot_size
                 be_armed = False
                 trade_pl = 0.0
+                trade_pips = 0.0
                 trades_opened += 1
         else:
             if arms_breakeven and not be_armed \
@@ -1190,6 +1231,10 @@ def simulate_legacy(df, outs, uppers, lowers, config, initial_balance,
                     trade_pl += pl
                     partial_pl += pl
                     partials_fired += 1
+                    leg_pips = _leg_pips(side, entry_price, trigger_price,
+                                         scale_out_lots, lot_size, pip)
+                    trade_pips += leg_pips
+                    partial_pips += leg_pips
                     open_volume = runner_lots
 
             # be_armed pulls the stop to entry, which is the whole point of the
@@ -1211,6 +1256,12 @@ def simulate_legacy(df, outs, uppers, lowers, config, initial_balance,
                 balance += pl
                 total_pl += pl
                 trade_pl += pl
+                trade_pips += _leg_pips(side, entry_price, exit_price,
+                                        open_volume, lot_size, pip)
+                if trade_pips > 0:
+                    pips_won += trade_pips
+                elif trade_pips < 0:
+                    pips_lost += trade_pips
                 # One win or loss per TRADE, scored on the partial and the runner
                 # together -- counting the banked partial as its own win is what
                 # makes a scale-out look like it raises the hit rate for free.
@@ -1225,6 +1276,11 @@ def simulate_legacy(df, outs, uppers, lowers, config, initial_balance,
                 closed_trades.append({
                     "closed_at": (times.iloc[i] if times is not None else None),
                     "pl": trade_pl,
+                    # Carried per trade for the same reason `pl` is: a combined
+                    # run re-buckets these in close-time order, and a sum of two
+                    # symbols' finished pips_won/pips_lost cannot be re-bucketed
+                    # at all.
+                    "pips": trade_pips,
                     "scaled_out": be_armed and scale_out_lots > 0,
                 })
                 side = 0
@@ -1248,6 +1304,15 @@ def simulate_legacy(df, outs, uppers, lowers, config, initial_balance,
         "runner_lots": runner_lots,
         "partials_fired": partials_fired,
         "partial_pl": partial_pl,
+        # Pips: the price distance captured, independent of the lot size above.
+        # `pips_lost` is NEGATIVE, like avg_loss is elsewhere in this codebase,
+        # so net_pips is the sum of the two rather than a subtraction that is
+        # easy to get backwards.
+        "pips_won": pips_won,
+        "pips_lost": pips_lost,
+        "net_pips": pips_won + pips_lost,
+        "partial_pips": partial_pips,
+        "pip": pip,
         "closed_trades": closed_trades,
         # This engine checks exits on CLOSES only and models no spread, commission
         # or slippage. It DOES now model the scale-out / break-even rule, but at an
@@ -1278,6 +1343,14 @@ def combine_legacy_results(results, initial_balance):
         simulate_legacy returns `closed_trades` at all.
       * win/loss counts DO add up, since a trade is won or lost on its own P&L
         regardless of what the other symbol was doing.
+      * pips add up as PIPS and not as money. A pip is a price distance, so
+        summing them across instruments is a statement about price movement
+        captured and nothing else -- it is not a share of the P&L above, and it
+        does not become one just because both configured symbols happen to be
+        worth $10 a pip per lot (see backend/core/symbols.py; that is a
+        coincidence of the two contract sizes, and the two symbols can be sized
+        differently in the same run anyway). `pips_by_symbol` is returned
+        alongside so the merged number never has to be un-mixed.
 
     `results` is {symbol: simulate_legacy(...)}. Pure -- no MT5, no database.
     """
@@ -1300,10 +1373,22 @@ def combine_legacy_results(results, initial_balance):
     max_drawdown = 0.0
     wins = losses = 0
     total_pl = 0.0
-    for _symbol, _seq, trade in events:
+    pips_won = pips_lost = 0.0
+    pips_by_symbol = dict.fromkeys(results, 0.0)
+    for symbol, _seq, trade in events:
         pl = trade["pl"]
         balance += pl
         total_pl += pl
+        # Re-bucketed here rather than summed off each symbol's finished
+        # pips_won/pips_lost -- which would give the same two totals today, and
+        # would stop doing so the moment a trade is bucketed by anything the
+        # merge can see and a single symbol's run cannot.
+        pips = trade.get("pips") or 0.0
+        pips_by_symbol[symbol] = pips_by_symbol.get(symbol, 0.0) + pips
+        if pips > 0:
+            pips_won += pips
+        elif pips < 0:
+            pips_lost += pips
         if pl > 0:
             wins += 1
         elif pl < 0:
@@ -1339,6 +1424,20 @@ def combine_legacy_results(results, initial_balance):
         "max_drawdown": max_drawdown,
         "partials_fired": sum(r["partials_fired"] for r in results.values()),
         "partial_pl": sum(r["partial_pl"] for r in results.values()),
+        "pips_won": pips_won,
+        "pips_lost": pips_lost,
+        "net_pips": pips_won + pips_lost,
+        # The merged pips split back out, because a pip of gold and a pip of
+        # Bitcoin are the same UNIT and not the same money. Reported next to the
+        # total so nobody has to reconstruct it from `per_symbol` to find out
+        # which instrument the movement came from.
+        #
+        # Accumulated from the SAME stream as the total above rather than read
+        # off each symbol's finished `net_pips`. Those agree today, and reading
+        # them would make the split silently stop adding up to the total the
+        # first time the merge drops or re-buckets a trade the per-symbol run
+        # kept -- a disagreement between two numbers printed on one card.
+        "pips_by_symbol": pips_by_symbol,
         "per_symbol": per_symbol,
         "warning": (
             "Close-only, cost-free engine: no spread/commission/slippage and no "
@@ -1485,6 +1584,9 @@ class BotManager:
             "losses": 0,
             "total_pl": 0.0,
             "max_drawdown": 0.0,
+            "pips_won": 0.0,
+            "pips_lost": 0.0,
+            "net_pips": 0.0,
             "desired_state": "stopped",
             "persisted": False,
         }
@@ -1525,6 +1627,19 @@ class BotManager:
             "costs": stats["costs"],
             "avg_win": stats["avg_win"],
             "avg_loss": stats["avg_loss"],
+            # Pips are GROSS -- a price distance carries no commission or swap
+            # -- so `pip_wins`/`pip_losses` can disagree with `wins`/`losses`
+            # above on a trade the costs decided. Both counts are passed through
+            # rather than one of them, so the card can show the disagreement
+            # instead of the user finding it.
+            "pips_won": stats["pips_won"],
+            "pips_lost": stats["pips_lost"],
+            "net_pips": stats["net_pips"],
+            "avg_win_pips": stats["avg_win_pips"],
+            "avg_loss_pips": stats["avg_loss_pips"],
+            "pip_wins": stats["pip_wins"],
+            "pip_losses": stats["pip_losses"],
+            "pips_unknown": stats["pips_unknown"],
             # Realised, closed-trade drawdown in account currency -- see
             # repo.trade_stats. The stat this replaces was initialised to 0.0
             # and never written to at all.
@@ -1594,6 +1709,11 @@ class BotManager:
             "sl_pips": cfg["sl_pips"],
             "tp_pips": cfg["tp_pips"],
             "pip": cfg["pip"],
+            # Account currency per pip, per lot. Derived, and sent rather than
+            # left to the page to reconstruct: doing that needs `profit_mult`,
+            # which is not on this response and should not be -- the contract
+            # size is not a setting.
+            "pip_value_per_lot": price_levels(symbol)["pip_value_per_lot"],
             "risk_per_lot": price_levels(symbol)["risk_per_lot"],
             "volume_min": vol_min,
             "volume_max": vol_max,

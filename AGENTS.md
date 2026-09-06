@@ -33,7 +33,10 @@
 - **Symbols**: `XAUUSDm` and `BTCUSDm`, both defined in `backend/core/symbols.py`
   (`SYMBOL_CONFIG`) — the one MT5-free, database-free copy that the live loop,
   `backend.db.migrate` and the research scripts all read. Geometry is in pip
-  COUNTS times a per-symbol pip size: gold 70/100 x 0.1, Bitcoin 700/1000 x 1.0.
+  COUNTS times a per-symbol pip size: gold 70/100 x 0.1, Bitcoin 70/100 x 10.0
+  -- the same counts, because $1 of gold and $100 of Bitcoin are both 10 pips.
+  Every pips figure in the project comes from `to_pips()` in that module and is
+  GROSS of costs; `net_pips` is `pips_won + pips_lost` with the latter negative.
   Adding a symbol is one entry there plus `python -m backend.db.migrate`.
 - **External Dependency**: Requires MetaTrader 5 (MT5) Terminal installed and logged in.
 

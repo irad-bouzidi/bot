@@ -43,8 +43,9 @@ python -m backend.scripts.run_baseline --symbol XAUUSDm --exit-at-mean
 python -m backend.scripts.run_baseline --symbol XAUUSDm --no-exit-at-mean
 # --sl/--tp are PRICE units, SYMBOL_CONFIG is pip COUNTS times a per-symbol pip.
 # They now DEFAULT from backend/core/symbols.py -- gold 70x0.1 -> 7/10, Bitcoin
-# 700x1.0 -> 700/1000 -- and the chosen numbers are printed at the top of the
-# report. Passing 7/10 for BTCUSDm would put a $7 stop on an $81,000 instrument.
+# 70x10.0 -> 700/1000 -- and the chosen numbers are printed at the top of the
+# report, along with the pip the report's pips figures are counted in. Passing
+# 7/10 for BTCUSDm would put a $7 stop on an $81,000 instrument.
 
 # Data capture (MT5 host only)
 python -m backend.data.snapshot --symbol XAUUSDm --start 2023-01-01
@@ -171,6 +172,12 @@ Storage: `backtest_runs` gains `symbols TEXT[]` and `sizing JSONB` (schema versi
 matches on the array too, so a combined run appears under either symbol's filter -- it is
 a fact about both.
 
+**Schema version 4** adds `trades.pips`. It changes no behaviour and no money figure,
+but `list_trades()` and `trade_stats()` NAME the column, so a database left at version 3
+fails `/trades` with a psycopg2 `UndefinedColumn` -- which is why
+`REQUIRED_SCHEMA_VERSION` moved with it. The column arrives NULL and is filled by the
+first `reconcile_all(full=True)`, i.e. the next API boot.
+
 **Schema version 3** adds `symbol_settings.exit_at_mean` plus the two matching
 `settings_audit` columns. `REQUIRED_SCHEMA_VERSION` in `bot_manager.py` is a **floor**,
 not a "has any schema" check: `load_settings()` names the new column, so a database left
@@ -230,7 +237,7 @@ which is strictly worse than a gap in the history. The gap is reported through
 | `control_events` | nothing | every start/stop press, accepted or refused |
 | `bot_snapshots` | `TradingBot.stats` | latest envelope reading, with `updated_at` |
 | `deals` | nothing | raw MT5 deals, keyed on the broker's deal ticket |
-| `trades` | nothing | one row per **position**, folded from `deals` |
+| `trades` | nothing | one row per **position**, folded from `deals`; `pips` is derived in the same fold and NULLABLE |
 | `backtest_runs` | nothing | every `POST /backtest`, inputs + outputs, errors included |
 | `ui_preferences` | `localStorage` | theme, active view, backtest form; jsonb, merged not replaced |
 | `account_snapshots` | nothing | throttled account reading; accumulates an equity curve |
@@ -508,10 +515,11 @@ still holds a live reference into it and a size edit still reaches the thread.
 
 | | XAUUSDm | BTCUSDm |
 |---|---|---|
-| `pip` | 0.1 | 1.0 |
-| stop / target | 70 / 100 pips = 7.00 / 10.00 | 700 / 1000 pips = 700 / 1000 |
-| scale-out trigger | 50 pips = 5.00 | 500 pips = 500 |
+| `pip` | 0.1 ($1 = 10 pips) | 10.0 ($100 = 10 pips) |
+| stop / target | 70 / 100 pips = 7.00 / 10.00 | 70 / 100 pips = 700 / 1000 |
+| scale-out trigger | 50 pips = 5.00 | 50 pips = 500 |
 | `profit_mult` (contract size) | 100 oz per lot | 1 BTC per lot |
+| `pip_value_per_lot` (derived) | $10 | $10 |
 | risk at the 0.1 default | ~$70 | ~$70 |
 | `exit_at_mean` | `False` (editable) | `False` (editable) |
 
@@ -519,12 +527,68 @@ The pip COUNTS are identical on purpose -- one rule, two instruments -- so the w
 example reads the same on both: a BTCUSDm long at 80500 targets 81500, stops at 79800,
 and at 81000 banks `partial_fraction` of the position and pulls the stop to 80500.
 
+**Bitcoin's `pip` was 1.0 with counts of 700/1000/500** until pips became a reported
+figure. The product is identical -- 70 x 10.0 is the same 700.00 of price 700 x 1.0 was
+-- so **no stop, target, trigger or P&L moved**, and the worked example above is
+unchanged. What moved is what a pip is *called*: the old definition reported ten Bitcoin
+pips for every one this project now reports. It also made the "identical pip counts"
+claim above finally true of the table rather than only of the geometry.
+
 **The equal $70 is a coincidence of the two contract sizes, not a rule.** Gold is 100 oz
 over a 7.00 stop, Bitcoin 1 BTC over a 700.00 one. A third symbol will land wherever its
 contract size puts it, so re-derive the dollar risk rather than assuming 0.1 lots means
 $70. `TradingBot.__init__` and `run_backtest` now **refuse** an unconfigured symbol
 instead of falling back to gold's row, because that fallback is silent and gold's pip
 would compute a $0.70 stop on an $81,000 instrument.
+
+### Pips -- a second measurement, not a restatement of the P&L
+
+Every result surface now reports **pips won and pips lost** beside the money: the trade
+history (`trades.pips`, schema version 4), `POST /backtest`, the dashboard's bot card and
+`run_baseline`. One definition, `backend/core/symbols.py`:
+
+```python
+to_pips(symbol, price_diff)     # signed distance / SYMBOL_CONFIG[symbol]["pip"]
+pip_size(symbol)                # 0.0 for a symbol not in the table
+```
+
+Four things to keep straight before reading or extending any of it:
+
+- **Pips are GROSS and blind to size.** A price distance cannot carry a commission or a
+  swap, and it does not move when the lot size does. That is the point: it is the number
+  that stays comparable between two runs sized differently, and the gap between it and
+  the money is what the costs took. It is *not* a share of the P&L.
+- **The pip buckets are signed by the PIPS, not by the money.** `pips_won >= 0 >=
+  pips_lost` always, and `net_pips` is the two **summed** (the same convention `avg_loss`
+  uses). So the split can disagree with `wins`/`losses`: a trade that gained a pip and
+  paid more than that in costs is a pip win and a money loss. Both counts are returned --
+  `pip_wins`/`pip_losses` beside `wins`/`losses` -- so the disagreement is visible rather
+  than looking like one of the two is wrong. The legacy engine is cost-free, so there the
+  two can only agree; the research engine and the live fold are where they part.
+- **NULL is not zero.** `trades.pips` is nullable and every UI renders it as an em dash.
+  A closed trade with no pip figure means the symbol left `SYMBOL_CONFIG`, or the row was
+  folded before version 4 and has not been re-read; `trade_stats` returns
+  `pips_unknown` so the sums can be read as covering every closed trade or explicitly
+  not. There is deliberately **no backfill UPDATE** in `schema.sql`: the pip size lives
+  in code, and a copy of it in the schema would be a second table a new symbol could be
+  missing from. `reconcile_all(full=True)` on every API boot re-folds the whole history,
+  which is the migration.
+- **A scaled-out trade reports the distance the POSITION travelled**, volume-weighted
+  across its legs -- half banked at +50 and the runner scratched is 25 pips, not 50. The
+  same basis `exit_price` already used, so a pip means one thing on all four surfaces.
+
+Summing pips across symbols (the combined backtest) adds **movement, not money**. It
+happens to be readable in money here because `pip * profit_mult` is $10 a lot on both
+configured symbols -- a coincidence of the two contract sizes, exactly like the equal
+$70 risk -- so the combined view also prints `pips_by_symbol`, and the note under it is
+derived from `/settings`'s `pip_value_per_lot` rather than written into the prose.
+
+The research engine takes its pip through `BacktestConfig.pip_size` and does **not**
+import `SYMBOL_CONFIG`; `run_baseline` resolves it, exactly as it already does for
+`--sl`/`--tp`, so `backend/backtest/` stays runnable with nothing but `data/`. A run with
+no pip defined reports `None`, and the report prints a dash rather than a `0` that would
+read as a strategy that captured nothing. **Stored ledger CSVs gain two columns**
+(`pips`, `pip_size`); no existing column's values moved.
 
 Adding a third symbol means a `SYMBOL_CONFIG` entry and nothing else in the frontend --
 the Backtest page reads its symbol list from `/settings`, which is keyed off
