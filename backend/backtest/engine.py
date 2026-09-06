@@ -56,6 +56,16 @@ class BacktestConfig:
     volume: float = 0.1        # matches SYMBOL_CONFIG lot_size; keep the two equal
     tie_break: str = "sl_first"     # "sl_first" | "tp_first" | "ambiguous"
     legacy_mode: bool = False       # reproduce the ORIGINAL engine, for regression only
+    # Price distance of one pip, for REPORTING only -- nothing in the execution
+    # contract above reads it, and changing it cannot move a fill, a stop or a
+    # P&L figure. Passed in rather than looked up, because this package must stay
+    # importable and runnable with nothing but `data/`: reaching into
+    # SYMBOL_CONFIG here would give the research engine a config table to agree
+    # with, and `run_baseline` is the layer that already owns that resolution
+    # (it does the same for --sl/--tp). 0.0 means "this symbol has no pip
+    # defined", and every pips figure downstream is then None rather than a
+    # number derived from some other instrument's definition.
+    pip_size: float = 0.0
 
 
 @dataclass
@@ -455,6 +465,18 @@ class BacktestEngine:
         t.duration_s = (t.exit_time - t.entry_time).total_seconds()
         remainder_gross = spec.pl(t.entry_price, price, side, t.remaining_volume)
         t.gross_pl = t.partial_pl + remainder_gross
+        # The trade's result as a PRICE distance, weighted across the legs by the
+        # volume each carried -- the same basis the live trade fold uses, so a
+        # research pip and a dashboard pip mean one thing. Blind to costs by
+        # construction: a distance cannot hold a commission, which is exactly why
+        # it is worth reporting next to net_pl rather than instead of it.
+        t.pip_size = self.cfg.pip_size
+        if self.cfg.pip_size > 0 and t.volume > 0:
+            travelled = (price - t.entry_price) * side.sign * t.remaining_volume
+            if t.partial_volume:
+                travelled += ((t.partial_price - t.entry_price) * side.sign
+                              * t.partial_volume)
+            t.pips = travelled / t.volume / self.cfg.pip_size
         # Round turn on the volume OPENED: both legs eventually close, so the total
         # closed volume equals `volume` however many pieces it left in.
         t.commission = self.costs.commission(t.volume)

@@ -26,6 +26,11 @@ const Skeleton = ({ className = '' }: { className?: string }) => (
 const money = (n: number | null | undefined) =>
   n === null || n === undefined ? '—' : `${n < 0 ? '-' : ''}$${Math.abs(n).toFixed(2)}`;
 
+// Signed, and an em dash for absent. A card whose /stats read failed carries no
+// pips fields at all, and 0.0 there would read as "traded, captured nothing".
+const pips = (n: number | null | undefined) =>
+  n === null || n === undefined ? '—' : `${n > 0 ? '+' : ''}${n.toFixed(1)}`;
+
 const utcStamp = (iso: string) =>
   new Date(iso).toISOString().slice(0, 19).replace('T', ' ');
 
@@ -909,6 +914,37 @@ const Dashboard = () => {
                             </span>
                             <span className="metric-value">{stats.scaled_out ?? 0}</span>
                           </div>
+                          {/* Pips are the GROSS price distance -- $1 of gold and
+                              $100 of Bitcoin are both 10 -- so they are bucketed
+                              by their own sign, not by the money's. On a trade
+                              the costs decided the two disagree, which is the
+                              reason both are on this card. */}
+                          <div className="metric success">
+                            <span
+                              className="metric-label"
+                              title="Price distance captured on trades that finished up, gross of commission and swap"
+                            >
+                              Pips won
+                            </span>
+                            <span className="metric-value">{pips(stats.pips_won)}</span>
+                          </div>
+                          <div className="metric danger">
+                            <span
+                              className="metric-label"
+                              title="Price distance given up on trades that finished down, gross of commission and swap"
+                            >
+                              Pips lost
+                            </span>
+                            <span className="metric-value">{pips(stats.pips_lost)}</span>
+                          </div>
+                          <div
+                            className={`metric ${
+                              (stats.net_pips ?? 0) >= 0 ? 'success' : 'danger'
+                            }`}
+                          >
+                            <span className="metric-label">Net pips</span>
+                            <span className="metric-value">{pips(stats.net_pips)}</span>
+                          </div>
                           <div className="metric danger">
                             <span
                               className="metric-label"
@@ -924,6 +960,23 @@ const Dashboard = () => {
                             Net of ${Math.abs(stats.costs).toFixed(2)} in commission and swap
                             across {stats.trades_closed} closed trade{stats.trades_closed === 1 ? '' : 's'}
                             {stats.trades_open ? ` · ${stats.trades_open} open` : ''}
+                            {/* Said out loud only when it is actually true. The
+                                pip buckets and the money buckets are allowed to
+                                disagree -- a trade that gained a pip and paid
+                                more than that in costs is a pip win and a money
+                                loss -- and a reader who spots it unexplained has
+                                to assume one of the two is wrong. */}
+                            {stats.pip_wins !== undefined && stats.pip_wins !== stats.wins
+                              ? ` · ${stats.pip_wins} of them up on pips: costs decided the difference`
+                              : ''}
+                            {/* Rows folded before the pips column existed and not
+                                yet re-read. “Re-read from MT5” on the Trade
+                                History page fills them in; without this the pip
+                                totals silently cover fewer trades than the
+                                money ones. */}
+                            {stats.pips_unknown
+                              ? ` · ${stats.pips_unknown} with no pip figure yet — re-read from MT5`
+                              : ''}
                           </p>
                         )}
                       </div>

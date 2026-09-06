@@ -53,6 +53,12 @@ const formatDate = (date: Date) => {
 const money = (n: number | null | undefined) =>
   n === null || n === undefined ? '—' : `${n < 0 ? '-' : ''}$${Math.abs(n).toFixed(2)}`;
 
+// Signed, and an em dash for absent rather than 0. A run stored before the
+// engine reported pips has none of these fields, and printing "0.0" for it
+// would claim the strategy captured no price movement.
+const pips = (n: number | null | undefined) =>
+  n === null || n === undefined ? '—' : `${n > 0 ? '+' : ''}${n.toFixed(1)}`;
+
 /** Read the stored form, migrating the single-symbol shape it used to have. */
 const initialForm = (stored: Partial<FormState>): FormState => {
   const symbols =
@@ -392,6 +398,21 @@ const BacktestPage = ({ prefs }: { prefs: PreferencesState }) => {
     new Date(run.created_at).toISOString().slice(0, 16).replace('T', ' ');
 
   const combined = !!result?.combined;
+  // Whether a pip is worth the same on every symbol in this run, read from
+  // /settings rather than written into the prose. It is $10 a lot on both
+  // configured symbols today -- a coincidence of their contract sizes, exactly
+  // like the equal $70 risk -- and a hardcoded sentence saying so would quietly
+  // become false the first time a third symbol is added.
+  const pipValueNote = useMemo(() => {
+    const values = (result?.symbols || [])
+      .map((s: string) => sizing[s]?.pip_value_per_lot)
+      .filter((v: any) => typeof v === 'number' && v > 0);
+    if (values.length !== (result?.symbols || []).length || !values.length) return null;
+    const same = values.every((v: number) => Math.abs(v - values[0]) < 1e-9);
+    return same
+      ? `One pip is worth $${values[0].toFixed(2)} per lot on each of them, so at equal lots the sum is comparable in money too — a coincidence of their contract sizes, not a rule.`
+      : 'A pip is worth a different amount on each of them, so this sum is movement only.';
+  }, [result, sizing]);
   const perSymbol: Array<[string, any]> = result
     ? (result.symbols || Object.keys(result.per_symbol || {})).map((s: string) => [
         s,
@@ -652,6 +673,39 @@ const BacktestPage = ({ prefs }: { prefs: PreferencesState }) => {
                 </span>
                 <span className="stat-value">{result.max_drawdown.toFixed(2)}%</span>
               </div>
+              {/* Pips sit next to the money, not instead of it. This engine is
+                  cost-free, so here the two agree in sign on every trade -- the
+                  reason to show both is that pips are blind to the lot size,
+                  which is what makes them comparable between two runs that
+                  sized differently. */}
+              <div className="stat">
+                <span
+                  className="stat-label"
+                  title="Total pips gained on trades that finished up"
+                >
+                  Pips won
+                </span>
+                <span className="stat-value positive">{pips(result.pips_won)}</span>
+              </div>
+              <div className="stat">
+                <span
+                  className="stat-label"
+                  title="Total pips given up on trades that finished down"
+                >
+                  Pips lost
+                </span>
+                <span className="stat-value negative">{pips(result.pips_lost)}</span>
+              </div>
+              <div className="stat">
+                <span className="stat-label">Net pips</span>
+                <span
+                  className={`stat-value ${
+                    (result.net_pips ?? 0) >= 0 ? 'positive' : 'negative'
+                  }`}
+                >
+                  {pips(result.net_pips)}
+                </span>
+              </div>
               <div className="stat">
                 <span className="stat-label">Scale-outs fired</span>
                 <span className="stat-value">{result.partials_fired}</span>
@@ -671,6 +725,19 @@ const BacktestPage = ({ prefs }: { prefs: PreferencesState }) => {
                 </div>
               )}
             </div>
+
+            {combined && (
+              <p className="note">
+                Pips are a <b>price distance</b>, so the combined figure adds
+                movement and not money:{' '}
+                {Object.entries(result.pips_by_symbol || {})
+                  .map(([s, v]) => `${s} ${pips(v as number)}`)
+                  .join(' · ')}
+                .{' '}
+                {pipValueNote ||
+                  'What one pip is worth differs by instrument, and the two can be sized differently in the same run.'}
+              </p>
+            )}
 
             {/* The engine has always returned this and the page has always dropped it.
                 It says the numbers above are optimistic, which is the single most
@@ -715,6 +782,14 @@ const BacktestPage = ({ prefs }: { prefs: PreferencesState }) => {
                   <th scope="col" className="num">Wins / losses</th>
                   <th scope="col" className="num">Win rate</th>
                   <th scope="col" className="num">P&L</th>
+                  <th
+                    scope="col"
+                    className="num"
+                    title="Pips won / pips lost — price distance, in this symbol's own pips"
+                  >
+                    Pips (won / lost)
+                  </th>
+                  <th scope="col" className="num">Net pips</th>
                   <th scope="col" className="num">Scale-outs</th>
                   <th scope="col" className="num">Own drawdown</th>
                 </tr>
@@ -732,6 +807,16 @@ const BacktestPage = ({ prefs }: { prefs: PreferencesState }) => {
                       <td className="num">{per.win_rate.toFixed(1)}%</td>
                       <td className={`num strong ${per.total_pl >= 0 ? 'positive' : 'negative'}`}>
                         {money(per.total_pl)}
+                      </td>
+                      <td className="num mono">
+                        {pips(per.pips_won)} / {pips(per.pips_lost)}
+                      </td>
+                      <td
+                        className={`num mono strong ${
+                          (per.net_pips ?? 0) >= 0 ? 'positive' : 'negative'
+                        }`}
+                      >
+                        {pips(per.net_pips)}
                       </td>
                       <td className="num">{per.partials_fired}</td>
                       <td className="num">{per.max_drawdown.toFixed(1)}%</td>
@@ -784,6 +869,7 @@ const BacktestPage = ({ prefs }: { prefs: PreferencesState }) => {
                   <th scope="col">Window</th>
                   <th scope="col" className="num">Balance</th>
                   <th scope="col" className="num">P&L</th>
+                  <th scope="col" className="num">Net pips</th>
                   <th scope="col" className="num">Win rate</th>
                   <th scope="col" className="num">Trades</th>
                   <th scope="col">Engine</th>
@@ -822,6 +908,20 @@ const BacktestPage = ({ prefs }: { prefs: PreferencesState }) => {
                       <td className="num">${run.initial_balance.toFixed(0)}</td>
                       <td className={`num ${run.status === 'error' ? '' : (r.total_pl ?? 0) >= 0 ? 'positive' : 'negative'}`}>
                         {run.status === 'error' ? '—' : money(r.total_pl ?? 0)}
+                      </td>
+                      {/* An em dash for a run stored before the engine reported
+                          pips, which is what `pips()` gives an undefined -- not
+                          a 0 that would read as a flat strategy. */}
+                      <td
+                        className={`num mono ${
+                          run.status === 'error' || r.net_pips === undefined
+                            ? ''
+                            : r.net_pips >= 0
+                            ? 'positive'
+                            : 'negative'
+                        }`}
+                      >
+                        {run.status === 'error' ? '—' : pips(r.net_pips)}
                       </td>
                       <td className="num">
                         {run.status === 'error' ? '—' : `${(r.win_rate ?? 0).toFixed(1)}%`}

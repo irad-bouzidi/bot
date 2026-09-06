@@ -92,6 +92,42 @@ def compute_metrics(ledger, equity, initial_balance, periods_per_year=252):
     m["largest_loss"] = float(r.min()) if n else 0.0
     m["roi_pct"] = 100.0 * m["total_pl"] / initial_balance if initial_balance else 0.0
 
+    # Pips -- the price distance captured, gross of costs and blind to size.
+    #
+    # Bucketed by the sign of the PIPS, not by the sign of the money, so
+    # `pips_won` is never negative and `pips_lost` never positive. `pip_wins` /
+    # `pip_losses` are reported beside them because the two splits genuinely
+    # differ: a trade that gained half a pip and paid a spread wider than that
+    # is a pip win and a money loss, and this engine models the spread. Printing
+    # one set of counts over both would make the other a silent contradiction.
+    #
+    # All None when the run had no pip defined (BacktestConfig.pip_size == 0),
+    # rather than 0.0: a report that says "0 pips" for an unconfigured symbol
+    # reads as a flat result instead of an absent measurement.
+    pips = closed["pips"].values if (n and "pips" in closed) else np.array([])
+    # `pip_size` and not just a non-empty column: an all-zero `pips` is what a
+    # run with no pip defined produces AND what a run of perfectly flat trades
+    # would, and only the recorded pip size tells the two apart.
+    has_pips = bool(len(pips)) and (
+        "pip_size" in closed and float(closed["pip_size"].max()) > 0)
+    if has_pips:
+        pip_win_mask, pip_loss_mask = pips > 0, pips < 0
+        m["pips_won"] = float(pips[pip_win_mask].sum())
+        m["pips_lost"] = float(pips[pip_loss_mask].sum())
+        m["net_pips"] = float(pips.sum())
+        m["pip_wins"] = int(pip_win_mask.sum())
+        m["pip_losses"] = int(pip_loss_mask.sum())
+        m["avg_win_pips"] = float(pips[pip_win_mask].mean()) if pip_win_mask.any() else 0.0
+        m["avg_loss_pips"] = float(pips[pip_loss_mask].mean()) if pip_loss_mask.any() else 0.0
+        m["avg_pips"] = float(pips.mean())
+        m["largest_win_pips"] = float(pips.max())
+        m["largest_loss_pips"] = float(pips.min())
+    else:
+        for k in ("pips_won", "pips_lost", "net_pips", "pip_wins", "pip_losses",
+                  "avg_win_pips", "avg_loss_pips", "avg_pips",
+                  "largest_win_pips", "largest_loss_pips"):
+            m[k] = None
+
     # Expectancy in R -- the scale- and symbol-free number worth comparing.
     if n and "pnl_r" in closed:
         rr = closed["pnl_r"].values

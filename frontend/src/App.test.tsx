@@ -47,9 +47,12 @@ const sizing = (symbol: string, pip: number, slPips: number, tpPips: number) => 
   locked: false,
 });
 
+// The pip COUNTS are identical across the two symbols and the pip SIZES are
+// not: $1 of gold is 10 pips, $100 of Bitcoin is 10 pips. That is what makes
+// 70 x 0.1 = $7.00 of gold and 70 x 10.0 = $700 of Bitcoin both a 70-pip stop.
 const settings = {
   XAUUSDm: sizing('XAUUSDm', 0.1, 70, 100),
-  BTCUSDm: sizing('BTCUSDm', 1.0, 700, 1000),
+  BTCUSDm: sizing('BTCUSDm', 10.0, 70, 100),
 };
 
 /** One bot's /stats card. */
@@ -66,6 +69,9 @@ const bot = (symbol: string, close: number) => ({
   losses: 0,
   total_pl: 0,
   max_drawdown: 0,
+  pips_won: 0,
+  pips_lost: 0,
+  net_pips: 0,
   persisted: true,
 });
 
@@ -509,6 +515,10 @@ const storedTrade = {
   swap: -0.04,
   fee: 0,
   net_profit: 12.4,
+  // A SHORT that made money: 4485.183 -> 4479.196 is +5.987 of price, and gold's
+  // pip is 0.1, so +59.9 pips. Signed by the trade's own direction -- an
+  // unsigned `exit - entry` would render this winner as -59.9.
+  pips: 59.87,
 };
 
 /** mockApi, plus canned bodies for the routes a given test needs to control. */
@@ -648,6 +658,50 @@ test('Stop is immediate with no position, and confirms when one is open', async 
   const dialog = await screen.findByRole('alertdialog');
   expect(dialog).toHaveTextContent(/does not close the 1 open position/i);
   expect(held.seen.some(c => c.url.includes('/control'))).toBe(false);
+});
+
+test('the trade history reports the pip result of a winning short', async () => {
+  // Pips are GROSS -- the column sits left of Costs and Net for exactly that
+  // reason -- and they carry the trade's own sign, so a profitable short is
+  // positive here. Rendering `exit - entry` unsigned would show this winner as
+  // a loss while the money column stayed right, which is the failure that is
+  // hardest to notice.
+  const { fetchMock } = mockApiWith({ theme: 'light', view: 'trades' }, [
+    ['/trades/512300', { position_id: 512300, deals: [] }],
+    ['/trades', { trades: [storedTrade], total: 1, limit: 50, offset: 0 }],
+  ]);
+  global.fetch = fetchMock as any;
+
+  render(<App />);
+
+  await screen.findByText('Trade History');
+  expect(await screen.findByText('+59.9')).toBeInTheDocument();
+  expect(screen.getByRole('columnheader', { name: 'Pips' })).toBeInTheDocument();
+});
+
+test('a trade with no pip figure shows a dash, not a flat zero', async () => {
+  // NULL happens for real: the row was folded before the column existed and has
+  // not been re-read from MT5. "0.0" would report it as a trade that closed
+  // exactly flat, which is a claim about a measurement that was never taken.
+  const { fetchMock } = mockApiWith({ theme: 'light', view: 'trades' }, [
+    ['/trades/512300', { position_id: 512300, deals: [] }],
+    [
+      '/trades',
+      {
+        trades: [{ ...storedTrade, pips: null }],
+        total: 1,
+        limit: 50,
+        offset: 0,
+      },
+    ],
+  ]);
+  global.fetch = fetchMock as any;
+
+  render(<App />);
+
+  await screen.findByText('Trade History');
+  await waitFor(() => expect(screen.queryByText('+59.9')).toBeNull());
+  expect(screen.queryByText('0.0')).toBeNull();
 });
 
 test('a trade row expands from the keyboard and reports whether it is open', async () => {

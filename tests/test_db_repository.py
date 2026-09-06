@@ -203,7 +203,7 @@ def test_the_schema_is_re_runnable_against_an_existing_database():
     repo.apply_schema()
     repo.apply_schema()
 
-    assert repo.schema_version() >= 3
+    assert repo.schema_version() >= 4
     with repo.cursor() as cur:
         # A single %, not %%: psycopg2 only unescapes when arguments are passed,
         # and this execute() has none.
@@ -292,6 +292,165 @@ def test_a_scaled_out_trade_is_one_row_not_two():
     stats = repo.trade_stats("XAUUSDm")
     assert (stats["trades_closed"], stats["wins"], stats["losses"]) == (1, 1, 0)
     assert stats["scaled_out"] == 1
+
+
+# ---------------------------------------------------------------------------
+# pips -- the fold's other derived column
+# ---------------------------------------------------------------------------
+
+def test_pips_come_from_the_symbols_own_definition():
+    """$1 of gold is 10 pips (SYMBOL_CONFIG's 0.1). 3300 -> 3310 is 100."""
+    repo.upsert_deals([
+        deal(40, "in", "buy", 0.1, 3300.0, at=datetime(2026, 1, 1, 10, 0)),
+        deal(40, "out", "sell", 0.1, 3310.0, profit=100.0,
+             at=datetime(2026, 1, 1, 11, 0)),
+    ])
+    repo.rebuild_trades("XAUUSDm")
+    assert one_trade()["pips"] == pytest.approx(100.0)
+
+
+def test_a_winning_short_reports_POSITIVE_pips():
+    """The sign is the TRADE's, taken from the entry deal. A short is closed by
+    a buy, so reading direction off the exit -- or off `exit - entry` unsigned
+    -- reports every profitable short as a loss while its P&L stays right."""
+    repo.upsert_deals([
+        deal(41, "in", "sell", 0.1, 3310.0, at=datetime(2026, 1, 1, 10, 0)),
+        deal(41, "out", "buy", 0.1, 3300.0, profit=100.0,
+             at=datetime(2026, 1, 1, 11, 0)),
+    ])
+    repo.rebuild_trades("XAUUSDm")
+    t = one_trade()
+    assert t["side"] == "short"
+    assert t["pips"] == pytest.approx(100.0)
+
+
+def test_a_scaled_out_trade_reports_the_distance_the_position_travelled():
+    """Half out at +5.00, the runner scratched at entry: 25 pips, not 50.
+
+    Volume-weighted through `exit_price`, the same basis the price column uses.
+    Counting each leg in full would report a trade that gave back its runner as
+    a 50-pip winner.
+    """
+    repo.upsert_deals([
+        deal(42, "in", "buy", 0.1, 3300.0, at=datetime(2026, 1, 1, 10, 0)),
+        deal(42, "out", "sell", 0.05, 3305.0, profit=25.0,
+             at=datetime(2026, 1, 1, 10, 30)),
+        deal(42, "out", "sell", 0.05, 3300.0, profit=0.0,
+             at=datetime(2026, 1, 1, 11, 0)),
+    ])
+    repo.rebuild_trades("XAUUSDm")
+    assert one_trade()["pips"] == pytest.approx(25.0)
+
+
+def test_an_unexited_position_has_no_pip_figure_rather_than_zero():
+    """NULL and not 0. Nothing has been closed, so there is no distance -- and a
+    0 would render as a trade that finished exactly flat."""
+    repo.upsert_deals([
+        deal(43, "in", "buy", 0.1, 3300.0, at=datetime(2026, 1, 1, 10, 0)),
+    ])
+    repo.rebuild_trades("XAUUSDm")
+    t = one_trade()
+    assert t["status"] == "open"
+    assert t["pips"] is None
+
+
+def test_a_symbol_with_no_pip_defined_gets_NULL_not_golds_arithmetic():
+    """The reporting-side mirror of the live path refusing an unconfigured
+    symbol. Gold's 0.1 applied to an $81,000 instrument would report a 700.00
+    move as 7,000 pips -- a plausible number for a rule nobody configured."""
+    repo.upsert_deals([
+        deal(44, "in", "buy", 0.1, 1.1000, symbol="EURUSDm",
+             at=datetime(2026, 1, 1, 10, 0)),
+        deal(44, "out", "sell", 0.1, 1.1050, symbol="EURUSDm", profit=50.0,
+             at=datetime(2026, 1, 1, 11, 0)),
+    ])
+    repo.rebuild_trades("EURUSDm")
+    t = one_trade("EURUSDm")
+    assert t["status"] == "closed"
+    assert t["pips"] is None
+
+
+def test_pip_buckets_are_signed_by_pips_and_can_disagree_with_the_money():
+    """A trade that gained a pip and lost it to costs is a pip WIN and a money
+    LOSS. Both counts are returned so the divergence is visible rather than
+    making whichever set is printed alone look wrong."""
+    repo.upsert_deals([
+        deal(45, "in", "buy", 0.1, 3300.0, commission=-0.7,
+             at=datetime(2026, 1, 1, 10, 0)),
+        deal(45, "out", "sell", 0.1, 3300.1, profit=1.0, commission=-0.7,
+             at=datetime(2026, 1, 1, 11, 0)),
+    ])
+    repo.rebuild_trades("XAUUSDm")
+
+    t = one_trade()
+    assert t["pips"] == pytest.approx(1.0)
+    assert t["net_profit"] == pytest.approx(-0.4)
+
+    stats = repo.trade_stats("XAUUSDm")
+    assert (stats["wins"], stats["losses"]) == (0, 1)
+    assert (stats["pip_wins"], stats["pip_losses"]) == (1, 0)
+    assert stats["pips_won"] == pytest.approx(1.0)
+    assert stats["pips_lost"] == pytest.approx(0.0)
+
+
+def test_the_pip_totals_add_up_and_the_lost_side_is_negative():
+    """`net_pips` is the two SUMMED, so nothing has to remember which way round
+    a subtraction goes -- the same convention `avg_loss` uses for money."""
+    repo.upsert_deals([
+        deal(46, "in", "buy", 0.1, 3300.0, at=datetime(2026, 1, 1, 10, 0)),
+        deal(46, "out", "sell", 0.1, 3310.0, profit=100.0,
+             at=datetime(2026, 1, 1, 11, 0)),
+        deal(47, "in", "buy", 0.1, 3300.0, at=datetime(2026, 1, 2, 10, 0)),
+        deal(47, "out", "sell", 0.1, 3293.0, profit=-70.0,
+             at=datetime(2026, 1, 2, 11, 0)),
+    ])
+    repo.rebuild_trades("XAUUSDm")
+
+    stats = repo.trade_stats("XAUUSDm")
+    assert stats["pips_won"] == pytest.approx(100.0)
+    assert stats["pips_lost"] == pytest.approx(-70.0)
+    assert stats["net_pips"] == pytest.approx(30.0)
+    assert stats["avg_win_pips"] == pytest.approx(100.0)
+    assert stats["avg_loss_pips"] == pytest.approx(-70.0)
+    assert stats["pips_unknown"] == 0
+
+
+def test_a_closed_trade_with_no_pip_figure_is_counted_and_reported():
+    """`pips_unknown` exists so the pip sums can be read as covering every
+    closed trade or explicitly not -- a row folded before the column existed and
+    not yet re-read is silently missing from them otherwise."""
+    repo.upsert_deals([
+        deal(48, "in", "buy", 0.1, 3300.0, at=datetime(2026, 1, 1, 10, 0)),
+        deal(48, "out", "sell", 0.1, 3310.0, profit=100.0,
+             at=datetime(2026, 1, 1, 11, 0)),
+    ])
+    repo.rebuild_trades("XAUUSDm")
+    with repo.cursor() as cur:
+        cur.execute("UPDATE trades SET pips = NULL WHERE position_id = 48")
+
+    stats = repo.trade_stats("XAUUSDm")
+    assert stats["trades_closed"] == 1 and stats["wins"] == 1
+    assert stats["pips_unknown"] == 1
+    assert stats["net_pips"] == pytest.approx(0.0)
+
+
+def test_a_re_fold_fills_in_a_pip_figure_a_migration_could_not():
+    """Version 4 adds the column NULL and there is no backfill UPDATE -- the pip
+    size lives in SYMBOL_CONFIG, not in schema.sql. Re-folding is what fills it,
+    which is why reconcile_all(full=True) on every boot is the whole migration
+    path for this column."""
+    repo.upsert_deals([
+        deal(49, "in", "buy", 0.1, 3300.0, at=datetime(2026, 1, 1, 10, 0)),
+        deal(49, "out", "sell", 0.1, 3310.0, profit=100.0,
+             at=datetime(2026, 1, 1, 11, 0)),
+    ])
+    repo.rebuild_trades("XAUUSDm")
+    with repo.cursor() as cur:
+        cur.execute("UPDATE trades SET pips = NULL WHERE position_id = 49")
+    assert one_trade()["pips"] is None
+
+    repo.rebuild_trades("XAUUSDm")
+    assert one_trade()["pips"] == pytest.approx(100.0)
 
 
 def test_a_partially_closed_position_is_still_open_and_undated():
