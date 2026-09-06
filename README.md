@@ -33,6 +33,18 @@ This bot places **real market orders**. Read this section before running it.
   factor on the held-out final third** — a seven-fold collapse. Read that as the
   answer to "which parameters should we ship": on this data, a configuration
   chosen in-sample carries no information about the next period.
+- **The strategy's premise does not hold on this data, and that is a stronger
+  result than the sweep.** Three measurements that involve no stop, no target and
+  no cost model agree. *Gross of every cost* gold still loses $13,133 (profit
+  factor 0.86) while Bitcoin makes $221 (1.01) — so costs are the whole
+  explanation on Bitcoin and none of it on gold. The *variance ratio* of gold's
+  log returns is 0.97–1.06 at every horizon this strategy trades, i.e. a random
+  walk to three decimal places: there is no reversion on gold to harvest, so no
+  filter or geometry can find one. And an *event study* of the band touch itself,
+  with the execution rules stripped away, shows the drift-adjusted edge flipping
+  sign between 2-year blocks on both symbols in both directions. The one
+  real-looking effect — gold M5 long-side, 2025–26 — is the bull run, not
+  reversion. Details and the full tables are in `CLAUDE.md`.
 - **Both configured symbols backtest NEGATIVE.** Shipped config, central costs,
   0.1 lots on $1,000, full cached M5 span, on the engine that resolves the entry
   bar: gold -$24,181 (-0.12R) and Bitcoin -$3,429 (-0.04R). Bitcoin is the less
@@ -58,9 +70,13 @@ This bot places **real market orders**. Read this section before running it.
   against its stop. It is editable from the dashboard — which shows the dollar
   risk as you type — and persisted. Equity-based sizing (`risk_pct`) now exists
   and ships OFF; it is quantised away on a small account, because the broker's
-  smallest position already risks $7 on gold, which is 0.23% of $3,000. There is
-  still no live daily or weekly loss cap and no margin check — those exist in the
-  research engine only.
+  smallest position already risks $7 on gold, which is 0.23% of $3,000. Below that
+  floor every entry is **skipped**, never rounded up. There is still no live daily
+  or weekly loss cap, no consecutive-loss cooldown, no equity floor and no margin
+  check — those exist in `backend/backtest/risk.py`, which the research engine
+  uses and the live loop does not. And sizing cannot rescue a negative edge in any
+  case: expectancy stays flat at −0.12R across every risk fraction tested, because
+  sizing scales the outcome without touching the edge.
   This configuration produced runs of 9-11 consecutive losses in backtest — about
   $630-770 — at roughly 5.5 trades per day. Note that "0.1 lots" means a completely
   different dollar risk on another instrument: the risk is set by the contract
@@ -87,8 +103,13 @@ against that mean, scaled by `MULT`.
   switch in the dashboard's *Exit rules* block.
 - **Scale-out** — at half the target in profit, `partial_fraction` of the
   position is closed and the stop is pulled to entry, so the remainder runs at
-  no risk. Measured on cached data this *lowers* expectancy (see below); it is
-  configuration, not a recommendation.
+  no risk. It is enabled because it was asked for, not because the data supports
+  it: the measurement that used to be quoted here was produced before the
+  entry-bar fix and has been withdrawn, and the scale-out is the rule that bias
+  touched hardest, since its trigger is reached on the entry bar in about a third
+  of gold's trades. It clips winners and does nothing for trades that run
+  straight to the stop. Configuration, not a recommendation — re-measure before
+  concluding anything about it.
 
 **What actually happens in practice matters here, and it is not what the band
 geometry suggests.** With the centre-line exit off — the shipped default — the
@@ -133,8 +154,11 @@ theme and form values (previously `localStorage`). The bar cache stays in
 `data/*.csv.gz`: the research stack must keep running with no database at all.
 
 Exactly two modules import `MetaTrader5` — `backend/data/mt5_source.py` (reads)
-and `backend/execution/` (writes). Everything else is importable and testable
-without a terminal.
+and `backend/bot_manager.py` (the live loop; reads and writes). Everything else is
+importable and testable without a terminal. `backend/execution/`, `backend/live/` and
+`backend/risk/` are **empty placeholder packages** for pulling order-sending out of
+`bot_manager.py`; nothing lives in them yet, and the research risk layer is
+`backend/backtest/risk.py`, which is a different thing in a different place.
 
 ```
 backend/
@@ -147,7 +171,10 @@ backend/
   strategy/nw_envelope.py       The strategy — shared by live and backtest
   data/                         MarketData abstraction, csv.gz cache, snapshot CLI
   backtest/                     Engine, cost model, trade ledger, metrics
+  backtest/risk.py              Risk sizing + daily/streak/equity caps (all off by default)
   scripts/run_baseline.py       Baseline performance report
+  scripts/sweep.py              Parameter grid + train/holdout split, one CSV row per cell
+  scripts/diagnose.py           Where the money went in a stored ledger
 frontend/src/
   App.tsx                       Dashboard
   BacktestPage.tsx              Backtester + stored run history
@@ -180,6 +207,7 @@ all read the same numbers instead of copying them.
 | `COOLDOWN_BARS` | `3` | Minimum closed bars between entries |
 | `partial_fraction` | `0.5` | Proportion closed at the scale-out trigger; the rest runs to TP |
 | `exit_at_mean` | `False` | Also close on a return to the centre line. Editable from the dashboard |
+| `risk_pct` | `0.0` | Percent of equity risked at the stop. `0` = size from `lot_size`. Editable from the dashboard |
 | `DEVIATION_POINTS` | `20` | Max slippage tolerated on a market order |
 | `MAGIC_NUMBER` | `123456` | Identifies this bot's positions |
 | `TIMEFRAME` | `M5` | Chart timeframe |
@@ -214,22 +242,31 @@ Adding a third symbol is one `SYMBOL_CONFIG` entry — the dashboard reads its
 symbol list from `/settings` — but re-derive its dollar risk from the contract
 size and back-test it before funding it.
 
-`lot_size`, `partial_fraction` and `exit_at_mean` are also editable at runtime from the
-dashboard and are persisted to the `symbol_settings` table, so a restart does not quietly
-restore a size you lowered or a rule you switched off. Every other key is code-only.
+`lot_size`, `partial_fraction`, `exit_at_mean` and `risk_pct` are the four keys editable
+at runtime from the dashboard, and they are persisted to the `symbol_settings` table, so a
+restart does not quietly restore a size you lowered or a rule you switched off. Every
+other key is code-only.
 
 The **Position sizing** panel takes **lots** (0.1 and 0.05); the scale-out is stored as the
 resulting share of the position, so it keeps meaning "half" if you later change the lot
 size. The centre-line exit is a switch in the **Exit rules** block just below it.
 
-**Sizing** edits are refused while the bot holds a position, because `manage_position()`
-infers whether the scale-out has already fired from the position's volume against
-`lot_size` — change it mid-trade and an already-reduced position looks untouched and is
-scaled out twice. The **exit rule** is *not* refused then: it takes part in no such
-inference, and the moment you reach for that switch is while a trade is running. Either
-way an edit the database will not accept is refused rather than applied in memory. Every
-change is appended to `settings_audit`, which the dashboard shows under **Show sizing
-history**; rows written before the flag existed show it as unknown rather than guessing.
+**Sizing** edits — `lot_size`, the scale-out, and `risk_pct` — are refused while the bot
+holds a position. The **exit rule** is *not*, because it sizes nothing and the moment you
+reach for that switch is while a trade is running.
+
+The refusal used to be a correctness guard: `manage_position()` inferred whether the
+scale-out had already fired by comparing the position's volume against `lot_size`, so
+changing the size mid-trade made an already-reduced position look untouched and scaled it
+out twice. **That inference is gone** — the guard now reads the position's own entry deal
+out of the `deals` table, so it does not depend on the configured size at all. What the
+refusal buys today is that a running trade keeps being described by the numbers it was
+opened with; it is a legibility guarantee rather than a correctness one.
+
+Either way an edit the database will not accept is refused rather than applied in memory.
+Every change is appended to `settings_audit`, which the dashboard shows under **Show
+sizing history**; rows written before a column existed show it as unknown rather than
+guessing.
 
 Server settings come from the environment:
 
@@ -421,10 +458,20 @@ also:
 cover several symbols at once. Existing rows are backfilled with their single
 symbol, so nothing needs re-creating — run `migrate` and the columns appear.
 
+**Schema version 3** adds `symbol_settings.exit_at_mean`. This one **does** change how
+the bot trades: the centre-line exit was unconditional before it and ships off after it,
+so `python -m backend.db.migrate` is what actually switches it off. The container's
+init-directory mount will not do it — Postgres ignores that directory once the volume
+exists.
+
 **Schema version 4** adds `trades.pips`. It changes nothing about how the bot
 trades, but the reporting queries name the column, so the API refuses to boot
 against a database still at version 3 — run `migrate`. The column arrives empty
 and is filled by the first full reconcile, which happens on the next API start.
+
+**Schema version 5** adds `symbol_settings.risk_pct`. It ships as `0`, meaning "size from
+`lot_size`", so applying it changes no behaviour — but `load_settings()` names the
+column, so the API refuses to boot against a database still at version 4. Run `migrate`.
 
 `python -m backend.db.migrate --check` reports connectivity and schema version
 and changes nothing.
@@ -535,6 +582,30 @@ together; this script cannot, because a report here is the basis for a decision
 about a strategy *on an instrument*, and averaging two instruments' edges is how
 a losing one hides behind a winning one. Run it twice and compare.
 
+**3. Sweep a grid, with a held-out window (anywhere, offline):**
+
+```bash
+python -m backend.scripts.sweep --symbols XAUUSDm,BTCUSDm --timeframes M5,M15,M30,H1     --param sl_pips=70,90,110,130,150 --param tp_pips=100,140,180,220
+```
+
+One tidy CSV row per cell and never a ledger. Three things make it harder to fool
+yourself with than a plain grid search: the geometry is specified in pip **counts** shared
+across symbols, so a cell that gave two instruments different geometry is not expressible;
+the objective is a **t-statistic** (`expectancy_r / expectancy_r_se`), so a spectacular
+result on twelve trades cannot win; and ranking is on the **neighbourhood**, so a cell
+that beats its own neighbours is visible as the spike it is rather than as a winner.
+Every row carries both the training and the held-out column — read the held-out one.
+
+**4. Find out where the money went in any stored ledger:**
+
+```bash
+python -m backend.scripts.diagnose data/reports/XAUUSDm_20260906_152553_ledger.csv
+```
+
+It leads with the **bars-held histogram** on purpose: a spike at 0 or 1 bars is the
+fingerprint of an execution rule resolving on the wrong bar, and it is the diagnostic that
+would have caught the entry-bar blind spot years earlier.
+
 ---
 
 ## 🚀 Running the Bot
@@ -578,7 +649,7 @@ is carried over, then leaves the database value alone on every later run.
 
 ```bash
 python -m pytest                                     # should pass
-python -m backend.db.migrate --check                 # schema version 2
+python -m backend.db.migrate --check                 # schema version 5
 python -m backend.data.snapshot --symbol XAUUSDm --spec-only
 python -m backend.data.snapshot --symbol BTCUSDm --spec-only
 ```
@@ -656,9 +727,13 @@ Press **Stop** to halt. The bot finishes its current cycle within about a second
 - [ ] `BOT_HOST` is `127.0.0.1`
 - [ ] `lot_size` is sized for your account — 0.1 risks ~$70 per gold trade, so a
       12-loss streak is ~$840. Check it in the dashboard's Position sizing panel,
-      which shows the dollar risk; `data/settings.json` may hold a value that
-      differs from the `SYMBOL_CONFIG` default
-- [ ] You know the bot has no daily loss limit — monitor it
+      which shows the dollar risk. The live value comes from `symbol_settings` in
+      Postgres, not from `SYMBOL_CONFIG` and not from `data/settings.json`, which is
+      no longer read at runtime
+- [ ] You know the bot has **no daily loss limit, no weekly loss limit, no
+      consecutive-loss cooldown, no equity floor and no margin check**. Those exist in
+      the research engine (`backend/backtest/risk.py`) and are not wired into the live
+      loop — monitor it yourself
 - [ ] Backend log is visible; it is where order rejections appear
 
 ---

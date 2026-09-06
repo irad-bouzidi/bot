@@ -21,8 +21,8 @@ python -m backend.db.migrate --check     # report connectivity/version, change n
 python -m pytest
 python -m pytest tests/test_backtest_engine.py::test_intrabar_stop_is_detected_even_when_close_recovers
 python -m pytest -k lookahead
-python -m pytest tests/test_db_repository.py   # needs the db container up (32 tests)
-npm test --prefix frontend               # CRA/jest; App.test.tsx (17 tests)
+python -m pytest tests/test_db_repository.py   # needs the db container up (46 tests)
+npm test --prefix frontend               # CRA/jest; App.test.tsx (25 tests)
 
 # Run -- the API needs BOTH a live MT5 terminal and a reachable Postgres
 python -m backend.main                   # FastAPI on 127.0.0.1:8000
@@ -41,6 +41,18 @@ python -m backend.scripts.run_baseline --symbol BTCUSDm --start 2025-09-01
 # the rule ON:
 python -m backend.scripts.run_baseline --symbol XAUUSDm --exit-at-mean
 python -m backend.scripts.run_baseline --symbol XAUUSDm --no-exit-at-mean
+# Costs the default run now charges, and the two flags that switch them off.
+# --slippage-stop defaults to ONE TYPICAL SPREAD of the instrument, and swap
+# comes from the spec sidecar; no report written before 2026-09-06 had either.
+python -m backend.scripts.run_baseline --symbol BTCUSDm --slippage-stop 0 --no-swap
+# The risk layer. ALL OFF by default, and off is a byte-for-byte no-op.
+python -m backend.scripts.run_baseline --symbol XAUUSDm --risk-pct 0.5 --min-equity 100
+# Grid + train/holdout split (one CSV row per cell, never a ledger), and
+# where the money went in a stored ledger. See "Sweeps, walk-forward and
+# ledger diagnosis" below -- these are how sections 11 and 16 of the brief
+# are actually implemented.
+python -m backend.scripts.sweep --symbols XAUUSDm --timeframes M5,H1 --param sl_pips=70,110,150
+python -m backend.scripts.diagnose data/reports/XAUUSDm_20260906_152553_ledger.csv
 # --sl/--tp are PRICE units, SYMBOL_CONFIG is pip COUNTS times a per-symbol pip.
 # They now DEFAULT from backend/core/symbols.py -- gold 70x0.1 -> 7/10, Bitcoin
 # 70x10.0 -> 700/1000 -- and the chosen numbers are printed at the top of the
@@ -75,8 +87,11 @@ python -m backend.data.snapshot --symbol XAUUSDm --verify 2026-07
 ## Architecture
 
 The project assumes **two machines**: MT5 is Windows-only and needs a logged-in terminal;
-nothing else does. `data/` (gitignored, but populated here) is the handoff — snapshot on
-the trading host, copy it over, and all research runs offline and reproducibly.
+nothing else does. `data/` is the handoff — snapshot on the trading host, copy it over,
+and all research runs offline and reproducibly. It is **committed**, not gitignored:
+the bar cache, the contract sidecars, the stored reports and the sweep outputs are all
+in the tree, which is what makes a quoted number in this file checkable against the run
+that produced it.
 
 **Three tiers now, not two.** The API and the bot threads run on the MT5 host;
 the dashboard and Postgres run in containers (`docker-compose.yml` at the repo
@@ -104,7 +119,11 @@ stay importable without a terminal — `tests/test_indicators_nw.py::test_import
 guards part of this. Do not add an MT5 import anywhere else. (`requirements.txt` and the
 README refer to `backend/execution/mt5_broker.py`; that file does not exist yet —
 `backend/execution/`, `backend/live/` and `backend/risk/` are empty placeholder packages
-for the intended extraction of order-sending out of `bot_manager.py`.)
+for the intended extraction of order-sending out of `bot_manager.py`.) Note the research
+risk layer is `backend/backtest/risk.py` and deliberately **not** the empty
+`backend/risk/` package: `tests/test_db_invariants.py` parametrises the
+"may not import `backend.db` or MetaTrader5" guard over `backtest`, so keeping it there
+keeps it guarded.
 
 ### Two parallel implementations exist — know which one you are touching
 
@@ -119,7 +138,8 @@ This is the most important thing to understand before editing.
 | P&L | `price_diff * lot_size * profit_mult` | `SymbolSpec.pl()` from real tick value |
 | Config | `SYMBOL_CONFIG` (`backend/core/symbols.py`), pip counts; sizing from Postgres | `NWConfig` + `BacktestConfig`, price units |
 | Storage | Postgres (`backend/db/`) | `data/` files only — never Postgres |
-| Sizing | `SYMBOL_CONFIG["lot_size"]` / `"partial_fraction"`, editable via `POST /settings` | `BacktestConfig.volume` / `NWConfig.partial_fraction`, CLI flags |
+| Sizing | `SYMBOL_CONFIG["lot_size"]` / `"partial_fraction"` / `"risk_pct"`, editable via `POST /settings` | `BacktestConfig.volume` / `NWConfig.partial_fraction` / `RiskConfig.risk_pct_per_trade`, CLI flags |
+| Risk caps | **none** — no daily loss cap, no consecutive-loss cooldown, no equity floor, no margin check | `RiskConfig` (`backend/backtest/risk.py`), all off by default |
 | Centre-line exit | `TradingBot._mean_reversion_exit`, gated on `SYMBOL_CONFIG["exit_at_mean"]` from Postgres | `NWEnvelopeStrategy.on_bar`, gated on `NWConfig.exit_at_mean` — **both default OFF** |
 
 `POST /backtest` (used by the frontend Backtest page) still runs the **legacy** engine, so
@@ -172,6 +192,17 @@ Storage: `backtest_runs` gains `symbols TEXT[]` and `sizing JSONB` (schema versi
 matches on the array too, so a combined run appears under either symbol's filter -- it is
 a fact about both.
 
+**Schema version 5** adds `symbol_settings.risk_pct` plus the two matching
+`settings_audit` columns. Unlike version 3 it changes **no** behaviour: the column ships
+as 0, which means "size from `lot_size`", so an existing row keeps trading exactly as it
+did. `REQUIRED_SCHEMA_VERSION` moved to 5 anyway, for the same mechanical reason as
+version 4 -- `load_settings()` NAMES the column, so a database left at 4 would fail inside
+`_load_settings()` with a psycopg2 `UndefinedColumn`. It is also the first column with a
+CHECK constraint applied to **existing** volumes: Postgres has no
+`ADD CONSTRAINT IF NOT EXISTS`, so `schema.sql` uses the idempotent
+`DROP CONSTRAINT IF EXISTS` + `ADD CONSTRAINT` pair, which
+`tests/test_db_invariants.py` allows by name.
+
 **Schema version 4** adds `trades.pips`. It changes no behaviour and no money figure,
 but `list_trades()` and `trade_stats()` NAME the column, so a database left at version 3
 fails `/trades` with a psycopg2 `UndefinedColumn` -- which is why
@@ -205,8 +236,8 @@ matters is held in a process any more.
   `IF NOT EXISTS`, because the container path only runs on a fresh volume so
   re-runnability is the primary path.
 - `repository.py` — **all** the SQL. Two rules it exists to hold:
-  *the store cannot widen its own reach* (`load_settings` SELECTs exactly the two
-  `EDITABLE_KEYS` columns for exactly the symbols named, and validates both), and
+  *the store cannot widen its own reach* (`load_settings` SELECTs exactly the four
+  `EDITABLE_KEYS` columns for exactly the symbols named, and validates every one), and
   *aggregates are derived, never accumulated* (win/loss/P&L are SELECTs over
   `trades`, which is folded from `deals`, so nothing can drift).
 - `migrate.py` — `python -m backend.db.migrate`. Imports `data/settings.json`
@@ -231,7 +262,7 @@ which is strictly worse than a gap in the history. The gap is reported through
 
 | Table | Replaces | Note |
 |---|---|---|
-| `symbol_settings` | `data/settings.json` | the three `EDITABLE_KEYS` only; CHECK constraints refuse a bad value on the way *in*, which a file could not. `exit_at_mean` is BOOLEAN and needs none -- the type is the constraint |
+| `symbol_settings` | `data/settings.json` | the four `EDITABLE_KEYS` only; CHECK constraints refuse a bad value on the way *in*, which a file could not. `exit_at_mean` is BOOLEAN and needs none -- the type is the constraint |
 | `settings_audit` | nothing | append-only; the file overwrote its own history on every save |
 | `bot_state` | instance attributes | `desired_state` + the S4 `last_bar_time`/`last_entry_bar` |
 | `control_events` | nothing | every start/stop press, accepted or refused |
@@ -299,7 +330,22 @@ the button. `BOT_AUTO_RESUME=1` opts in.
   stops are live **from the fill**, entry bar included, and checked **intrabar** against
   high/low; a gap fills at the **gap price**, not the level; SL wins same-bar ties by
   default; drawdown comes from the **equity** curve. Changing any of these invalidates
-  every stored report in `data/reports/` — which has happened once, see below.
+  every stored report in `data/reports/` — which has happened once, see "The entry-bar
+  blind spot" immediately below.
+
+- `backend/data/cache.py` — `BarSet.warmup_count` + `eval_slice()`. Warm-up bars are
+  prepended *before* the requested range and excluded from evaluation; the engine iterates
+  from `warmup_count`. This exists because the old backtest silently lost the first ~998
+  bars of every window to NaN bands.
+- `backend/indicators/nadaraya_watson.py` — only the **non-repainting endpoint** branch of
+  the Pine source is implemented. Two traps called out in its docstring: the kernel must
+  **not** be reversed for `np.convolve`, and the denominator is always the **full-window**
+  weight sum even when truncated. `taps` is a speed knob, not a tunable.
+- `backend/backtest/risk.py` — `RiskConfig` + `size_for_risk()`. Sizing and the caps that
+  bound a losing run, all off by default; see "The risk layer" below for the four
+  decisions inside it that are not obvious.
+- Missing data raises `DataUnavailable` naming the exact `snapshot` command to run, never
+  silent NaNs.
 
 ### The entry-bar blind spot — the bias that made every stored number wrong
 
@@ -343,16 +389,6 @@ Two things fell out of the fix that are worth knowing:
 `_track_excursion` also moved to *before* the stop block, so the bar that closes a trade
 still contributes its range. Without that, a trade opening and closing on one bar would be
 written with a flat 0.0 MAE/MFE — and after this fix that is a third of them.
-- `backend/data/cache.py` — `BarSet.warmup_count` + `eval_slice()`. Warm-up bars are
-  prepended *before* the requested range and excluded from evaluation; the engine iterates
-  from `warmup_count`. This exists because the old backtest silently lost the first ~998
-  bars of every window to NaN bands.
-- `backend/indicators/nadaraya_watson.py` — only the **non-repainting endpoint** branch of
-  the Pine source is implemented. Two traps called out in its docstring: the kernel must
-  **not** be reversed for `np.convolve`, and the denominator is always the **full-window**
-  weight sum even when truncated. `taps` is a speed knob, not a tunable.
-- Missing data raises `DataUnavailable` naming the exact `snapshot` command to run, never
-  silent NaNs.
 
 ### Warm-up arithmetic
 
@@ -365,9 +401,13 @@ original code while Pine uses 499; the off-by-one is deliberate and configurable
 
 ### Live loop invariants (`bot_manager.py`)
 
-Each is a fix for a real incident, marked `S1`–`S10` in comments. **`S9` is retired**
-— it was the news blackout, now removed — and the number is deliberately left as a gap
-rather than reused, so an `S9` in an older comment or commit still means what it said:
+Each is a fix for a real incident. The numbering is a **documentation** convention, and
+only `S1` and `S3`–`S7` are actually written as markers in `bot_manager.py`; `S8`, `S10`
+and `S11` are described here and live inside the code they amend (the persisted `S4`
+guards, `_mean_reversion_exit()`, and the scale-out guard respectively). `S2` never
+existed. **`S9` is retired** — it was the news blackout, now removed — and the number is
+deliberately left as a gap rather than reused, so an `S9` in an older comment or commit
+still means what it said:
 
 - `bot_positions()` filters by `MAGIC_NUMBER` — the bot must never touch manually opened
   positions.
@@ -383,9 +423,10 @@ rather than reused, so an `S9` in an older comment or commit still means what it
 - `update_performance_stats()` scans 365 days of deal history over IPC — keep it out of
   the per-tick signal path (currently throttled to once a minute).
 - `S7`: `manage_position()` (scale-out + break-even) runs **every ~15s cycle**, not once
-  per bar, because the trigger is an intrabar event. It is stateless — it re-derives what
-  is still to do from the position's own volume and SL, so it survives restarts. Entries
-  and the mean-reversion exit remain gated per closed bar; do not move them.
+  per bar, because the trigger is an intrabar event. It holds no per-ticket state of its
+  own — it re-derives what is still to do from the position's SL and from what the
+  position opened with, so it survives restarts. Entries and the mean-reversion exit
+  remain gated per closed bar; do not move them.
 - `S8`: the S4 bar marks are now **persisted** (`bot_state`). They were instance
   attributes, so Stop-then-Start — or any restart — cleared the cooldown and the
   bot could enter again on the very bar it had just entered on, which is the
@@ -398,6 +439,15 @@ rather than reused, so an `S9` in an older comment or commit still means what it
   position is open, so the loop can genuinely race a save. And nothing in the suite drives
   `run()`, so for as long as it was six inlined lines, the rule deciding most of this
   strategy's exits had no test at all.
+- `S11`: "has the scale-out already fired?" is answered from the position's **own entry
+  deal** (`repository.opened_volume`, keyed on the broker's `position_id`), not from
+  `SYMBOL_CONFIG["lot_size"]`. The configured size is only a valid proxy while it is a
+  constant between trades, and it stopped being one the moment `risk_pct` could derive it
+  from equity — an already-reduced position would read as untouched and be scaled out a
+  second time. This needed no new state: `deals` is already keyed on the position and
+  already durable, so it is a SELECT rather than the per-ticket dict S7 refuses to carry
+  across restarts. When the read fails the scale-out is **skipped and the stop still
+  moves** — scaling out twice cannot be undone, skipping it costs part of one trade.
 
 ### Scale-out / break-even
 
@@ -448,7 +498,7 @@ behind it at all, because `exit_at_mean` was unreachable from the CLI until the 
 
 **The measured A/B that used to sit here has been STRUCK.** It compared two runs that
 were both produced by the engine's entry-bar blind spot (see "The entry-bar blind spot"
-below), on a window where 47% of gold's trades exited through the artifact — so the
+above), on a window where 47% of gold's trades exited through the artifact — so the
 direction it reported is not evidence about the rule. It shipped OFF on both symbols
 because one rule across both instruments was asked for, and that decision stands on its
 own; the numbers that were offered in support of it do not. Re-measure with
@@ -498,7 +548,8 @@ anything else holding the DSN can write rows the UI never could. `schema.sql` ad
 CHECK constraints as a second line of defence, refusing a bad value on the way
 **in**; the file store could only reject one on the way out, at the next load.
 
-Three things to keep straight about the third key, since it is the first non-float one:
+Three things to keep straight about the **third** key, `exit_at_mean`, since it is the
+first non-float one:
 
 - **It has no CHECK constraint, and that is not an omission.** `BOOLEAN NOT NULL`
   admits exactly two values, so for this column the *type* is the second line of
@@ -513,12 +564,28 @@ Three things to keep straight about the third key, since it is the first non-flo
   validated cleanly as 1.0 lots, ten times the shipped size, with every range check
   passing it. That hole did not exist until this function started seeing booleans.
 
+And three about the **fourth**, `risk_pct`, which is the first key that can size a real
+order without anyone touching `lot_size`:
+
+- **It is a PERCENT, so 1.0 means 1%,** and `MAX_RISK_PCT = 5.0` is the ceiling. The
+  ceiling is there to make the classic unit confusion unstorable: `0.5` meant as a
+  fraction is harmless, but `50` meant as "half" is refused instead of risking half the
+  account on one trade. The same bound is a CHECK constraint in `schema.sql`, so psql
+  cannot write what the API refuses.
+- **Its failure direction is NOT bounded**, unlike `exit_at_mean`. This is the key that
+  reintroduces everything the `lot_size` refusal exists for, which is why it counts as a
+  sizing edit and why it ships at 0.
+- **A size below `volume_min` is SKIPPED, never clamped up** — `_risk_sized_lots()`
+  returns `None` and the entry is dropped, matching `backend/backtest/risk.py`. Clamping
+  would risk *more* than asked precisely when the account is smallest. On this account
+  size that is not a corner case: see "Risk-% sizing barely functions on a small account".
+
 A `POST /settings` carrying only `exit_at_mean` is **accepted while a position is
-open**, unlike a sizing edit. The sizing refusal exists because `manage_position()`
-infers "has the scale-out fired?" from the position's volume against `lot_size`;
-this flag takes part in no such inference, and the moment someone reaches for it is
-while a trade is running and the centre line is closing in on it. Refusing it then
-would withhold the control in the only situation that motivates it.
+open**, unlike a sizing edit. That is the only key of the four that is. `risk_pct`
+travels with `lot_size` and `scale_out_lots` in `touches_sizing` and is refused with
+them; `exit_at_mean` removes an exit and sizes nothing, and the moment someone reaches
+for it is while a trade is running and the centre line is closing in on it. Refusing it
+then would withhold the control in the only situation that motivates it.
 
 The database is published on `127.0.0.1:5432` only, for the same reason
 `BOT_HOST` is loopback. `docker compose down -v` **deletes** the trade history
@@ -536,13 +603,24 @@ the volume was `docker_db-data`; carry it over rather than starting fresh:
 docker run --rm -v docker_db-data:/from:ro -v nw-bot-db-data:/to alpine sh -c 'cd /from && tar cf - . | (cd /to && tar xf -)'
 ```
 
-An edit is **refused while the bot holds a position**, under the same `_CONFIG_LOCK` that
-`open_trade()` holds across its `order_send`. This is not politeness:
-`manage_position()` decides "has the scale-out already fired?" by comparing the
-position's volume against `lot_size`, so lowering the size mid-trade makes an
-already-reduced position look untouched and scales it out twice. Remembering the size
-per ticket instead would need exactly the cross-restart state that S7 was written to
-avoid.
+A **sizing** edit is refused while the bot holds a position, under the same
+`_CONFIG_LOCK` that `open_trade()` holds across its `order_send`.
+
+**The original reason for that refusal is gone, and the refusal is not.** It existed
+because `manage_position()` decided "has the scale-out already fired?" by comparing the
+position's volume against `lot_size`, so lowering the size mid-trade made an
+already-reduced position look untouched and scaled it out twice. `S11` removed that
+inference — the guard now reads the position's own entry deal — and the objection that
+remembering the size per ticket would need the cross-restart state S7 avoids turned out
+to be answerable without any new state at all, because `deals` was already keyed on the
+position.
+
+What the refusal now protects is narrower and still worth having: the size a *running*
+trade was opened at is the size its scale-out and its risk were reasoned about, and
+changing the configured size — or switching `risk_pct` on — mid-trade produces a
+dashboard that describes a position that does not exist. It is a legibility guarantee
+now rather than a correctness one. If it is ever relaxed, `S11` is the invariant that
+has to keep holding, not this lock.
 
 ### Symbols
 
@@ -561,6 +639,7 @@ still holds a live reference into it and a size edit still reaches the thread.
 | `pip_value_per_lot` (derived) | $10 | $10 |
 | risk at the 0.1 default | ~$70 | ~$70 |
 | `exit_at_mean` | `False` (editable) | `False` (editable) |
+| `risk_pct` | `0.0` = off (editable) | `0.0` = off (editable) |
 
 The pip COUNTS are identical on purpose -- one rule, two instruments -- so the worked
 example reads the same on both: a BTCUSDm long at 80500 targets 81500, stops at 79800,
