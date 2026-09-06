@@ -10,7 +10,8 @@ from typing import Dict
 
 from backend.core.errors import ConfigRejected, DatabaseUnavailable
 from backend.core.symbols import (
-    BOOL_KEYS, EDITABLE_KEYS, SUPPORTED_SYMBOLS, SYMBOL_CONFIG, price_levels,
+    BOOL_KEYS, EDITABLE_KEYS, MAX_RISK_PCT, SUPPORTED_SYMBOLS, SYMBOL_CONFIG,
+    price_levels,
 )
 from backend.db import pool as db_pool
 from backend.db import repository as repo
@@ -45,7 +46,7 @@ COOLDOWN_BARS = 3
 # it whenever repository.py starts naming a column that an older database does
 # not have, so init_persistence() can refuse with the migrate command instead of
 # letting psycopg2 raise UndefinedColumn from somewhere deeper.
-REQUIRED_SCHEMA_VERSION = 4
+REQUIRED_SCHEMA_VERSION = 5
 
 # Max price slippage tolerated on a market order, in points.
 DEVIATION_POINTS = 20
@@ -139,6 +140,12 @@ def _validated(key, value):
         raise ConfigRejected("lot_size must be positive")
     if key == "partial_fraction" and not 0.0 <= value < 1.0:
         raise ConfigRejected("partial_fraction must be in [0, 1)")
+    if key == "risk_pct" and not 0.0 <= value <= MAX_RISK_PCT:
+        # A percent, so 0.5 means half a percent. The ceiling is what makes the
+        # classic unit confusion unstorable: 50 (meaning "half") is refused
+        # rather than silently risking half the account on one trade.
+        raise ConfigRejected(
+            "risk_pct must be between 0 and %g percent" % MAX_RISK_PCT)
     return value
 
 
@@ -191,6 +198,7 @@ def _save_settings(symbol, notes=None):
     return repo.save_settings(symbol, cfg["lot_size"],
                               cfg.get("partial_fraction", 0.0),
                               bool(cfg.get("exit_at_mean", False)),
+                              float(cfg.get("risk_pct", 0.0)),
                               source="api", notes=notes)
 
 
@@ -583,6 +591,40 @@ class TradingBot(threading.Thread):
 
     # ---- orders ---------------------------------------------------------------
 
+    def _risk_sized_lots(self, risk_pct, info):
+        # type: (float, object) -> Optional[float]
+        """Lots that put `risk_pct` of ACCOUNT EQUITY at the stop, or None.
+
+        None means "do not send this order". Two ways to get it, and neither may
+        fall back to `lot_size`: an unreadable account (S3's lesson -- an
+        unguarded MT5 return is an invisible failure), and a size that rounds
+        below `volume_min`. Rounding is DOWN throughout, so the order can only
+        ever risk less than asked, never more.
+
+        The risk per lot comes from `price_levels()`, which is the one place the
+        pip count becomes money -- so this cannot quietly assume gold's
+        arithmetic on an instrument whose contract size is different.
+        """
+        account = mt5.account_info()
+        if account is None:
+            log("%s: account_info() returned None; cannot size by risk"
+                % self.symbol)
+            return None
+        equity = float(getattr(account, "equity", 0.0) or 0.0)
+        risk_cash = equity * risk_pct / 100.0
+        per_lot = price_levels(self.symbol)["risk_per_lot"]
+        if equity <= 0 or risk_cash <= 0 or per_lot <= 0:
+            return None
+
+        vol_min = float(getattr(info, "volume_min", 0.01) or 0.01)
+        vol_max = float(getattr(info, "volume_max", 100.0) or 100.0)
+        step = float(getattr(info, "volume_step", 0.01) or 0.01)
+        raw = risk_cash / per_lot
+        lots = round(int(raw / step) * step, 8)
+        if lots < vol_min - 1e-9:
+            return None
+        return min(lots, vol_max)
+
     def open_trade(self, action):
         info = self._symbol_info()
         tick = mt5.symbol_info_tick(self.symbol)
@@ -600,6 +642,20 @@ class TradingBot(threading.Thread):
         # not opened with -- and scale an already-reduced position out twice.
         with _CONFIG_LOCK:
             lot_size = self.config["lot_size"]
+            risk_pct = float(self.config.get("risk_pct", 0.0))
+            if risk_pct > 0:
+                sized = self._risk_sized_lots(risk_pct, info)
+                if sized is None:
+                    # REFUSED, never clamped up to the broker minimum. The
+                    # minimum position risks a fixed number of dollars, so
+                    # clamping would risk more than asked precisely when the
+                    # account is smallest -- see backend/backtest/risk.py, which
+                    # makes the same choice for the same reason.
+                    log("%s: risk_pct=%g sizes below the broker minimum at this "
+                        "equity -- skipping the entry rather than rounding up"
+                        % (self.symbol, risk_pct))
+                    return False
+                lot_size = sized
             pip = self.config["pip"]
             if action == "BUY":
                 sl = price - (self.config["sl_pips"] * pip)
@@ -740,6 +796,24 @@ class TradingBot(threading.Thread):
             % (self.symbol, volume, position.ticket, price, position.price_open))
         return True
 
+    def _opened_volume(self, ticket):
+        # type: (int) -> Optional[float]
+        """Volume this position opened with, or None if it cannot be determined.
+
+        Deliberately NOT routed through `_persist`: that helper exists for
+        best-effort WRITES, where losing one costs a row of history. This is a
+        read whose answer decides whether to send an order, so the failure has
+        to be visible to the caller as "unknown" rather than swallowed as
+        "false". `manage_position` then does the bounded thing.
+        """
+        try:
+            from backend.db import repository
+            return repository.opened_volume(ticket)
+        except Exception as exc:                                   # noqa: BLE001
+            log("db: could not read the opened volume for #%s -- %r"
+                % (ticket, exc))
+            return None
+
     def manage_position(self, position, info, tick):
         """At `be_trigger_pips` in profit: bank part of the position, stop to entry.
 
@@ -756,12 +830,23 @@ class TradingBot(threading.Thread):
         The two guards are independent on purpose: if the scale-out fills but the
         stop move is rejected, the next cycle retries only the stop, and vice versa.
 
-        That first guard is why `lot_size` cannot be edited while a position is
-        open: shrinking it mid-trade would make an already-reduced position look
-        un-scaled and scale it out a second time. Now that the dashboard can edit
-        the size, this is no longer an assumption -- BotManager.update_settings()
-        refuses the edit while this bot holds a position, under the same
-        _CONFIG_LOCK that open_trade() holds across its order_send.
+        The first guard used to compare against `SYMBOL_CONFIG["lot_size"]`,
+        which is only a valid proxy for "the volume this position opened with"
+        while that number is a constant between trades. It asks the position's
+        own entry deal instead (`repository.opened_volume`, keyed on the
+        broker's position_id), so the guard no longer depends on the configured
+        size at all -- which is what makes equity-derived sizing safe here, and
+        also closes the case where the size is simply edited between two trades.
+
+        When the opened volume cannot be read the scale-out is SKIPPED and the
+        stop is still moved. The asymmetry is deliberate: scaling out twice
+        cannot be undone, while skipping it costs part of one trade's profit.
+        Never guess in the direction that can send an order.
+
+        `lot_size` still cannot be edited while a position is open
+        (`BotManager.update_settings` refuses it under the same `_CONFIG_LOCK`
+        that `open_trade()` holds across its `order_send`) -- but that is now
+        about the size the NEXT entry will use, not about this inference.
 
         Runs on the live tick, not on bar close: the trigger is an intrabar event,
         and waiting for a close would skip every move that gave the profit back
@@ -772,7 +857,6 @@ class TradingBot(threading.Thread):
         with _CONFIG_LOCK:
             trigger_pips = self.config.get("be_trigger_pips", 0)
             fraction = self.config.get("partial_fraction", 0.0)
-            full_lots = self.config["lot_size"]
         if not trigger_pips or fraction <= 0:
             return
 
@@ -788,7 +872,19 @@ class TradingBot(threading.Thread):
         if not reached:
             return
 
-        if position.volume >= full_lots - 1e-9:
+        # Has the scale-out already fired? Ask the position's OWN entry deal,
+        # not the configured lot size. `lot_size` only answers this while it is
+        # a constant between trades; the moment sizing follows equity -- or
+        # anyone edits the size between two trades -- an already-reduced
+        # position reads as untouched and is scaled out a second time. That is
+        # unrecoverable, so when the answer is unknown we do the bounded thing.
+        opened = self._opened_volume(position.ticket)
+        if opened is None:
+            log("%s: #%s cannot confirm the opened volume (persistence "
+                "unavailable); moving the stop to break-even but SKIPPING the "
+                "scale-out. Scaling out twice cannot be undone; skipping it "
+                "costs part of one trade." % (self.symbol, position.ticket))
+        elif position.volume >= opened - 1e-9:
             want = self._round_volume(position.volume * fraction, info)
             remainder = round(position.volume - want, 8)
             vol_min = getattr(info, "volume_min", 0.01) or 0.01
@@ -1690,7 +1786,10 @@ class BotManager:
         and a lot count would stop meaning the same thing the moment the size
         changed. `risk_per_lot` is here so the form can show what a size actually
         costs -- this bot has no equity-based sizing and no daily loss cap, so the
-        dollar figure behind "0.1" is the only warning a user gets.
+        dollar figure behind "0.1" is the only warning a user gets -- but only
+        while `risk_pct` is 0, the shipped default. With risk sizing ON a trade
+        risks `equity * risk_pct / 100` and `risk_per_lot * lot_size` is no
+        longer what it costs, so the page must switch which one it shows.
         """
         cfg = SYMBOL_CONFIG.get(symbol)
         if cfg is None:
@@ -1701,6 +1800,7 @@ class BotManager:
             lot_size = float(cfg["lot_size"])
             fraction = float(cfg.get("partial_fraction", 0.0))
             at_mean = bool(cfg.get("exit_at_mean", False))
+            risk_pct = float(cfg.get("risk_pct", 0.0))
         scale_out, runner = _split_lots(lot_size, fraction, vol_min, step)
         open_positions = len(bot_positions(symbol))
         return {
@@ -1708,6 +1808,14 @@ class BotManager:
             "lot_size": lot_size,
             "partial_fraction": fraction,
             "exit_at_mean": at_mean,
+            "risk_pct": risk_pct,
+            # The equity below which risk sizing cannot produce a legal order.
+            # The broker's smallest position risks a FIXED number of dollars, so
+            # below this an entry is SKIPPED rather than rounded up -- the form
+            # has to be able to say so. 0 when risk sizing is off.
+            "risk_pct_min_equity": (
+                vol_min * price_levels(symbol)["risk_per_lot"] * 100.0 / risk_pct
+                if risk_pct > 0 else 0.0),
             "scale_out_lots": scale_out,
             "runner_lots": runner,
             # fraction > 0 but nothing to bank: the size cannot be split at this
@@ -1737,7 +1845,7 @@ class BotManager:
         }
 
     def update_settings(self, symbol, lot_size=None, scale_out_lots=None,
-                        exit_at_mean=None):
+                        exit_at_mean=None, risk_pct=None):
         """Apply a settings edit from the UI. Returns the new settings + any notes.
 
         Any field may be omitted to leave it alone, but the two sizing fields are
@@ -1751,7 +1859,13 @@ class BotManager:
                                  % (symbol, ", ".join(SUPPORTED_SYMBOLS)))
         vol_min, vol_max, step, from_broker = _volume_limits(symbol)
         notes = []
-        touches_sizing = lot_size is not None or scale_out_lots is not None
+        # `risk_pct` counts as sizing. It decides how large the NEXT order is,
+        # and while the scale-out guard no longer infers anything from the
+        # configured size (it reads the position's own entry deal now), changing
+        # how a running trade would have been sized mid-trade is still a change
+        # nobody can act on until it is flat.
+        touches_sizing = (lot_size is not None or scale_out_lots is not None
+                          or risk_pct is not None)
 
         with _CONFIG_LOCK:
             # SIZING is refused while a position is open, because
@@ -1829,6 +1943,26 @@ class BotManager:
                         "Centre-line exit ON -- a scaled-out runner will usually "
                         "be closed at the centre line instead of the target.")
 
+            if risk_pct is None:
+                new_risk_pct = float(cfg.get("risk_pct", 0.0))
+            else:
+                new_risk_pct = _validated("risk_pct", risk_pct)
+                if new_risk_pct > 0:
+                    # The floor is a fact about the CONTRACT, not a preference:
+                    # the broker's smallest position already risks a fixed
+                    # number of dollars, and anything below it is skipped, not
+                    # clamped. Say so at the moment it is set rather than
+                    # leaving the user to infer it from an idle bot.
+                    lv = price_levels(symbol)
+                    min_risk_cash = vol_min * lv["risk_per_lot"]
+                    notes.append(
+                        "Risk sizing ON at %g%%. The broker minimum of %g lots "
+                        "already risks about $%.2f on %s, so any equity below "
+                        "$%.0f will size under it and those entries are SKIPPED, "
+                        "not rounded up."
+                        % (new_risk_pct, vol_min, min_risk_cash, symbol,
+                           min_risk_cash * 100.0 / new_risk_pct))
+
             # The write happens BEFORE SYMBOL_CONFIG is updated, and is allowed
             # to raise. Postgres now holds the settings, so an in-memory value
             # that the database refused would be traded for the rest of the
@@ -1837,15 +1971,17 @@ class BotManager:
             # the caller turns DatabaseUnavailable into a message on the form,
             # exactly as it does ConfigRejected.
             _persist_settings = repo.save_settings(
-                symbol, new_lot, new_fraction, new_at_mean, source="api",
-                notes=notes or None)
+                symbol, new_lot, new_fraction, new_at_mean, new_risk_pct,
+                source="api", notes=notes or None)
             cfg["lot_size"] = _persist_settings["lot_size"]
             cfg["partial_fraction"] = _persist_settings["partial_fraction"]
             cfg["exit_at_mean"] = _persist_settings["exit_at_mean"]
+            cfg["risk_pct"] = _persist_settings["risk_pct"]
 
         log("%s: settings set to lot_size=%g partial_fraction=%.4f (%g lots out) "
-            "exit_at_mean=%s"
-            % (symbol, new_lot, new_fraction, new_lot * new_fraction, new_at_mean))
+            "exit_at_mean=%s risk_pct=%g"
+            % (symbol, new_lot, new_fraction, new_lot * new_fraction, new_at_mean,
+               new_risk_pct))
         result = self.get_settings(symbol)
         result["notes"] = notes
         return result

@@ -133,10 +133,10 @@ def one_trade(symbol="XAUUSDm"):
 # ---------------------------------------------------------------------------
 
 def test_settings_round_trip():
-    repo.save_settings("XAUUSDm", 0.03, 0.25, True)
+    repo.save_settings("XAUUSDm", 0.03, 0.25, True, 1.5)
     assert repo.load_settings(["XAUUSDm"]) == {
         "XAUUSDm": {"lot_size": 0.03, "partial_fraction": 0.25,
-                    "exit_at_mean": True},
+                    "exit_at_mean": True, "risk_pct": 1.5},
     }
 
 
@@ -704,6 +704,38 @@ def test_the_deals_behind_a_trade_are_retrievable():
     ])
     deals = repo.list_deals(500)
     assert [d["entry_kind"] for d in deals] == ["in", "out", "out"]
+
+
+def test_the_opened_volume_comes_from_the_entry_deal_not_the_current_size():
+    """`manage_position()` asks this to decide whether the scale-out has already
+    fired. Reading it from the position's own entry deal is what frees the guard
+    from `SYMBOL_CONFIG["lot_size"]` -- and from the double scale-out that a size
+    edit, or equity-derived sizing, would otherwise cause."""
+    repo.upsert_deals([
+        deal(600, "in", "buy", 0.10, 3300.0, at=datetime(2026, 1, 1, 10, 0)),
+        deal(600, "out", "sell", 0.05, 3305.0, profit=25.0,
+             at=datetime(2026, 1, 1, 10, 30)),
+    ])
+    # Half is already banked, so the LIVE volume is 0.05 -- but the question
+    # "what did this open with" must still answer 0.10.
+    assert repo.opened_volume(600) == pytest.approx(0.10)
+
+
+def test_an_unknown_position_reports_None_rather_than_zero():
+    """None means "cannot tell" and makes the caller skip the scale-out. Zero
+    would compare as "already scaled out" and silently disable the rule; any
+    non-zero default would re-enable it on a position it knows nothing about."""
+    assert repo.opened_volume(999999) is None
+
+
+def test_a_scaled_in_position_reports_the_TOTAL_opened_volume():
+    """The bot never adds to a position today, but the guard must not become
+    wrong the day it does."""
+    repo.upsert_deals([
+        deal(601, "in", "buy", 0.10, 3300.0, at=datetime(2026, 1, 1, 10, 0)),
+        deal(601, "in", "buy", 0.05, 3302.0, at=datetime(2026, 1, 1, 10, 5)),
+    ])
+    assert repo.opened_volume(601) == pytest.approx(0.15)
 
 
 # ---------------------------------------------------------------------------

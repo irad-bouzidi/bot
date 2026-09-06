@@ -45,7 +45,7 @@ def _editable_keys_and_validator():
     The key *list* is imported rather than copied, so a new editable key cannot
     be added and then silently skipped by this importer.
     """
-    from backend.core.symbols import BOOL_KEYS, EDITABLE_KEYS
+    from backend.core.symbols import BOOL_KEYS, EDITABLE_KEYS, MAX_RISK_PCT
 
     def validated(key, value):
         if key in BOOL_KEYS:
@@ -70,6 +70,9 @@ def _editable_keys_and_validator():
             raise ValueError("lot_size must be positive")
         if key == "partial_fraction" and not 0.0 <= value < 1.0:
             raise ValueError("partial_fraction must be in [0, 1)")
+        if key == "risk_pct" and not 0.0 <= value <= MAX_RISK_PCT:
+            raise ValueError("risk_pct must be between 0 and %g percent"
+                             % MAX_RISK_PCT)
         return value
 
     return EDITABLE_KEYS, validated
@@ -131,8 +134,12 @@ def import_legacy_settings(path=None, known_symbols=None, defaults=None):
         fallback = defaults.get(symbol, {})
         fraction = clean.get("partial_fraction", fallback.get("partial_fraction", 0.0))
         at_mean = clean.get("exit_at_mean", fallback.get("exit_at_mean", False))
+        # No settings.json in existence carries risk_pct, so this always falls
+        # to the code default of 0 -- the same reasoning the file's docstring
+        # gives for exit_at_mean.
+        risk_pct = clean.get("risk_pct", fallback.get("risk_pct", 0.0))
         repository.save_settings(
-            symbol, clean["lot_size"], fraction, at_mean,
+            symbol, clean["lot_size"], fraction, at_mean, risk_pct,
             source="legacy-file",
             notes="imported from %s" % os.path.basename(path))
         _log("imported %s lot_size=%g partial_fraction=%g exit_at_mean=%s"
@@ -161,7 +168,7 @@ def seed_defaults(defaults):
             continue
         repository.save_settings(
             symbol, values["lot_size"], values["partial_fraction"],
-            values["exit_at_mean"], source="code-default",
+            values["exit_at_mean"], values["risk_pct"], source="code-default",
             notes="seeded from SYMBOL_CONFIG")
         _log("seeded %s lot_size=%g partial_fraction=%g exit_at_mean=%s"
              % (symbol, values["lot_size"], values["partial_fraction"],
@@ -184,7 +191,8 @@ def _code_defaults():
 
     return {symbol: {"lot_size": float(cfg["lot_size"]),
                      "partial_fraction": float(cfg.get("partial_fraction", 0.0)),
-                     "exit_at_mean": bool(cfg.get("exit_at_mean", False))}
+                     "exit_at_mean": bool(cfg.get("exit_at_mean", False)),
+                     "risk_pct": float(cfg.get("risk_pct", 0.0))}
             for symbol, cfg in SYMBOL_CONFIG.items()}
 
 

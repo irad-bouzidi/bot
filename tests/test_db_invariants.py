@@ -247,11 +247,40 @@ def test_the_schema_is_reachable_and_idempotent_in_shape():
     # Checked per STATEMENT, not per line: an ADD COLUMN routinely wraps onto
     # the next line, and a line-wise check would pass a bare `ALTER TABLE x`
     # only because the guard it was missing lived one line down.
-    alters = [s for s in sql.split(";")
+    #
+    # ADD CONSTRAINT is the one exception, and it is allowed only as half of a
+    # pair: Postgres has no ADD CONSTRAINT IF NOT EXISTS, so the idempotent form
+    # is `DROP CONSTRAINT IF EXISTS <name>` immediately followed by
+    # `ADD CONSTRAINT <name>`. The name must actually match, or the "drop" is
+    # dropping something else and the ADD still fails on a second run. A
+    # DO $$ ... $$ block would be the other way to write this and is rejected on
+    # purpose -- splitting on `;` lands inside it, so this whole check would
+    # stop seeing the statements it exists to police.
+    #
+    # Comments are stripped BEFORE the split, not after. Two ways that silently
+    # disarmed this check: a statement introduced by an explanatory comment --
+    # which in this file is all of them -- did not start with "ALTER TABLE" and
+    # fell out of the list entirely, so it was never checked at all; and a
+    # comment containing a semicolon cuts the statement it describes in half.
+    code = "\n".join(ln for ln in sql.splitlines()
+                     if not ln.strip().startswith("--"))
+    alters = [s.strip() for s in code.split(";")
               if s.strip().upper().startswith("ALTER TABLE")]
     assert alters, "no ALTER TABLE statements found"
+    dropped = set()
     for stmt in alters:
-        assert "IF NOT EXISTS" in stmt.upper(), stmt.strip()
+        upper = stmt.upper()
+        if "DROP CONSTRAINT IF EXISTS" in upper:
+            dropped.add(upper.split("DROP CONSTRAINT IF EXISTS")[1].strip())
+            continue
+        if "ADD CONSTRAINT" in upper:
+            name = upper.split("ADD CONSTRAINT")[1].split()[0].strip()
+            assert name in dropped, (
+                "ADD CONSTRAINT %s is not preceded by a matching "
+                "DROP CONSTRAINT IF EXISTS, so re-applying schema.sql fails"
+                % name)
+            continue
+        assert "IF NOT EXISTS" in upper, stmt.strip()
 
 
 def test_reporting_failures_cannot_reach_the_trading_path():

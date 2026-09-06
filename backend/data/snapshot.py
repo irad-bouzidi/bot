@@ -22,6 +22,7 @@ import pandas as pd
 
 from backend.data.cache import (
     DEFAULT_ROOT, _months, _month_end, read_shard, shard_path, write_shard,
+    read_spec,
     write_spec,
 )
 from backend.data.market_data import TIMEFRAME_SECONDS
@@ -36,7 +37,17 @@ def cmd_snapshot(args):
     from backend.data.mt5_source import MT5Source  # imported late: needs a terminal
 
     src = MT5Source()
-    spec = src.get_symbol_spec(args.symbol)
+    # Hand the offset already on disk back as the fallback. A snapshot run while
+    # every configured market is shut cannot measure the server clock, and the
+    # one thing it must not do is replace a good stored offset with a guess --
+    # that is how a weekend run stamped a whole H1 capture 41 hours out.
+    stored = read_spec(args.symbol, args.root)
+    spec = src.get_symbol_spec(
+        args.symbol,
+        offset_fallback=stored.server_utc_offset_seconds if stored else None)
+    if stored is not None and spec.server_utc_offset_seconds != stored.server_utc_offset_seconds:
+        print("NOTE  server-UTC offset changed: %+d s -> %+d s"
+              % (stored.server_utc_offset_seconds, spec.server_utc_offset_seconds))
     path = write_spec(spec, args.root)
     print("spec  -> %s" % path)
     print("        contract_size=%s tick_size=%s tick_value=%s digits=%s"

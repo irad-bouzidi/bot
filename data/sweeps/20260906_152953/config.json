@@ -1,0 +1,41 @@
+{
+  "argv": [
+    "--symbols",
+    "XAUUSDm",
+    "--timeframes",
+    "M5",
+    "--start",
+    "2025-04-01",
+    "--param",
+    "sl_pips=50,70,90",
+    "--top",
+    "6"
+  ],
+  "grid": {
+    "sl_pips": [
+      50,
+      70,
+      90
+    ],
+    "tp_pips": [
+      100
+    ],
+    "be_trigger_pips": [
+      50
+    ],
+    "entry_mode": [
+      "level"
+    ],
+    "exit_at_mean": [
+      false
+    ],
+    "partial_fraction": [
+      0.5
+    ]
+  },
+  "swept": [
+    "sl_pips"
+  ],
+  "git_sha": "5010e10",
+  "created_at": "2026-09-06T14:29:53.067074+00:00"
+}

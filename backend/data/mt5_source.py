@@ -13,7 +13,10 @@ LOCAL dates straight to `copy_rates_range`, so every requested window was
 silently offset by (local - server), typically 1-3 hours.
 
 Here the offset is measured once from a live tick, stored in the symbol sidecar,
-and applied in both directions. Bars are indexed in true UTC.
+and applied in both directions. Bars are indexed in true UTC. A tick is only
+current while its market is OPEN, so `measure_server_utc_offset` refuses an
+implausible reading rather than trusting a Friday tick on a Sunday -- see its
+docstring for the corruption that taught us that.
 """
 
 import time as _time
@@ -24,6 +27,7 @@ import MetaTrader5 as mt5  # noqa: F401  (allowed here only)
 import pandas as pd
 
 from backend.core.errors import DataUnavailable
+from backend.core.symbols import SUPPORTED_SYMBOLS
 from backend.core.types import SymbolSpec
 from backend.data.market_data import BarSet, MarketData
 
@@ -45,14 +49,51 @@ def ensure_initialized():
     return True
 
 
-def measure_server_utc_offset(symbol):
-    # type: (str) -> int
-    """Seconds to ADD to UTC to get broker server time, snapped to 15 minutes."""
+# Real broker clocks live between UTC-12 and UTC+14, so a measurement outside
+# that range is not a distant server -- it is a STALE TICK, i.e. a closed market.
+_MAX_PLAUSIBLE_OFFSET = 14 * 3600
+
+
+def _tick_offset(symbol):
+    # type: (str) -> Optional[int]
+    """Offset measured from `symbol`'s last tick, or None if it is not current."""
     tick = mt5.symbol_info_tick(symbol)
     if tick is None or not tick.time:
-        return 0
+        return None
     raw = tick.time - _time.time()
+    if abs(raw) > _MAX_PLAUSIBLE_OFFSET:
+        return None
     return int(round(raw / 900.0) * 900)
+
+
+def measure_server_utc_offset(symbol, fallback=None):
+    # type: (str, Optional[int]) -> int
+    """Seconds to ADD to UTC to get broker server time, snapped to 15 minutes.
+
+    The measurement comes from the symbol's last tick, which is only current
+    while that symbol's market is OPEN. Ask gold on a Sunday and the newest tick
+    is Friday's close, so a bare `tick.time - now()` reads as an offset of about
+    -41 hours -- and every bar written against it is stamped 41 hours out.
+
+    That is not hypothetical. It is how `data/specs/XAUUSDm.json` came to be
+    marked "mt5+offset-repaired" by hand, and the repair did not survive: the
+    next weekend snapshot silently wrote -148500 back into the sidecar and
+    stamped a fresh H1 capture at :15 past every hour.
+
+    So an implausible reading is treated as "could not measure" rather than as a
+    number. We then try the other configured symbols -- a 24/7 instrument reads
+    the SAME server clock and is still ticking on a Sunday -- and only then fall
+    back to the offset already stored for this symbol. Never to a guess.
+    """
+    off = _tick_offset(symbol)
+    if off is not None:
+        return off
+    for other in SUPPORTED_SYMBOLS:
+        if other != symbol:
+            off = _tick_offset(other)
+            if off is not None:
+                return off
+    return 0 if fallback is None else int(fallback)
 
 
 class MT5Source(MarketData):
@@ -76,15 +117,17 @@ class MT5Source(MarketData):
             )
         return mt5.symbol_info(symbol)
 
-    def offset(self, symbol):
-        # type: (str) -> int
+    def offset(self, symbol, fallback=None):
+        # type: (str, Optional[int]) -> int
+        """Cached per source. `fallback` is the sidecar's stored offset, used only
+        when no configured symbol has a current tick -- i.e. everything is shut."""
         if symbol not in self._offsets:
-            self._offsets[symbol] = measure_server_utc_offset(symbol)
+            self._offsets[symbol] = measure_server_utc_offset(symbol, fallback)
         return self._offsets[symbol]
 
     # -- MarketData ---------------------------------------------------------
 
-    def get_symbol_spec(self, symbol):
+    def get_symbol_spec(self, symbol, offset_fallback=None):
         info = self._select(symbol)
         return SymbolSpec(
             name=symbol,
@@ -102,7 +145,11 @@ class MT5Source(MarketData):
             currency_profit=str(info.currency_profit),
             currency_margin=str(info.currency_margin),
             typical_spread_points=float(getattr(info, "spread", 0) or 0),
-            server_utc_offset_seconds=self.offset(symbol),
+            swap_mode=int(getattr(info, "swap_mode", 0) or 0),
+            swap_long=float(getattr(info, "swap_long", 0.0) or 0.0),
+            swap_short=float(getattr(info, "swap_short", 0.0) or 0.0),
+            swap_rollover_3days=int(getattr(info, "swap_rollover3days", 3) or 3),
+            server_utc_offset_seconds=self.offset(symbol, offset_fallback),
             captured_at=datetime.now(timezone.utc).isoformat(),
             source="mt5",
         )

@@ -69,6 +69,16 @@ reintroduce it there.)
 #                     and made the target effectively unreachable. It is a
 #                     boolean rather than a distance because there is nothing to
 #                     tune: the level is wherever the envelope puts it.
+# `risk_pct`         PERCENT of account equity to risk at the stop, sizing the
+#                     order instead of `lot_size`. 0.0 means OFF and `lot_size`
+#                     is used, which is what every stored result was produced
+#                     with; a non-zero shipped default would re-size a running
+#                     bot the moment the code landed. EDITABLE at runtime.
+#                     Read the measured limit before setting it: gold risks $700
+#                     per 1.0 lot, so the broker's smallest position (0.01 lots)
+#                     already risks $7 -- 0.23% of a $3,000 account. Anything
+#                     below that floor rounds under `volume_min` and every entry
+#                     is SKIPPED rather than clamped up.
 SYMBOL_CONFIG = {
     "XAUUSDm": {
         "pip": 0.1,
@@ -79,6 +89,7 @@ SYMBOL_CONFIG = {
         "be_trigger_pips": 50,      # 5.00 in price -- half of the 100-pip target
         "partial_fraction": 0.5,    # 0.05 out at +5.00, 0.05 runs to the target
         "exit_at_mean": False,      # centre line ~6.00 out: inside the target
+        "risk_pct": 0.0,            # 0 = size from lot_size; see EDITABLE_KEYS
     },
     # Same shape as gold and, now, the same pip COUNTS: one pip is $10, so $100
     # of Bitcoin is 10 pips exactly as $1 of gold is. A long at 80500 therefore
@@ -100,6 +111,7 @@ SYMBOL_CONFIG = {
         "be_trigger_pips": 50,      # 500.00 in price -- half of the target
         "partial_fraction": 0.5,    # 0.05 out at +500, 0.05 runs to the target
         "exit_at_mean": False,      # centre line ~600 out: inside the target
+        "risk_pct": 0.0,            # 0 = size from lot_size; see EDITABLE_KEYS
     },
 }
 
@@ -117,7 +129,12 @@ SUPPORTED_SYMBOLS = list(SYMBOL_CONFIG.keys())
 # symbol. Every editable key either sizes a position or removes an exit; none of
 # them can move a level or introduce an instrument. That is the invariant
 # `repository.load_settings()` and `_load_settings()` are both written to hold.
-EDITABLE_KEYS = ("lot_size", "partial_fraction", "exit_at_mean")
+EDITABLE_KEYS = ("lot_size", "partial_fraction", "exit_at_mean", "risk_pct")
+
+# The ceiling on `risk_pct`. It is a percent of EQUITY, so 5 is already an
+# aggressive number and anything past it is far more likely to be a unit
+# confusion (0.5 meant as a fraction, 50 meant as "half") than an intent.
+MAX_RISK_PCT = 5.0
 
 # Which of the above are NOT floats. `_validated()` branches on this, and it
 # matters more than it looks: bool("false") is True, so a boolean that went

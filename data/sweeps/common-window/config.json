@@ -1,0 +1,55 @@
+{
+  "argv": [
+    "--symbols",
+    "XAUUSDm,BTCUSDm",
+    "--timeframes",
+    "M5,M15,M30,H1",
+    "--start",
+    "2025-09-24",
+    "--end",
+    "2026-08-28",
+    "--param",
+    "sl_pips=70,90,110,130,150",
+    "--param",
+    "tp_pips=100,140,180,220",
+    "--min-trades",
+    "60",
+    "--top",
+    "20",
+    "--out",
+    "data/sweeps/common-window"
+  ],
+  "grid": {
+    "sl_pips": [
+      70,
+      90,
+      110,
+      130,
+      150
+    ],
+    "tp_pips": [
+      100,
+      140,
+      180,
+      220
+    ],
+    "be_trigger_pips": [
+      50
+    ],
+    "entry_mode": [
+      "level"
+    ],
+    "exit_at_mean": [
+      false
+    ],
+    "partial_fraction": [
+      0.5
+    ]
+  },
+  "swept": [
+    "sl_pips",
+    "tp_pips"
+  ],
+  "git_sha": "5010e10",
+  "created_at": "2026-09-06T14:31:22.472835+00:00"
+}

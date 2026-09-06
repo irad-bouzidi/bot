@@ -133,6 +133,89 @@ def test_gap_through_the_stop_fills_at_the_gap_price_not_the_level():
     assert row["net_pl"] == pytest.approx(-30.0)
 
 
+# --- rule 3, the entry bar: SL/TP are live from the FILL --------------------
+# These pin the fix for the engine's largest bias. The stop check used to start
+# on the bar AFTER the fill, so the first price it ever saw was that bar's open
+# -- which rule 5 then booked as a gap. On gold M5 that hit 717 of 1044
+# stop-outs and filled them an average of 3.0 past a 7.00 stop, while handing
+# take-profits an average 2.1 BETTER than their limit, which no broker does.
+# Live the two levels ride inside the entry order, so the broker holds them from
+# the fill; these tests are what keeps the backtest modelling that bot.
+
+def test_stop_reached_on_the_entry_bar_fills_AT_the_stop():
+    bs = bars([(100, 101, 99, 100),
+               (100, 101, 88, 95),       # entry 100 at THIS open, low 88 < SL 90
+               (95, 96, 94, 95)])
+    res = run(bs, EnterOnceStrategy(sl=10.0, tp=10.0))
+    row = res.ledger.iloc[0]
+    assert row["exit_reason"] == EXIT_SL
+    assert row["exit_index"] == 1, "must resolve on the entry bar, not the next one"
+    assert row["exit_price"] == pytest.approx(90.0), "the level, never the next open"
+    assert row["net_pl"] == pytest.approx(-10.0)
+
+
+def test_target_reached_on_the_entry_bar_fills_AT_the_target():
+    """A take-profit is a LIMIT: it fills at the limit and never better."""
+    bs = bars([(100, 101, 99, 100),
+               (100, 130, 99, 128),      # entry 100, high 130 sails past TP 110
+               (128, 129, 127, 128)])
+    res = run(bs, EnterOnceStrategy(sl=10.0, tp=10.0))
+    row = res.ledger.iloc[0]
+    assert row["exit_reason"] == EXIT_TP
+    assert row["exit_index"] == 1
+    assert row["exit_price"] == pytest.approx(110.0), "not 130, and not the next open"
+    assert row["net_pl"] == pytest.approx(10.0)
+
+
+def test_entry_bar_touching_both_levels_obeys_the_tie_break():
+    bs = bars([(100, 101, 99, 100),
+               (100, 115, 85, 100),      # entry 100; both 90 and 110 inside
+               (100, 101, 99, 100)])
+    res = run(bs, EnterOnceStrategy(sl=10.0, tp=10.0))
+    assert res.ledger.iloc[0]["exit_reason"] == EXIT_SL
+    assert res.metrics["ambiguous_bars"] >= 1, "entry bar ambiguity must be counted"
+
+    tp_first = run(bs, EnterOnceStrategy(sl=10.0, tp=10.0),
+                   cfg=BacktestConfig(initial_balance=1000.0, volume=1.0,
+                                      tie_break="tp_first"))
+    assert tp_first.ledger.iloc[0]["exit_reason"] == EXIT_TP
+
+
+def test_an_entry_bar_that_reaches_nothing_still_resolves_on_later_bars():
+    """The guard moved from `>` to `>=`; it must not have become `==`."""
+    bs = bars([(100, 101, 99, 100),
+               (100, 101, 99, 100),      # entry 100, neither level touched
+               (100, 101, 85, 100)])     # stop swept here
+    row = run(bs, EnterOnceStrategy(sl=10.0, tp=10.0)).ledger.iloc[0]
+    assert row["exit_reason"] == EXIT_SL
+    assert row["exit_index"] == 2
+    assert row["exit_price"] == pytest.approx(90.0)
+
+
+def test_a_trade_closed_on_its_entry_bar_still_records_its_excursion():
+    """Excursion is tracked before the stop block, so a same-bar exit is not
+    written with a flat 0.0 MAE/MFE and quietly flattened out of the
+    distribution the stop distance gets fitted against."""
+    bs = bars([(100, 101, 99, 100),
+               (100, 120, 88, 95),       # entry 100, R = 10: +20 then -12
+               (95, 96, 94, 95)])
+    row = run(bs, EnterOnceStrategy(sl=10.0, tp=100.0)).ledger.iloc[0]
+    assert row["exit_index"] == 1
+    assert row["mae_r"] == pytest.approx(-1.2)
+    assert row["mfe_r"] == pytest.approx(2.0)
+
+
+def test_legacy_mode_keeps_the_old_entry_bar_skip():
+    """--compare-legacy exists to measure the ORIGINAL engine's overstatement.
+    Fixing the entry bar inside it would measure something else."""
+    bs = bars([(100, 101, 99, 100),
+               (100, 101, 88, 85),       # close 85 is past the 90 stop
+               (85, 86, 84, 85)])
+    cfg = BacktestConfig(initial_balance=1000.0, volume=1.0, legacy_mode=True)
+    row = run(bs, EnterOnceStrategy(sl=10.0, tp=10.0), cfg=cfg).ledger.iloc[0]
+    assert row["exit_index"] == 2, "legacy must still skip the entry bar"
+
+
 # --- rule 7: the survivor ---------------------------------------------------
 
 def test_open_position_is_marked_to_market_and_excluded_from_win_rate():

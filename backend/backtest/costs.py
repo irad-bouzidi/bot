@@ -25,6 +25,19 @@ from typing import Optional
 from backend.core.types import Side, SymbolSpec
 
 
+def triple_weekday(mt5_rollover_3days):
+    # type: (int) -> int
+    """MT5's SYMBOL_SWAP_ROLLOVER3DAYS -> Python's `date.weekday()`.
+
+    MT5 counts from SUNDAY=0; Python counts from MONDAY=0. They differ by one,
+    and the two default values collide misleadingly: MT5's 3 is Wednesday and
+    Python's 2 is Wednesday, so a hand-typed default looks right while any value
+    read from a broker is a day late. BTCUSDm reports 5, which is Friday -- 4 in
+    Python, not 5.
+    """
+    return (int(mt5_rollover_3days) - 1) % 7
+
+
 @dataclass(frozen=True)
 class CostConfig:
     spread_source: str = "bar"                 # "bar" | "fixed" | "none"
