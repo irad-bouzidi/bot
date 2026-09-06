@@ -465,18 +465,25 @@ class BacktestEngine:
         t.duration_s = (t.exit_time - t.entry_time).total_seconds()
         remainder_gross = spec.pl(t.entry_price, price, side, t.remaining_volume)
         t.gross_pl = t.partial_pl + remainder_gross
-        # The trade's result as a PRICE distance, weighted across the legs by the
-        # volume each carried -- the same basis the live trade fold uses, so a
-        # research pip and a dashboard pip mean one thing. Blind to costs by
-        # construction: a distance cannot hold a commission, which is exactly why
-        # it is worth reporting next to net_pl rather than instead of it.
+        # The trade's result as a PRICE distance: entry to this, its FINAL exit.
+        # The same basis the live trade fold uses, so a research pip and a
+        # dashboard pip mean one thing. Blind to costs by construction -- a
+        # distance cannot hold a commission, which is exactly why it is worth
+        # reporting next to net_pl rather than instead of it.
+        #
+        # `partial_price` deliberately plays no part, and neither does any
+        # volume. Every pips figure here is measured as though the position were
+        # the smallest lot a broker will take, and 0.01 lots cannot be scaled
+        # out -- so the rule that banks half the position moves `net_pl` and
+        # leaves this untouched. Weighting the legs by volume (which this did)
+        # made the distance move with `cfg.volume`: the identical price path
+        # reported 100 pips at 0.01 lots, where round_volume refuses the split,
+        # 75 at 0.1 and 66.7 at 0.03, where the split lands 0.02/0.01. A figure
+        # that changes when only the size changes cannot be compared across two
+        # runs, which is the one job it has next to the money.
         t.pip_size = self.cfg.pip_size
-        if self.cfg.pip_size > 0 and t.volume > 0:
-            travelled = (price - t.entry_price) * side.sign * t.remaining_volume
-            if t.partial_volume:
-                travelled += ((t.partial_price - t.entry_price) * side.sign
-                              * t.partial_volume)
-            t.pips = travelled / t.volume / self.cfg.pip_size
+        if self.cfg.pip_size > 0:
+            t.pips = (price - t.entry_price) * side.sign / self.cfg.pip_size
         # Round turn on the volume OPENED: both legs eventually close, so the total
         # closed volume equals `volume` however many pieces it left in.
         t.commission = self.costs.commission(t.volume)

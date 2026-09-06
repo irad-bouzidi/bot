@@ -275,9 +275,13 @@ They are a second measurement rather than a restatement of the P&L:
   nullable — nothing exited yet, or a row folded before the column existed.
   Press **Re-read from MT5** on the Trade History page (or restart the API) to
   fill those in; the fold recomputes them from the raw deals.
-- **Volume-weighted across a scale-out.** Half banked at +50 pips with the
-  runner scratched at entry is 25 pips, not 50 — the distance the *position*
-  travelled.
+- **Measured as if you traded the smallest lot, so a scale-out is invisible to
+  it.** 0.01 lots cannot be scaled out at any broker, so the distance runs from
+  the entry to the *final* exit and the banked leg is not part of it: half out
+  at +50 with the runner to the +100 target is **100 pips**, and half out at +50
+  with the runner scratched at break-even is **0 pips** on a trade that still
+  made money. That is the price of a figure two differently-sized runs can be
+  compared on.
 
 Adding pips across symbols in a combined backtest adds **movement, not money**;
 the combined view prints the per-symbol split beside the total for that reason.

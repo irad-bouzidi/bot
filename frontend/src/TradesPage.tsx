@@ -270,7 +270,7 @@ const TradesPage = ({ symbols = [] }: { symbols?: string[] }) => {
                   <th
                     scope="col"
                     className="num"
-                    title="Price distance captured, in this symbol's pips — $1 of gold and $100 of Bitcoin are both 10. Gross: costs are in the next column."
+                    title="Price distance from entry to final exit, in this symbol's pips — $1 of gold and $100 of Bitcoin are both 10. Measured as if the lot were 0.01, so the lot size and the scale-out do not move it. Gross: costs are in the next column."
                   >
                     Pips
                   </th>
@@ -402,9 +402,10 @@ const TradesPage = ({ symbols = [] }: { symbols?: string[] }) => {
       <p className="page-note">
         Open trades show no net result on purpose — a scale-out is not a close, and
         dating a trade by its partial exit would drop it into the closed-trade equity
-        curve early. <b>Pips</b> is the price distance the position travelled,
-        volume-weighted across its exits and <b>gross of costs</b>, so a trade can be
-        green there and red under Net.
+        curve early. <b>Pips</b> is the price distance from the entry to the final
+        exit, measured as if the lot were 0.01 — so a scale-out moves the money and
+        not this — and <b>gross of costs</b>, so a trade can be green there and red
+        under Net, or flat there after banking a partial.
       </p>
     </>
   );

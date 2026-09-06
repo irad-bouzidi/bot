@@ -330,11 +330,19 @@ def test_a_run_with_no_pip_defined_reports_no_pips_rather_than_zero():
     assert res.metrics["pips_won"] is None and res.metrics["pips_lost"] is None
 
 
-def test_the_scaled_out_leg_is_weighted_into_the_pip_result():
-    """Half banked at +5, the rest run to +10 -> 7.5 pips, not 15.
+def test_the_scaled_out_leg_is_NOT_part_of_the_pip_result():
+    """Half banked at +5, the rest run to +10 -> 10 pips, not 7.5 and not 15.
 
-    Same basis as the live trade fold's volume-weighted exit price, so a pip on
-    the Backtest page and a pip on the Trade History page mean one thing.
+    Pips are measured as though the position were the smallest lot a broker will
+    take, and 0.01 lots cannot be scaled out -- so the distance is entry to
+    FINAL exit and the banked leg contributes nothing. Same basis as the live
+    trade fold, so a pip on the Backtest page and a pip on the Trade History
+    page mean one thing.
+
+    7.5 is what volume-weighting the two legs gave, and it is wrong for the job:
+    it made the figure move with `cfg.volume`, which is the one thing a price
+    distance is reported to be free of. 15 is what counting each leg in full
+    would give -- a 100-pip target reported as 150.
     """
     class ScaleOut(EnterOnceStrategy):
         def on_bar(self, ctx):
@@ -349,12 +357,18 @@ def test_the_scaled_out_leg_is_weighted_into_the_pip_result():
                (100, 106, 99, 100),      # trigger at 105 -> half out
                # The break-even stop is live from HERE, so this bar must not
                # revisit 100 -- it would scratch the runner before the target
-               # and the weighting would be measured on the wrong two legs.
+               # and the distance would be measured to the wrong exit.
                (106, 115, 105, 112)])    # target at 110 -> the runner
     res = run(bs, ScaleOut(), cfg=_pips_cfg())
     row = res.ledger.iloc[0]
     assert row["partial_volume"] == pytest.approx(0.5)
-    assert row["pips"] == pytest.approx(7.5)
+    assert row["pips"] == pytest.approx(10.0)
+    # And the same run at a size the broker cannot split reports the same
+    # distance, which is the property the whole definition exists for: nothing
+    # about `volume` reaches the pips column.
+    small = run(bs, ScaleOut(), cfg=_pips_cfg(volume=0.01))
+    assert small.ledger.iloc[0]["partial_volume"] == 0.0
+    assert small.ledger.iloc[0]["pips"] == pytest.approx(10.0)
 
 
 def test_the_research_default_matches_the_live_bot():

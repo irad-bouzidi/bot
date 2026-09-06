@@ -557,7 +557,9 @@ Four things to keep straight before reading or extending any of it:
 - **Pips are GROSS and blind to size.** A price distance cannot carry a commission or a
   swap, and it does not move when the lot size does. That is the point: it is the number
   that stays comparable between two runs sized differently, and the gap between it and
-  the money is what the costs took. It is *not* a share of the P&L.
+  the money is what the costs took. It is *not* a share of the P&L. Read "blind to size"
+  strictly: **every pips figure is measured as though the position were 0.01 lots**,
+  which is what makes the scale-out rule below invisible to it.
 - **The pip buckets are signed by the PIPS, not by the money.** `pips_won >= 0 >=
   pips_lost` always, and `net_pips` is the two **summed** (the same convention `avg_loss`
   uses). So the split can disagree with `wins`/`losses`: a trade that gained a pip and
@@ -573,9 +575,40 @@ Four things to keep straight before reading or extending any of it:
   in code, and a copy of it in the schema would be a second table a new symbol could be
   missing from. `reconcile_all(full=True)` on every API boot re-folds the whole history,
   which is the migration.
-- **A scaled-out trade reports the distance the POSITION travelled**, volume-weighted
-  across its legs -- half banked at +50 and the runner scratched is 25 pips, not 50. The
-  same basis `exit_price` already used, so a pip means one thing on all four surfaces.
+- **A scaled-out trade is measured entry to FINAL exit**, and the banked leg contributes
+  nothing: half out at +50 with the runner to the +100 target is **100 pips**, and half
+  out at +50 with the runner scratched at break-even is **0 pips** on a trade that made
+  money. That follows from the rule above -- 0.01 lots cannot be scaled out at any
+  broker, so at the size pips are measured in, the partial does not exist. A trade still
+  running on a banked partial has **no** pip figure (NULL), for the same reason.
+
+  **This replaced a volume-weighted definition** (75 and 25 for the two cases above),
+  which read as the more honest answer and was not: weighting by volume put the lot size
+  back inside the one number that exists to be free of it. The identical price path
+  reported **100 pips at 0.01 lots** (too small for the broker to split, so the rule
+  never fired), **66.7 at 0.03** (MT5's volume step lands the split on 0.02 against 0.01)
+  and **75 at 0.10**. Two runs of one strategy at two sizes could not be compared, which
+  is the whole job of the column. Changed in all four places at once -- the live fold's
+  SQL, `simulate_legacy`, the research engine and the stored ledgers -- so a pip still
+  means one thing on every surface. `exit_price` is **unchanged** and stays the
+  volume-weighted average the position actually left at; the fold derives pips from a
+  separate `final_exit_price` instead, because the average is still the right answer for
+  the money and for what the trade history displays.
+
+  **Every stored pips figure predates this and is the old definition.** `trades.pips` is
+  re-derived by `reconcile_all(full=True)` on the next API boot; `data/reports/*` and the
+  `backtest_runs` rows are not re-derived by anything.
+
+  **No money figure moved**, and that was measured rather than assumed:
+  `run_baseline --symbol XAUUSDm --exit-at-mean` was run on the engine either side of the
+  change and the two `metrics.json` compared key by key -- 201 keys, 0 non-pips
+  differences, across all three cost scenarios. What the pips keys did on that run is
+  worth knowing before reading one: `avg_win_pips` 64.4 -> 94.8 (a scale-out winner is no
+  longer diluted by its banked leg), `net_pips` -16,819 -> -15,096, and `pip_wins` 1,232
+  -> 871 with 159 trades now sitting at exactly 0 pips -- the break-even scratches. The
+  old figure's real problem shows up in the same run: at 0.1 lots on gold it equalled
+  `gross_pl` to the cent (ratio 1.0000), because volume-weighting had quietly made the
+  column a restatement of the money that the first bullet says it must not be.
 
 Summing pips across symbols (the combined backtest) adds **movement, not money**. It
 happens to be readable in money here because `pip * profit_mult` is $10 a lot on both

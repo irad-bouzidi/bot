@@ -213,16 +213,20 @@ CREATE TABLE IF NOT EXISTS trades (
     net_profit     DOUBLE PRECISION NOT NULL DEFAULT 0,
     -- The trade's result as a PRICE distance, in this symbol's pips (schema
     -- version 4). Nullable, and the three reasons it can be NULL are all real:
-    -- the position has not been exited at all, so there is no distance yet; the
-    -- symbol is no longer in SYMBOL_CONFIG, so nothing here knows what a pip of
-    -- it is; or the row predates the column and has not been re-folded. A
-    -- DEFAULT 0 would render every one of those as "closed flat".
+    -- the trade has not CLOSED, so there is no distance yet (a banked partial
+    -- is not an exit here -- see below); the symbol is no longer in
+    -- SYMBOL_CONFIG, so nothing here knows what a pip of it is; or the row
+    -- predates the column and has not been re-folded. A DEFAULT 0 would render
+    -- every one of those as "closed flat".
     --
-    -- Derived from the volume-weighted entry and exit prices, so a scaled-out
-    -- trade reports the average distance it actually left at -- the same basis
-    -- `exit_price` above uses. It is GROSS: a price distance cannot carry
-    -- commission or swap, so a trade can be positive here and a loss on
-    -- `net_profit`. That divergence is the point of reporting both.
+    -- Measured as though the position were 0.01 lots, which no broker will
+    -- scale out: entry to FINAL exit, with the banked leg contributing nothing.
+    -- NOT the volume-weighted `exit_price` above -- that weighting made the
+    -- figure move with the lot size, which is the one thing it is stored to be
+    -- free of. It is GROSS: a price distance cannot carry commission or swap,
+    -- so a trade can be positive here and a loss on `net_profit`, or 0.0 here
+    -- and a win, having banked a partial and scratched its runner. Those
+    -- divergences are the point of reporting both.
     pips           DOUBLE PRECISION,
     comment        TEXT,
     updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),

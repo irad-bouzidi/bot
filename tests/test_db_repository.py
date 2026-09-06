@@ -309,6 +309,35 @@ def test_pips_come_from_the_symbols_own_definition():
     assert one_trade()["pips"] == pytest.approx(100.0)
 
 
+@pytest.mark.parametrize("symbol,entry,target", [
+    ("XAUUSDm", 4300.0, 4310.0),
+    ("BTCUSDm", 70500.0, 71500.0),
+])
+@pytest.mark.parametrize("lots", [0.01, 0.03, 0.1, 1.0])
+def test_the_worked_examples_fold_to_100_pips_whatever_the_size(
+        symbol, entry, target, lots):
+    """Gold in at 4300 out at 4310, Bitcoin in at 70500 out at 71500: 100 pips.
+
+    Bitcoin is here and not only gold because its pip is 10.0 -- a hundred times
+    gold's -- so it is the one an arithmetic slip shows up on, and it is the one
+    that would silently report a $100 move as 100 pips instead of 10 if the pip
+    were ever read off the wrong symbol.
+
+    Swept across sizes because the size is not part of the measurement. The
+    money these deals report is left at a nominal 100.0 on purpose: a pips
+    column that quietly tracked the P&L would pass at one lot size and fail at
+    the rest.
+    """
+    repo.upsert_deals([
+        deal(60, "in", "buy", lots, entry, symbol=symbol,
+             at=datetime(2026, 5, 1, 10, 0)),
+        deal(60, "out", "sell", lots, target, symbol=symbol, profit=100.0,
+             at=datetime(2026, 5, 1, 11, 0)),
+    ])
+    repo.rebuild_trades(symbol)
+    assert one_trade(symbol)["pips"] == pytest.approx(100.0)
+
+
 def test_a_winning_short_reports_POSITIVE_pips():
     """The sign is the TRADE's, taken from the entry deal. A short is closed by
     a buy, so reading direction off the exit -- or off `exit - entry` unsigned
@@ -324,22 +353,69 @@ def test_a_winning_short_reports_POSITIVE_pips():
     assert t["pips"] == pytest.approx(100.0)
 
 
-def test_a_scaled_out_trade_reports_the_distance_the_position_travelled():
-    """Half out at +5.00, the runner scratched at entry: 25 pips, not 50.
+def test_a_scaled_out_trade_is_measured_entry_to_FINAL_exit():
+    """Half out at +5.00, the runner to the +10.00 target: 100 pips, not 75.
 
-    Volume-weighted through `exit_price`, the same basis the price column uses.
-    Counting each leg in full would report a trade that gave back its runner as
-    a 50-pip winner.
+    Pips are measured as though the position were 0.01 lots, which no broker
+    will scale out, so the banked leg is not part of the distance. Weighting the
+    legs by volume -- which this fold used to do, through `exit_price` -- gave
+    75 here and put the lot size back inside the one number that exists to be
+    free of it.
     """
     repo.upsert_deals([
         deal(42, "in", "buy", 0.1, 3300.0, at=datetime(2026, 1, 1, 10, 0)),
         deal(42, "out", "sell", 0.05, 3305.0, profit=25.0,
              at=datetime(2026, 1, 1, 10, 30)),
-        deal(42, "out", "sell", 0.05, 3300.0, profit=0.0,
+        deal(42, "out", "sell", 0.05, 3310.0, profit=50.0,
              at=datetime(2026, 1, 1, 11, 0)),
     ])
     repo.rebuild_trades("XAUUSDm")
-    assert one_trade()["pips"] == pytest.approx(25.0)
+    t = one_trade()
+    assert t["pips"] == pytest.approx(100.0)
+    # The money still knows about the partial, and `exit_price` still reports
+    # the volume-weighted average the trade actually left at. Only the distance
+    # ignores the split.
+    assert t["exit_price"] == pytest.approx(3307.5)
+    assert t["net_profit"] == pytest.approx(75.0)
+
+
+def test_a_scaled_out_trade_that_scratches_its_runner_reports_ZERO_pips():
+    """The other side of the rule above, and the price it charges.
+
+    Half banked at +5.00 and the runner stopped at break-even is a MONEY win of
+    $25 and a distance of nothing: entry 3300, final exit 3300. It is reported
+    as 0 pips, and the `pip_wins` / `wins` pair in trade_stats is what makes the
+    two readings visibly disagree rather than one of them looking wrong.
+    """
+    repo.upsert_deals([
+        deal(52, "in", "buy", 0.1, 3300.0, at=datetime(2026, 2, 1, 10, 0)),
+        deal(52, "out", "sell", 0.05, 3305.0, profit=25.0,
+             at=datetime(2026, 2, 1, 10, 30)),
+        deal(52, "out", "sell", 0.05, 3300.0, profit=0.0,
+             at=datetime(2026, 2, 1, 11, 0)),
+    ])
+    repo.rebuild_trades("XAUUSDm")
+    assert one_trade()["pips"] == pytest.approx(0.0)
+    stats = repo.trade_stats("XAUUSDm")
+    assert stats["wins"] == 1
+    assert stats["pip_wins"] == 0
+    assert stats["net_pips"] == pytest.approx(0.0)
+
+
+def test_a_half_banked_position_still_running_has_no_pip_figure():
+    """A partial exit is not an exit. At the 0.01 lots pips are measured in, a
+    position is never partly out, so there is no distance to state until the
+    trade closes -- and the row that used to report the banked leg's 50 pips
+    described a trade that was still live and could still be stopped."""
+    repo.upsert_deals([
+        deal(53, "in", "buy", 0.1, 3300.0, at=datetime(2026, 3, 1, 10, 0)),
+        deal(53, "out", "sell", 0.05, 3305.0, profit=25.0,
+             at=datetime(2026, 3, 1, 10, 30)),
+    ])
+    repo.rebuild_trades("XAUUSDm")
+    t = one_trade()
+    assert t["status"] == "open"
+    assert t["pips"] is None
 
 
 def test_an_unexited_position_has_no_pip_figure_rather_than_zero():

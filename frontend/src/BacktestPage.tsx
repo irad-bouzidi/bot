@@ -677,7 +677,10 @@ const BacktestPage = ({ prefs }: { prefs: PreferencesState }) => {
                   cost-free, so here the two agree in sign on every trade -- the
                   reason to show both is that pips are blind to the lot size,
                   which is what makes them comparable between two runs that
-                  sized differently. */}
+                  sized differently. Blind to it strictly: the distance is
+                  measured entry to final exit as though the lot were 0.01, so
+                  re-running with the scale-out resized moves every money figure
+                  on this page and none of the pips ones. */}
               <div className="stat">
                 <span
                   className="stat-label"
