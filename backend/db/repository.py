@@ -485,6 +485,15 @@ WITH scoped AS (
         CASE WHEN COALESCE(SUM(volume) FILTER (WHERE entry_kind IN ('out', 'out_by')), 0) > 0
              THEN SUM(price * volume) FILTER (WHERE entry_kind IN ('out', 'out_by'))
                   / SUM(volume) FILTER (WHERE entry_kind IN ('out', 'out_by')) END AS exit_price,
+        -- The LAST exit's price, unweighted, which is a different question from
+        -- `exit_price` above and is what the pips column is derived from. See
+        -- the note on that column: pips are measured as though the position
+        -- were 0.01 lots, which cannot be scaled out, so a partial fill is not
+        -- part of the distance the trade travelled. Kept as its own expression
+        -- rather than replacing `exit_price`, because the average IS the right
+        -- answer for the money and for what the trade history displays.
+        (ARRAY_AGG(price ORDER BY dealt_at DESC, ticket DESC)
+            FILTER (WHERE entry_kind IN ('out', 'out_by')))[1] AS final_exit_price,
         COALESCE(SUM(profit), 0) AS gross_profit,
         COALESCE(SUM(commission), 0) AS commission,
         COALESCE(SUM(swap), 0) AS swap,
@@ -516,7 +525,7 @@ SELECT
     -- every cost into a credit.
     gross_profit + commission + swap + fee,
     -- The result as a price distance, in pips. NULL rather than 0 whenever it
-    -- cannot be stated: nothing has been exited yet, or the symbol is not in
+    -- cannot be stated: the trade has not finished, or the symbol is not in
     -- SYMBOL_CONFIG so nothing here knows what a pip of it is. A 0 would read
     -- as "closed flat", which is a claim.
     --
@@ -525,11 +534,23 @@ SELECT
     -- short: the closing deal of a short is a buy, so its own direction says
     -- nothing about which way the trade needed price to go.
     --
-    -- Volume-weighted through `exit_price`, so a scaled-out trade reports the
-    -- average distance it actually left at rather than its last leg's.
-    CASE WHEN %(pip)s > 0 AND entry_price IS NOT NULL AND exit_price IS NOT NULL
+    -- SIZE PLAYS NO PART, which is the whole definition: every pips figure this
+    -- project reports is measured as though the position were 0.01 lots, and no
+    -- broker will scale 0.01 lots out. So this is entry to FINAL exit, and a
+    -- trade that banked half at +50 and ran the rest to the +100 target is 100
+    -- pips -- not the 75 the volume-weighted `exit_price` gives. That weighting
+    -- put the lot size back inside a number that exists to be free of it: the
+    -- same price path folded to 100 pips at 0.01 lots (too small for the broker
+    -- to split, so no partial deal exists), 75 at 0.10 and 66.7 at 0.03, where
+    -- MT5's volume step lands the split on 0.02 against 0.01.
+    --
+    -- Gated on the trade being CLOSED, and not merely on an exit deal existing,
+    -- for the same reason: at 0.01 lots a position is never partly out, so a
+    -- half-banked trade still running has no distance to report yet.
+    CASE WHEN %(pip)s > 0 AND entry_price IS NOT NULL
+              AND volume_in > 0 AND volume_out >= volume_in - %(eps)s
          THEN (CASE WHEN entry_type = 'buy' THEN 1 ELSE -1 END)
-              * (exit_price - entry_price) / %(pip)s END,
+              * (final_exit_price - entry_price) / %(pip)s END,
     comment, now()
 FROM folded
 WHERE opened_at IS NOT NULL

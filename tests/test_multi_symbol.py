@@ -99,6 +99,30 @@ def test_the_pip_definition_is_the_one_the_reports_are_read_in(symbol, dollars):
     assert to_pips(symbol, -dollars) == pytest.approx(-10.0)
 
 
+@pytest.mark.parametrize("symbol,entry,target", [
+    ("XAUUSDm", 4300.0, 4310.0),
+    ("BTCUSDm", 70500.0, 71500.0),
+])
+def test_a_trade_that_runs_to_its_target_is_100_pips_on_either_side(
+        symbol, entry, target):
+    """The worked examples the definition was specified from.
+
+    A gold long opened at 4300 that hits its target at 4310 is 100 pips; a
+    Bitcoin long opened at 70500 that hits 71500 is 100 pips. The sign is the
+    TRADE's, so the mirror-image short -- in at the target, out at the entry --
+    is the same +100 and not -100. These are the same 100 pips as the `tp_pips`
+    in SYMBOL_CONFIG, which is the point: the target is quoted in pips, so a
+    trade that reaches it has to report the number that was quoted.
+    """
+    distance = target - entry
+    assert to_pips(symbol, distance) == pytest.approx(100.0)          # long won
+    assert to_pips(symbol, -distance) == pytest.approx(-100.0)        # long lost
+    # A short is entered high and exited low, so its winning distance is
+    # `entry - exit`. Same magnitude, same sign as the winning long.
+    assert to_pips(symbol, -(entry - target)) == pytest.approx(100.0)
+    assert SYMBOL_CONFIG[symbol]["tp_pips"] == 100
+
+
 def test_an_unconfigured_symbol_reports_no_pips_rather_than_golds():
     """The mirror of `price_levels` refusing to reuse gold's pip, on the
     REPORTING side. There is nothing to raise about here -- a pips column is not
@@ -352,12 +376,14 @@ def test_a_full_stop_out_is_exactly_the_configured_pip_count():
     assert res["total_pl"] == pytest.approx(-70.0)
 
 
-def test_a_scale_out_reports_the_distance_the_POSITION_travelled():
-    """Half banked at +50 pips, the runner scratched at entry -> 25, not 50.
+def test_a_scale_out_that_scratches_its_runner_reports_ZERO_pips():
+    """Half banked at +50 pips, the runner scratched at entry -> 0 pips.
 
-    Volume-weighted, matching the live trade fold's volume-weighted exit price.
-    Counting each leg's distance in full would report a trade that banked half
-    way to a 100-pip target and gave the rest back as a 50-pip winner.
+    A MONEY win and a distance of nothing, and both statements are true: the
+    position finished where it started. Pips are measured as though the lot were
+    0.01, which no broker will scale out, so the banked leg is not part of the
+    distance -- the volume-weighted answer this used to give (25) is the lot
+    size leaking back into the one figure that exists to be free of it.
     """
     close = [80000.0, 79000.0, 79600.0, 79000.0, 79000.0, 79000.0]
     df = pd.DataFrame({"close": close,
@@ -371,18 +397,59 @@ def test_a_scale_out_reports_the_distance_the_POSITION_travelled():
     res = simulate_legacy(df, outs, uppers, lowers, _btc_config(), 1000.0)
 
     assert res["partials_fired"] == 1
-    # The trigger is 500 of price = 50 pips above entry, on half the position.
-    assert res["partial_pips"] == pytest.approx(25.0)
-    assert res["closed_trades"][0]["pips"] == pytest.approx(25.0)
-    assert res["net_pips"] == pytest.approx(25.0)
-    assert res["pips_won"] == pytest.approx(25.0)
+    assert res["closed_trades"][0]["pips"] == pytest.approx(0.0)
+    assert res["net_pips"] == pytest.approx(0.0)
+    # The money still banked the partial. The two disagreeing is the point of
+    # reporting both, not a defect in either.
+    assert res["wins"] == 1
+    assert res["total_pl"] == pytest.approx(25.0)
+
+
+@pytest.mark.parametrize("symbol,entry", [("XAUUSDm", 4300.0), ("BTCUSDm", 70500.0)])
+@pytest.mark.parametrize("lot", [0.01, 0.02, 0.03, 0.1, 1.0])
+def test_the_worked_example_reports_100_pips_at_every_lot_size(symbol, entry, lot):
+    """Gold in at 4300 out at 4310, Bitcoin in at 70500 out at 71500: 100 pips.
+
+    Driven through the engine rather than through `to_pips`, at the sizes where
+    the scale-out behaves differently -- 0.01 cannot be split by any broker,
+    0.03 splits unevenly into 0.02 against 0.01 -- and with the rule ON, as it
+    ships. Every one of them has to report the same 100, because the size is not
+    part of the measurement.
+    """
+    cfg = dict(SYMBOL_CONFIG[symbol], lot_size=lot)
+    pip = cfg["pip"]
+    be_dist = cfg["be_trigger_pips"] * pip
+    target = entry + cfg["tp_pips"] * pip
+
+    close = [entry, entry + be_dist, target]
+    df = pd.DataFrame({"close": close,
+                       "time": pd.date_range("2026-04-01", periods=3, freq="5min")})
+    far = cfg["tp_pips"] * pip * 10
+    # Only bar 0 is below its band, so exactly one trade is taken.
+    lowers = np.array([entry + pip, entry - far, entry - far])
+    uppers = np.full(3, target + far)
+    outs = np.full(3, target + far)
+
+    res = simulate_legacy(df, outs, uppers, lowers, cfg, 100000.0)
+
+    assert res["trades_opened"] == 1
+    assert res["closed_trades"][0]["pips"] == pytest.approx(100.0)
+    assert res["pips_won"] == pytest.approx(100.0)
+    assert res["net_pips"] == pytest.approx(100.0)
 
 
 def test_pips_do_not_move_with_the_lot_size_and_the_money_does():
     """The reason both are reported. A pips figure is a statement about PRICE,
     so it is the number that stays comparable between two runs sized
     differently -- which is exactly what the Backtest page's sizing panel
-    invites."""
+    invites.
+
+    Swept WITH the scale-out on, at the sizes where the rule behaves differently
+    -- 0.01 is too small for the broker to split at all, 0.03 splits unevenly
+    into 0.02 against 0.01 -- because that is precisely where the old
+    volume-weighted figure disagreed with itself: the same price path reported
+    100, 66.7 and 75 pips at 0.01, 0.03 and 0.1 lots.
+    """
     close = [80000.0, 79000.0, 78300.0, 78300.0]
     df = pd.DataFrame({"close": close,
                        "time": pd.date_range("2026-03-01", periods=len(close),
@@ -391,13 +458,15 @@ def test_pips_do_not_move_with_the_lot_size_and_the_money_does():
     outs, uppers = np.full(n, 85000.0), np.full(n, 90000.0)
     lowers = np.array([70000.0, 79500.0, 70000.0, 70000.0])
 
-    small = simulate_legacy(df, outs, uppers, lowers,
-                            _btc_config(lot_size=0.01, partial_fraction=0.0), 1000.0)
-    big = simulate_legacy(df, outs, uppers, lowers,
-                          _btc_config(lot_size=0.1, partial_fraction=0.0), 1000.0)
+    runs = {lot: simulate_legacy(df, outs, uppers, lowers,
+                                 _btc_config(lot_size=lot), 1000.0)
+            for lot in (0.01, 0.02, 0.03, 0.1, 1.0)}
 
-    assert small["net_pips"] == pytest.approx(big["net_pips"])
-    assert small["total_pl"] == pytest.approx(big["total_pl"] / 10.0)
+    # Entry 79000, stopped 700 lower: -70 pips at every size.
+    for lot, res in runs.items():
+        assert res["net_pips"] == pytest.approx(-70.0), lot
+    # ... while the money scales with the size, which is what it is for.
+    assert runs[0.1]["total_pl"] == pytest.approx(runs[0.01]["total_pl"] * 10.0)
 
 
 def test_the_two_symbols_report_the_same_pips_for_the_same_rule():

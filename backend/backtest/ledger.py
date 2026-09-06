@@ -85,7 +85,9 @@ class TradeRecord:
     swap: float = 0.0
     net_pl: float = 0.0
     pnl_r: float = 0.0                  # net P&L in R units -- the comparable one
-    # The result as a PRICE distance in pips, volume-weighted across the legs.
+    # The result as a PRICE distance in pips: entry to FINAL exit, with the
+    # scale-out's banked leg playing no part (pips are measured as though the
+    # position were 0.01 lots, which cannot be scaled out).
     # Gross by construction -- a distance carries no commission or swap -- so a
     # trade can be positive here and negative on `net_pl`. Both are kept because
     # that gap is the cost, per trade, and neither number can show it alone.

@@ -1090,20 +1090,31 @@ class TradingBot(threading.Thread):
         self.running = False
 
 
-def _leg_pips(side, entry_price, exit_price, volume, lot_size, pip):
-    """One leg's contribution to a trade's pip result, WEIGHTED by its share.
+def _trade_pips(side, entry_price, exit_price, pip):
+    """A trade's result as a price distance, in pips. SIZE PLAYS NO PART.
 
-    Weighted rather than counted in full, matching how the live trade fold
-    derives pips from a volume-weighted exit price: a scale-out that banks half
-    at +50 pips and runs the rest to +100 moved the position 75 pips, not 150.
+    Entry to FINAL exit, which is the whole of the definition: every pips figure
+    this project reports is measured as though the position were the smallest
+    lot the broker will take, and 0.01 lots cannot be scaled out at any broker.
+    So the partial leg contributes nothing and the distance is the one the trade
+    travelled from where it got in to where it got out.
 
-    Returns 0.0 when the symbol has no pip or the size is zero -- this function
-    is on a pure path that takes a plain dict, so a synthetic config must not be
-    able to raise ZeroDivisionError inside the loop.
+    This used to weight each leg by the volume it carried, which read as the
+    honest answer -- half banked at +50 and the runner to +100 is 75 -- but made
+    a pips figure move with the lot size, the one thing it exists not to do:
+    0.01 lots reported 100 (too small to split, so no scale-out fired), 0.03
+    reported 66.7 (0.02 out against 0.01 running) and 0.1 reported 75, all for
+    the identical price path. A number that changes when only the size changes
+    cannot be compared between two runs, which is the entire reason it is
+    printed beside the money.
+
+    Returns 0.0 when the symbol has no pip -- this function is on a pure path
+    that takes a plain dict, so a synthetic config must not be able to raise
+    ZeroDivisionError inside the loop.
     """
-    if not pip or not lot_size:
+    if not pip:
         return 0.0
-    return side * (exit_price - entry_price) / pip * (volume / lot_size)
+    return side * (exit_price - entry_price) / pip
 
 
 def simulate_legacy(df, outs, uppers, lowers, config, initial_balance,
@@ -1130,11 +1141,12 @@ def simulate_legacy(df, outs, uppers, lowers, config, initial_balance,
 
     Pips are reported alongside the money and are a different measurement, not a
     restatement of it: a pip figure is the PRICE distance captured, so it is
-    blind to the lot size and, in this engine, identical whether you traded 0.01
-    lots or 10. Both are returned because each answers a question the other
-    cannot -- "was the strategy right about price" against "what did the account
-    do" -- and on a combined run they diverge further still, since the two
-    symbols can be sized differently.
+    blind to the lot size -- identical whether you traded 0.01 lots or 10, the
+    scale-out included, since the distance is measured entry to final exit and
+    the banked leg is not weighted into it. Both are returned because each
+    answers a question the other cannot -- "was the strategy right about price"
+    against "what did the account do" -- and on a combined run they diverge
+    further still, since the two symbols can be sized differently.
     """
     pip = config["pip"]
     sl_dist = config["sl_pips"] * pip
@@ -1173,7 +1185,6 @@ def simulate_legacy(df, outs, uppers, lowers, config, initial_balance,
     # Trade History page is worth less than no pips at all.
     pips_won = 0.0
     pips_lost = 0.0
-    partial_pips = 0.0
 
     # One entry per CLOSED trade, in the order they closed. It exists so several
     # symbols can be replayed onto ONE account (combine_legacy_results): a
@@ -1192,13 +1203,6 @@ def simulate_legacy(df, outs, uppers, lowers, config, initial_balance,
     open_volume = 0.0     # lots still running; the scale-out reduces it
     be_armed = False      # trigger reached: stop is at entry, partial already taken
     trade_pl = 0.0        # realised on THIS trade so far, partial included
-    # Volume-WEIGHTED, matching how the live trade fold derives its pips from a
-    # volume-weighted exit price. A scale-out banks half the position at the
-    # trigger, so counting the trigger's distance in full and the runner's in
-    # full would report a trade that moved 5.00 and then 10.00 as 150 pips of a
-    # 100-pip target. The weighted answer is the distance the position as a
-    # whole travelled.
-    trade_pips = 0.0
 
     for i in range(len(df)):
         price = df['close'].iloc[i]
@@ -1216,7 +1220,6 @@ def simulate_legacy(df, outs, uppers, lowers, config, initial_balance,
                 open_volume = lot_size
                 be_armed = False
                 trade_pl = 0.0
-                trade_pips = 0.0
                 trades_opened += 1
         else:
             if arms_breakeven and not be_armed \
@@ -1231,10 +1234,10 @@ def simulate_legacy(df, outs, uppers, lowers, config, initial_balance,
                     trade_pl += pl
                     partial_pl += pl
                     partials_fired += 1
-                    leg_pips = _leg_pips(side, entry_price, trigger_price,
-                                         scale_out_lots, lot_size, pip)
-                    trade_pips += leg_pips
-                    partial_pips += leg_pips
+                    # No pips are booked here. The banked leg moves the MONEY
+                    # and nothing else: pips are measured as though the position
+                    # were 0.01 lots, which no broker will scale out, so the
+                    # trade's distance is settled once, at its final exit below.
                     open_volume = runner_lots
 
             # be_armed pulls the stop to entry, which is the whole point of the
@@ -1256,8 +1259,10 @@ def simulate_legacy(df, outs, uppers, lowers, config, initial_balance,
                 balance += pl
                 total_pl += pl
                 trade_pl += pl
-                trade_pips += _leg_pips(side, entry_price, exit_price,
-                                        open_volume, lot_size, pip)
+                # Entry to FINAL exit, whatever was banked on the way. See
+                # _trade_pips: a distance that moved with the lot size could not
+                # be compared between two runs, which is what it is printed for.
+                trade_pips = _trade_pips(side, entry_price, exit_price, pip)
                 if trade_pips > 0:
                     pips_won += trade_pips
                 elif trade_pips < 0:
@@ -1304,14 +1309,18 @@ def simulate_legacy(df, outs, uppers, lowers, config, initial_balance,
         "runner_lots": runner_lots,
         "partials_fired": partials_fired,
         "partial_pl": partial_pl,
-        # Pips: the price distance captured, independent of the lot size above.
-        # `pips_lost` is NEGATIVE, like avg_loss is elsewhere in this codebase,
-        # so net_pips is the sum of the two rather than a subtraction that is
-        # easy to get backwards.
+        # Pips: the price distance captured, independent of the lot size above
+        # and of `partial_pl` beside it. `pips_lost` is NEGATIVE, like avg_loss
+        # is elsewhere in this codebase, so net_pips is the sum of the two
+        # rather than a subtraction that is easy to get backwards.
+        #
+        # There is deliberately no `partial_pips` to sit next to `partial_pl`.
+        # The scale-out banks money, not distance -- the position is measured at
+        # 0.01 lots, where the rule cannot fire -- so the key would be a
+        # constant 0.0 inviting the reading that the partial captured nothing.
         "pips_won": pips_won,
         "pips_lost": pips_lost,
         "net_pips": pips_won + pips_lost,
-        "partial_pips": partial_pips,
         "pip": pip,
         "closed_trades": closed_trades,
         # This engine checks exits on CLOSES only and models no spread, commission

@@ -27,7 +27,11 @@ median spread understates what this strategy actually pays.
 Every scenario also reports PIPS won and lost, from the symbol's own pip in
 SYMBOL_CONFIG. They are gross price distance -- a distance cannot carry a
 spread -- so read them against the money figures rather than as a version of
-them: the difference between the two is what the cost scenario charged.
+them: the difference between the two is what the cost scenario charged. Each
+trade is measured entry to FINAL exit as though the lot were 0.01, so `--volume`
+and the scale-out move every money figure in the report and none of the pips
+ones. A run whose scale-out banks half at +50 and scratches its runner shows
+that trade as 0 pips and a positive P&L; both are true of it.
 """
 
 import argparse
