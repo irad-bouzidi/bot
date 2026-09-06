@@ -6,10 +6,17 @@ are the ones the previous implementation got wrong:
 1. A signal is evaluated on the CLOSE of bar i using data <= i only.
 2. Entries and signal-driven exits fill at bar i+1's OPEN, adjusted for costs.
    No same-bar fills. A signal on the final bar cannot fill.
-3. While a position is open, every subsequent bar is checked for INTRABAR SL/TP
-   against that bar's high/low. The old engine compared only against `close`, so
-   any stop swept intrabar and recovered by the close was scored as a later win.
-   For a band-fading strategy on M5 this was the single largest source of bias.
+3. Every bar FROM THE FILL ONWARD -- the entry bar included -- is checked for
+   INTRABAR SL/TP against that bar's high/low. The old engine compared only
+   against `close`, so any stop swept intrabar and recovered by the close was
+   scored as a later win. For a band-fading strategy on M5 this was the single
+   largest source of bias.
+   "From the fill onward" is load-bearing and was itself a bug for a while: this
+   said "every SUBSEQUENT bar", and the loop skipped the entry bar, so the first
+   check landed on the NEXT bar's open and rule 5 booked it as a gap. On gold M5
+   that hit 717 of 1044 stop-outs and filled them an average of 3.0 past a 7.00
+   stop -- and it disagreed with the live bot, which sends `sl`/`tp` inside the
+   entry order (`bot_manager.open_trade`), so the broker holds both from the fill.
 4. Same-bar tie-break: SL BEFORE TP. If both levels sit inside [low, high] the
    trade is booked as a stop-out. Conservative and documented; `tie_break="ambiguous"`
    instead flags such trades and reports how much of the edge rests on bars whose
@@ -40,12 +47,13 @@ import numpy as np
 import pandas as pd
 
 from backend.backtest.costs import CostConfig, CostModel
+from backend.backtest.risk import RiskConfig, size_for_risk
 from backend.backtest.ledger import (
     EXIT_BE, EXIT_END_OF_DATA, EXIT_SIGNAL, EXIT_SL, EXIT_TP,
     SIGNAL_EXIT_REASONS, TradeRecord,
     session_of, to_frame,
 )
-from backend.core.types import PositionView, Side, SignalType, SymbolSpec
+from backend.core.types import PositionView, Side, Signal, SignalType, SymbolSpec
 from backend.data.market_data import BarSet
 from backend.strategy.base import Bar, BarContext, Strategy
 
@@ -55,6 +63,9 @@ class BacktestConfig:
     initial_balance: float = 1000.0
     volume: float = 0.1        # matches SYMBOL_CONFIG lot_size; keep the two equal
     tie_break: str = "sl_first"     # "sl_first" | "tp_first" | "ambiguous"
+    # Sizing and the caps that bound a losing run. Defaults to the disabled
+    # config, so an engine constructed without one behaves exactly as before.
+    risk: RiskConfig = None
     legacy_mode: bool = False       # reproduce the ORIGINAL engine, for regression only
     # Price distance of one pip, for REPORTING only -- nothing in the execution
     # contract above reads it, and changing it cannot move a fill, a stop or a
@@ -88,15 +99,23 @@ class BacktestEngine:
 
     # -- intrabar resolution -------------------------------------------------
 
-    def _resolve_stops(self, side, sl, tp, o, h, l):
+    def _resolve_stops(self, side, sl, tp, o, h, l, on_entry_bar=False):
         """Return (exit_price, reason) or (None, None) if the bar does not close it.
 
         Rule 5 lives here: a gap through a level fills at the OPEN, which is the
         first price actually available, not at the level itself.
+
+        `on_entry_bar` turns that off, because on the bar the trade FILLED the open
+        is not a price the position gapped past -- it is the price it opened at.
+        Both levels are derived from that same open (`_open`), so `o <= sl` needs a
+        stop closer than the spread and `o >= tp` a negative target: unreachable
+        for any sane geometry. The flag exists so the pathological case still fills
+        at the LEVEL, which is the first price the position could have left at,
+        rather than at an "open" it never gapped through.
         """
         if side is Side.LONG:
-            gap_sl = sl > 0 and o <= sl
-            gap_tp = tp > 0 and o >= tp
+            gap_sl = not on_entry_bar and sl > 0 and o <= sl
+            gap_tp = not on_entry_bar and tp > 0 and o >= tp
             if gap_sl and gap_tp:
                 return (o, EXIT_SL)
             if gap_sl:
@@ -106,8 +125,8 @@ class BacktestEngine:
             hit_sl = sl > 0 and l <= sl
             hit_tp = tp > 0 and h >= tp
         else:
-            gap_sl = sl > 0 and o >= sl
-            gap_tp = tp > 0 and o <= tp
+            gap_sl = not on_entry_bar and sl > 0 and o >= sl
+            gap_tp = not on_entry_bar and tp > 0 and o <= tp
             if gap_sl and gap_tp:
                 return (o, EXIT_SL)
             if gap_sl:
@@ -129,28 +148,34 @@ class BacktestEngine:
 
     # -- scale-out / break-even (rule 9) -------------------------------------
 
-    def _trigger_touch(self, side, b, o, h, l):
+    def _trigger_touch(self, side, b, o, h, l, on_entry_bar=False):
         """First available price at which scale-out trigger `b` fills, or None.
 
         Same gap principle as rule 5: if the bar OPENS beyond the trigger, the
         first price actually available is the open. Here that is in the trade's
         favour, so it books at the open rather than at the trigger -- the mirror of
         a gapped stop booking worse than its level, not a free improvement.
+
+        And the same exception: on the entry bar the open IS the fill price, so the
+        trigger cannot have been gapped past. Booking the open there would hand the
+        scale-out a profit the position never travelled to.
         """
         if b <= 0:
             return None
         if side is Side.LONG:
-            if o >= b:
+            if o >= b and not on_entry_bar:
                 return o
             return b if h >= b else None
-        if o <= b:
+        if o <= b and not on_entry_bar:
             return o
         return b if l <= b else None
 
-    def _resolve_bar(self, t, side, o, h, l):
+    def _resolve_bar(self, t, side, o, h, l, on_entry_bar=False):
         """Everything that can happen to open trade `t` during one bar.
 
-        Returns (partial_price | None, exit_price | None, exit_reason, ambiguous).
+        Returns (partial_price | None, exit_price | None, exit_reason, ambiguous),
+        where `ambiguous` is "", "unresolvable" or "entry_bar" -- see the note on
+        the break-even branch for why the last one is counted apart.
 
         Ordering, in the same conservative spirit as rules 4-5:
 
@@ -169,16 +194,17 @@ class BacktestEngine:
         """
         sl, tp, be = t.sl_price, t.tp_price, t.be_trigger_price
         partial_px = None
-        ambiguous = False
+        ambiguous = ""
 
         if not t.be_moved and be > 0:
-            b_px = self._trigger_touch(side, be, o, h, l)
-            sl_px, sl_reason = self._resolve_stops(side, sl, 0.0, o, h, l)
+            b_px = self._trigger_touch(side, be, o, h, l, on_entry_bar)
+            sl_px, sl_reason = self._resolve_stops(
+                side, sl, 0.0, o, h, l, on_entry_bar)
             if b_px is not None and sl_px is not None:
                 # Trigger and original stop both touched: order unknowable.
-                return (None, sl_px, EXIT_SL, True)
+                return (None, sl_px, EXIT_SL, "unresolvable")
             if sl_px is not None:
-                return (None, sl_px, EXIT_SL, False)
+                return (None, sl_px, EXIT_SL, "")
             if b_px is not None:
                 partial_px = b_px
                 # The break-even stop is live from the NEXT bar, not this one.
@@ -202,21 +228,32 @@ class BacktestEngine:
                 # rather than assumed away.
                 sl = t.entry_price
                 if side is Side.LONG:
-                    gap_tp = tp > 0 and o >= tp
+                    gap_tp = not on_entry_bar and tp > 0 and o >= tp
                     hit_tp = tp > 0 and h >= tp
                     unresolved = l <= sl
                 else:
-                    gap_tp = tp > 0 and o <= tp
+                    gap_tp = not on_entry_bar and tp > 0 and o <= tp
                     hit_tp = tp > 0 and l <= tp
                     unresolved = h >= sl
+                # `sl` is the entry price here. On the ENTRY bar that is this
+                # bar's own open plus the spread, so "the low printed below it" is
+                # true of almost any bar with a downward wick -- 47% of gold's
+                # trades, against 23% before the entry bar was resolved at all.
+                # It is still not orderable from OHLC, but it is not evidence of
+                # anything either, and folding it in would destroy the meaning of
+                # a counter whose whole job is to say how much of the edge rests
+                # on genuinely unresolvable bars. So it is counted apart.
+                amb = ""
+                if unresolved:
+                    amb = "entry_bar" if on_entry_bar else "unresolvable"
                 if gap_tp:
                     # Gapped clean past the target: both legs fill at the open.
-                    return (partial_px, o, EXIT_TP, False)
+                    return (partial_px, o, EXIT_TP, "")
                 if hit_tp:
-                    return (partial_px, tp, EXIT_TP, unresolved)
-                return (partial_px, None, "", unresolved)
+                    return (partial_px, tp, EXIT_TP, amb)
+                return (partial_px, None, "", amb)
 
-        px, reason = self._resolve_stops(side, sl, tp, o, h, l)
+        px, reason = self._resolve_stops(side, sl, tp, o, h, l, on_entry_bar)
         if px is not None and reason == EXIT_SL and t.be_moved:
             reason = EXIT_BE
         return (partial_px, px, reason or "", ambiguous)
@@ -266,6 +303,11 @@ class BacktestEngine:
                                   {"error": "no bars"}, warnings=warnings)
 
         feats = self.strategy.prepare(df)
+        # Hoisted out of the per-bar BarContext below. `feats[k].values[i]` re-ran
+        # a DataFrame __getitem__ and a .values materialisation for every column
+        # on every bar; over 100k bars that alone was ~46% of the run. Same
+        # numbers, and the sweep depends on this being cheap.
+        feat_cols = {k: feats[k].values for k in feats.columns}
         self.strategy.reset()
 
         o = df["open"].values
@@ -275,19 +317,46 @@ class BacktestEngine:
         spr = df["spread"].values if "spread" in df.columns else np.zeros(n)
         idx = df.index
 
+        rc = cfg.risk or RiskConfig()
         balance = cfg.initial_balance
         equity_curve = np.full(n, balance, dtype=float)
+        # Risk state. All locals, like `balance` and `pending`, so a run cannot
+        # inherit another run's streak.
+        cur_day = None
+        day_open_equity = cfg.initial_balance
+        daily_pl = 0.0
+        loss_streak = 0
+        cooldown_left = 0
+        halted = False
+        halt_reason = ""
+        halt_time = None
+        entries_blocked = {"daily_loss": 0, "cooldown": 0, "halted": 0}
+        entries_skipped_too_small = 0
         trades = []                 # type: List[TradeRecord]
         open_trade = None           # type: Optional[TradeRecord]
         position = None             # type: Optional[PositionView]
         pending = None              # a signal awaiting the next bar's open
         ambiguous_bars = 0
+        ambiguous_entry_bars = 0
         # Evaluate from the first non-warm-up bar. The strategy must be ASKED on
         # this bar even though nothing can fill on it -- its signal fills at the
         # next bar's open (rule 2).
         start = barset.warmup_count
 
         for i in range(start, n):
+            # --- roll the broker's trading day; decay the cooldown ---
+            # The day is the BROKER's, via the spec's measured offset, or a
+            # daily loss cap resets in the middle of the London session.
+            if rc.enabled:
+                day = int((idx[i].value // 10 ** 9
+                           + spec.server_utc_offset_seconds) // 86400)
+                if day != cur_day:
+                    cur_day = day
+                    day_open_equity = equity_curve[i - 1] if i > start else balance
+                    daily_pl = 0.0
+                if cooldown_left:
+                    cooldown_left -= 1
+
             # --- fill anything queued on the previous bar (rule 2) ---
             if pending is not None:
                 sig = pending
@@ -306,11 +375,56 @@ class BacktestEngine:
                         and open_trade is None:
                     side = Side.LONG if sig.type is SignalType.ENTER_LONG else Side.SHORT
                     px = self.costs.entry_fill(side, o[i], spec, spr[i])
-                    open_trade, position = self._open(
-                        sig, side, px, i, idx[i], spec, spr[i], len(trades) + 1)
+                    # The gate sits at FILL time, not at signal time: that is the
+                    # moment an order would actually be sent, and it is where the
+                    # live loop checks too.
+                    block = None
+                    if halted:
+                        block = "halted"
+                    elif cooldown_left:
+                        block = "cooldown"
+                    elif rc.max_daily_loss_pct > 0 and daily_pl <= -abs(
+                            day_open_equity) * rc.max_daily_loss_pct / 100.0:
+                        block = "daily_loss"
+                    if block:
+                        # Counted by reason, never silently dropped. `Trading
+                        # Bot.md` rule 6 says do not hide losing trades; its
+                        # mirror is that a rule you cannot count is a rule you
+                        # cannot evaluate.
+                        entries_blocked[block] += 1
+                    else:
+                        vol = cfg.volume
+                        if rc.risk_pct_per_trade > 0:
+                            eq = equity_curve[i - 1] if i > start else balance
+                            sl_d = sig.sl_distance or 0.0
+                            vol = size_for_risk(rc, spec, eq, px,
+                                                px - sl_d * side.sign, side.sign)
+                        if not vol or vol <= 0:
+                            entries_skipped_too_small += 1
+                        else:
+                            open_trade, position = self._open(
+                                sig, side, px, i, idx[i], spec, spr[i],
+                                len(trades) + 1, volume=vol)
+
+            # --- track excursions ---
+            # Before the stop block, not after it, so the bar that CLOSES a trade
+            # still contributes its range. That matters now that a trade can open
+            # and close on the same bar: it would otherwise be written with
+            # mae_price == mfe_price == 0.0 and quietly flatten the MAE/MFE
+            # distribution the stop distance gets fitted against.
+            if open_trade is not None:
+                self._track_excursion(open_trade, position.side, hi[i], lo[i])
 
             # --- intrabar stops on the CURRENT bar (rules 3-6, 9) ---
-            if open_trade is not None and i > open_trade.entry_index:
+            # `>=`, not `>`: SL and TP are live from the FILL, which happened at
+            # this bar's open. Skipping the entry bar deferred the first check to
+            # the next bar's open, where rule 5 booked it as a gap -- 717 of gold's
+            # 1044 stop-outs, filled an average of 3.0 past a 7.00 stop. Live, the
+            # broker holds both levels from the fill (`bot_manager.open_trade`
+            # sends them inside the entry order), so this is also what the bot does.
+            if open_trade is not None and i >= open_trade.entry_index:
+                on_entry_bar = i == open_trade.entry_index
+                px, reason = None, ""
                 if not cfg.legacy_mode:
                     both_in = (
                         open_trade.sl_price > 0 and open_trade.tp_price > 0
@@ -322,9 +436,12 @@ class BacktestEngine:
                     if both_in:
                         ambiguous_bars += 1
                     partial_px, px, reason, amb = self._resolve_bar(
-                        open_trade, position.side, o[i], hi[i], lo[i])
+                        open_trade, position.side, o[i], hi[i], lo[i], on_entry_bar)
                     if amb and not both_in:
-                        ambiguous_bars += 1
+                        if amb == "entry_bar":
+                            ambiguous_entry_bars += 1
+                        else:
+                            ambiguous_bars += 1
                     if partial_px is not None:
                         balance += self._fire_partial(
                             open_trade, position.side, partial_px, i, idx[i],
@@ -335,26 +452,38 @@ class BacktestEngine:
                             entry_price=position.entry_price,
                             entry_time=position.entry_time,
                             sl=open_trade.sl_price, tp=open_trade.tp_price)
-                else:
+                elif not on_entry_bar:
+                    # legacy_mode exists to reproduce the ORIGINAL engine for
+                    # regression comparison, and the original skipped the entry
+                    # bar too. Fixing it here would make --compare-legacy measure
+                    # something other than the overstatement it exists to measure.
                     px, reason = self._legacy_stops(open_trade, position.side, cl[i])
 
                 if px is not None:
                     fill = self.costs.exit_fill(
                         position.side, px, spec, spr[i],
                         is_stop=(reason in (EXIT_SL, EXIT_BE)))
-                    balance += self._close(open_trade, fill, i, idx[i], reason, spec)
+                    delta = self._close(open_trade, fill, i, idx[i], reason, spec)
+                    balance += delta
+                    # `_close` returns the CASH DELTA, which excludes a partial
+                    # already banked on an earlier bar. Accumulating net_pl here
+                    # instead would count every scale-out twice in the daily cap.
+                    daily_pl += delta
+                    if open_trade.net_pl < 0:
+                        loss_streak += 1
+                        if 0 < rc.max_consecutive_losses <= loss_streak:
+                            cooldown_left = rc.cooldown_bars
+                            loss_streak = 0
+                    else:
+                        loss_streak = 0
                     trades.append(open_trade)
                     open_trade, position = None, None
-
-            # --- track excursions ---
-            if open_trade is not None:
-                self._track_excursion(open_trade, position.side, hi[i], lo[i])
 
             # --- ask the strategy (rule 1) ---
             ctx = BarContext(
                 index=i, time=idx[i].to_pydatetime(),
                 bar=Bar(o[i], hi[i], lo[i], cl[i], float(spr[i])),
-                features={k: float(feats[k].values[i]) for k in feats.columns},
+                features={k: float(v[i]) for k, v in feat_cols.items()},
                 position=position, spec=spec,
             )
             sigs = self.strategy.on_bar(ctx)
@@ -362,6 +491,22 @@ class BacktestEngine:
                 pending = sigs[0]
 
             equity_curve[i] = balance + self._unrealised(open_trade, position, cl[i], spec)
+
+            # --- the equity floor (terminal) ---
+            # Checked on the equity the bar actually printed, and only the floor
+            # is terminal. The daily cap blocks entries and is handled at fill
+            # time: closing a running position to honour a daily cap would
+            # realise the very loss the cap exists to bound.
+            if not halted and rc.min_equity > 0 and equity_curve[i] <= rc.min_equity:
+                halted = True
+                halt_reason = ("equity %.2f fell to the %.2f floor"
+                               % (equity_curve[i], rc.min_equity))
+                halt_time = idx[i]
+                if open_trade is not None and i < n - 1:
+                    # Fills at the NEXT bar's open like any other exit (rule 2).
+                    # This engine has no margin model, so there is nothing to
+                    # justify an intrabar liquidation.
+                    pending = Signal(SignalType.EXIT, "risk_halt", cl[i])
 
         # --- rule 7: mark the survivor to market ---
         if open_trade is not None:
@@ -379,12 +524,25 @@ class BacktestEngine:
         from backend.backtest.metrics import compute_metrics
         metrics = compute_metrics(ledger, equity, cfg.initial_balance)
         metrics["ambiguous_bars"] = ambiguous_bars
+        metrics["ambiguous_entry_bars"] = ambiguous_entry_bars
+        # A halted run's total_pl is NOT comparable with a completed one -- it
+        # stopped trading part-way through the window. Any ranking that does not
+        # filter on this can be won by a configuration that blew up on day 30.
+        metrics["halted"] = halted
+        metrics["halt_reason"] = halt_reason
+        metrics["halt_time"] = str(halt_time) if halt_time is not None else ""
+        metrics["min_equity_seen"] = float(np.nanmin(equity_curve))
+        metrics["entries_blocked"] = dict(entries_blocked)
+        for k, v in entries_blocked.items():
+            metrics["entries_blocked_" + k] = int(v)
+        metrics["entries_skipped_too_small"] = int(entries_skipped_too_small)
 
         return BacktestResult(
             ledger=ledger, equity=equity, metrics=metrics,
             config_used={
                 "initial_balance": cfg.initial_balance, "volume": cfg.volume,
                 "tie_break": cfg.tie_break, "legacy_mode": cfg.legacy_mode,
+                "risk": rc.__dict__,
                 "costs": self.costs.cfg.__dict__, "strategy": _strategy_cfg(self.strategy),
             },
             data_meta=barset.meta(), warnings=warnings,
@@ -406,7 +564,12 @@ class BacktestEngine:
                 return (t.tp_price, EXIT_TP)
         return (None, None)
 
-    def _open(self, sig, side, price, i, ts, spec, spread_pts, trade_id):
+    def _open(self, sig, side, price, i, ts, spec, spread_pts, trade_id,
+              volume=None):
+        # `volume` is the risk-sized lot when RiskConfig asked for one, and
+        # cfg.volume otherwise. 1R is anchored to it in `_close`, per trade, so
+        # varying the size does not make R incomparable across a run.
+        vol = self.cfg.volume if volume is None else float(volume)
         sl_d = sig.sl_distance or 0.0
         tp_d = sig.tp_distance or 0.0
         be_d = sig.be_trigger_distance or 0.0
@@ -422,9 +585,9 @@ class BacktestEngine:
         t = TradeRecord(
             trade_id=trade_id, symbol=spec.name, side=side.value,
             entry_time=ts.to_pydatetime(), entry_index=i, entry_price=price,
-            volume=self.cfg.volume, sl_price=spec.round_price(sl) if sl else 0.0,
+            volume=vol, sl_price=spec.round_price(sl) if sl else 0.0,
             tp_price=spec.round_price(tp) if tp else 0.0, r_price=sl_d,
-            remaining_volume=self.cfg.volume,
+            remaining_volume=vol,
             be_trigger_price=spec.round_price(be) if be else 0.0,
             partial_fraction=max(0.0, min(1.0, sig.partial_fraction or 0.0)),
             entry_reason=sig.reason, signal_strength=sig.strength,

@@ -1,5 +1,5 @@
 {
-  "captured_at": "2026-09-04T09:21:16.866599+00:00",
+  "captured_at": "2026-09-06T14:25:40.148402+00:00",
   "contract_size": 1.0,
   "currency_margin": "BTC",
   "currency_profit": "USD",
@@ -11,6 +11,10 @@
   "server_utc_offset_seconds": 0,
   "source": "mt5",
   "stops_level_points": 0,
+  "swap_long": -1638.6,
+  "swap_mode": 1,
+  "swap_rollover_3days": 5,
+  "swap_short": 0.0,
   "tick_size": 0.01,
   "tick_value": 0.01,
   "typical_spread_points": 1000.0,

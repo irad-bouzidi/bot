@@ -191,16 +191,37 @@ def test_load_settings_ignores_unknown_symbols_and_uneditable_keys(monkeypatch):
     assert "EURUSDm" not in bm.SYMBOL_CONFIG
 
 
+_OK_ROW = {"lot_size": 0.1, "partial_fraction": 0.5, "exit_at_mean": False,
+           "risk_pct": 0.0}
+
+
+def _row(**overrides):
+    """A full settings row with one column spoiled.
+
+    Written out in full because `load_settings` reads every EDITABLE_KEYS column
+    by name -- a partial row raises KeyError there, which is the deliberate
+    behaviour that stops a key being added without its column.
+    """
+    row = dict(_OK_ROW)
+    row.update(overrides)
+    return row
+
+
 @pytest.mark.parametrize("stored,key", [
-    ({"lot_size": -1.0, "partial_fraction": 0.5, "exit_at_mean": False}, "lot_size"),
-    ({"lot_size": 0.1, "partial_fraction": 1.0, "exit_at_mean": False}, "partial_fraction"),
-    ({"lot_size": 0.0, "partial_fraction": 0.5, "exit_at_mean": False}, "lot_size"),
+    (_row(lot_size=-1.0), "lot_size"),
+    (_row(partial_fraction=1.0), "partial_fraction"),
+    (_row(lot_size=0.0), "lot_size"),
     # `exit_at_mean` has no CHECK constraint to lean on -- BOOLEAN NOT NULL has
     # no out-of-range value -- but a dump, a JSONB round trip or a psql session
     # can still put a string in front of the validator. bool("no") is True, so
     # this is the case where a silent coercion turns the rule ON while the
     # dashboard reports it off.
-    ({"lot_size": 0.1, "partial_fraction": 0.5, "exit_at_mean": "no"}, "exit_at_mean"),
+    (_row(exit_at_mean="no"), "exit_at_mean"),
+    # risk_pct sizes the ORDER from equity, so an out-of-range row here is the
+    # most expensive of the four. 50 is the classic unit confusion -- "half",
+    # meant as 0.5 -- and it would risk half the account on one trade.
+    (_row(risk_pct=50.0), "risk_pct"),
+    (_row(risk_pct=-1.0), "risk_pct"),
 ])
 def test_out_of_range_stored_values_are_dropped_not_returned(monkeypatch, stored, key):
     """A value the validator refuses does not reach SYMBOL_CONFIG.
@@ -225,9 +246,10 @@ def test_a_bad_row_leaves_the_code_default_standing(monkeypatch):
     monkeypatch.setitem(bm.SYMBOL_CONFIG["XAUUSDm"], "lot_size", 0.1)
     monkeypatch.setitem(bm.SYMBOL_CONFIG["XAUUSDm"], "partial_fraction", 0.5)
     monkeypatch.setitem(bm.SYMBOL_CONFIG["XAUUSDm"], "exit_at_mean", False)
+    monkeypatch.setitem(bm.SYMBOL_CONFIG["XAUUSDm"], "risk_pct", 0.0)
     _stub_cursor(monkeypatch, [
-        {"symbol": "XAUUSDm", "lot_size": -1.0, "partial_fraction": 1.0,
-         "exit_at_mean": "yes"},
+        dict(_row(lot_size=-1.0, partial_fraction=1.0, exit_at_mean="yes",
+                  risk_pct=50.0), symbol="XAUUSDm"),
     ])
 
     bm._load_settings()
@@ -237,6 +259,8 @@ def test_a_bad_row_leaves_the_code_default_standing(monkeypatch):
     # A rejected flag leaves the code default standing too -- it does NOT fall
     # through to a truthy coercion of the string.
     assert bm.SYMBOL_CONFIG["XAUUSDm"]["exit_at_mean"] is False
+    # And the one that sizes real orders stays OFF rather than at 50%.
+    assert bm.SYMBOL_CONFIG["XAUUSDm"]["risk_pct"] == 0.0
 
 
 def test_an_unreachable_store_refuses_the_boot_rather_than_trading_the_default(monkeypatch):
@@ -300,10 +324,11 @@ def test_a_settings_edit_stores_what_it_applies(monkeypatch):
     monkeypatch.setattr(bm, "_volume_limits", lambda symbol: (0.01, 100.0, 0.01, False))
     written = {}
 
-    def fake_save(symbol, lot, fraction, at_mean, source=None, notes=None):
+    def fake_save(symbol, lot, fraction, at_mean, risk_pct=0.0,
+                  source=None, notes=None):
         written["args"] = (symbol, lot, fraction, at_mean, source)
         return {"lot_size": lot, "partial_fraction": fraction,
-                "exit_at_mean": at_mean}
+                "exit_at_mean": at_mean, "risk_pct": risk_pct}
 
     monkeypatch.setattr(repo, "save_settings", fake_save)
     manager = bm.BotManager.__new__(bm.BotManager)
@@ -353,10 +378,11 @@ def test_a_sizing_edit_does_not_reset_the_exit_rule(monkeypatch):
     monkeypatch.setattr(bm, "_volume_limits", lambda symbol: (0.01, 100.0, 0.01, False))
     seen = {}
 
-    def fake_save(symbol, lot, fraction, at_mean, source=None, notes=None):
+    def fake_save(symbol, lot, fraction, at_mean, risk_pct=0.0,
+                  source=None, notes=None):
         seen["at_mean"] = at_mean
         return {"lot_size": lot, "partial_fraction": fraction,
-                "exit_at_mean": at_mean}
+                "exit_at_mean": at_mean, "risk_pct": risk_pct}
 
     monkeypatch.setattr(repo, "save_settings", fake_save)
     manager = bm.BotManager.__new__(bm.BotManager)
@@ -381,10 +407,11 @@ def test_the_exit_rule_can_be_changed_while_a_position_is_open(monkeypatch):
     monkeypatch.setattr(bm, "_volume_limits", lambda symbol: (0.01, 100.0, 0.01, False))
     seen = {}
 
-    def fake_save(symbol, lot, fraction, at_mean, source=None, notes=None):
+    def fake_save(symbol, lot, fraction, at_mean, risk_pct=0.0,
+                  source=None, notes=None):
         seen["at_mean"] = at_mean
         return {"lot_size": lot, "partial_fraction": fraction,
-                "exit_at_mean": at_mean}
+                "exit_at_mean": at_mean, "risk_pct": risk_pct}
 
     monkeypatch.setattr(repo, "save_settings", fake_save)
     manager = bm.BotManager.__new__(bm.BotManager)
@@ -707,3 +734,111 @@ def test_lot_size_scales_pl_linearly():
                              cfg(lot_size=0.2, partial_fraction=0.0), 1000.0)
     assert big["total_pl"] == pytest.approx(small["total_pl"] * 2)
     assert big["trades_opened"] == small["trades_opened"]
+
+
+# ---------------------------------------------------------------------------
+# risk_pct -- the fourth editable key, and the first that sizes an order from
+# live account state rather than from a constant
+# ---------------------------------------------------------------------------
+
+def test_risk_pct_zero_means_the_lot_size_is_used(monkeypatch):
+    """0 is the shipped default and must be a true no-op. A non-zero default
+    would re-size a running bot the moment the code landed."""
+    monkeypatch.setitem(bm.SYMBOL_CONFIG["XAUUSDm"], "risk_pct", 0.0)
+    called = []
+    monkeypatch.setattr(bm.mt5, "account_info", lambda: called.append(1))
+    bot = bm.TradingBot.__new__(bm.TradingBot)
+    bot.symbol = "XAUUSDm"
+    bot.config = bm.SYMBOL_CONFIG["XAUUSDm"]
+    # The sizing helper is not consulted at all when the key is off.
+    assert bot.config.get("risk_pct", 0.0) == 0.0
+    assert called == []
+
+
+@pytest.mark.parametrize("equity,expected", [
+    # gold risks $700 per 1.0 lot, so 1% of $100,000 is $1,000 -> 1.42 lots,
+    # rounded DOWN to the 0.01 step.
+    (100000.0, 1.42),
+    (10000.0, 0.14),
+    (1000.0, 0.01),
+])
+def test_risk_sizing_rounds_down_to_the_volume_step(monkeypatch, equity, expected):
+    bot = bm.TradingBot.__new__(bm.TradingBot)
+    bot.symbol = "XAUUSDm"
+    monkeypatch.setattr(bm.mt5, "account_info",
+                        lambda: type("A", (), {"equity": equity})())
+    info = type("I", (), {"volume_min": 0.01, "volume_max": 100.0,
+                          "volume_step": 0.01})()
+    assert bot._risk_sized_lots(1.0, info) == pytest.approx(expected)
+
+
+def test_a_size_below_the_broker_minimum_refuses_the_entry(monkeypatch):
+    """Never clamped up. The minimum position risks a FIXED $7 on gold, so
+    clamping would risk more than asked exactly when the account is smallest."""
+    bot = bm.TradingBot.__new__(bm.TradingBot)
+    bot.symbol = "XAUUSDm"
+    monkeypatch.setattr(bm.mt5, "account_info",
+                        lambda: type("A", (), {"equity": 500.0})())
+    info = type("I", (), {"volume_min": 0.01, "volume_max": 100.0,
+                          "volume_step": 0.01})()
+    assert bot._risk_sized_lots(1.0, info) is None      # $5 asked, $7 minimum
+
+
+def test_an_unreadable_account_refuses_the_entry_rather_than_guessing(monkeypatch):
+    """S3's lesson: an unguarded MT5 return is an invisible failure. Falling
+    back to lot_size here would send an order at a size nobody chose."""
+    bot = bm.TradingBot.__new__(bm.TradingBot)
+    bot.symbol = "XAUUSDm"
+    monkeypatch.setattr(bm.mt5, "account_info", lambda: None)
+    info = type("I", (), {"volume_min": 0.01, "volume_max": 100.0,
+                          "volume_step": 0.01})()
+    assert bot._risk_sized_lots(1.0, info) is None
+
+
+@pytest.mark.parametrize("bad", [50.0, -1.0, 5.1])
+def test_risk_pct_outside_the_ceiling_is_refused(bad):
+    """5% is already aggressive; past it a value is far more likely to be a unit
+    confusion -- 50 meaning "half" -- than an intent."""
+    with pytest.raises(ConfigRejected):
+        bm._validated("risk_pct", bad)
+
+
+def test_a_boolean_under_risk_pct_is_refused():
+    """bool is a subclass of int, so float(True) is 1.0 -- which would validate
+    cleanly as 1% risk on every trade."""
+    with pytest.raises(ConfigRejected):
+        bm._validated("risk_pct", True)
+
+
+def test_risk_pct_is_refused_while_a_position_is_open(monkeypatch):
+    """It decides how large the next order is, so it travels with the sizing
+    fields rather than with the exit-rule toggle."""
+    monkeypatch.setattr(bm, "bot_positions", lambda symbol: [object()])
+    monkeypatch.setattr(bm, "_volume_limits",
+                        lambda symbol: (0.01, 100.0, 0.01, False))
+    manager = bm.BotManager.__new__(bm.BotManager)
+    with pytest.raises(ConfigRejected) as exc:
+        manager.update_settings("XAUUSDm", risk_pct=1.0)
+    assert "open position" in str(exc.value)
+
+
+def test_setting_risk_pct_says_what_equity_it_stops_working_below(monkeypatch):
+    """The floor is a fact about the contract, not a preference, and an idle bot
+    is a bad way to discover it."""
+    monkeypatch.setattr(bm, "bot_positions", lambda symbol: [])
+    monkeypatch.setattr(bm, "_volume_limits",
+                        lambda symbol: (0.01, 100.0, 0.01, False))
+    # update_settings writes through to SYMBOL_CONFIG, which is module state
+    # shared by every test in the session. setitem restores it on teardown.
+    monkeypatch.setitem(bm.SYMBOL_CONFIG["XAUUSDm"], "risk_pct", 0.0)
+
+    def fake_save(symbol, lot, fraction, at_mean, risk_pct=0.0,
+                  source=None, notes=None):
+        return {"lot_size": lot, "partial_fraction": fraction,
+                "exit_at_mean": at_mean, "risk_pct": risk_pct}
+
+    monkeypatch.setattr(repo, "save_settings", fake_save)
+    manager = bm.BotManager.__new__(bm.BotManager)
+    result = manager.update_settings("XAUUSDm", risk_pct=1.0)
+    assert bm.SYMBOL_CONFIG["XAUUSDm"]["risk_pct"] == 1.0
+    assert any("SKIPPED" in n for n in result["notes"]), result["notes"]

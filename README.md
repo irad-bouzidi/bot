@@ -25,26 +25,44 @@ This bot places **real market orders**. Read this section before running it.
 
 **Known open issues:**
 
-- **The scale-out / break-even rule reduces expectancy on every setting tested.**
-  On gold from 2025-05 with central costs it lifts the win rate from 45.9% to
-  ~54% while expectancy falls from -0.071R to -0.104R, because it clips the
-  average winner while doing nothing for trades that run straight to the stop.
-  A 3x3 sweep of trigger and size was monotonically worse than leaving it off.
-  It is enabled because it was requested; disable it with
-  `--no-breakeven`, `partial_fraction = 0` in `SYMBOL_CONFIG`, or a scale-out of
-  0 lots in the dashboard's Position sizing panel.
-- **Both configured symbols backtest NEGATIVE on cached data.** Central costs,
-  M5, 2025-09-01 to 2026-09-04, 0.1 lots on $1,000, honest engine: gold at 7/10
-  is -$13,046 (-0.106R, 908% drawdown) and Bitcoin at 700/1000 of price is -$3,677
-  (-0.031R, 356% drawdown). Bitcoin is the less bad of the two at the same
-  nominal risk; neither is a configuration to fund. Nothing here promises
-  profitability — re-measure on your own data.
+- **No configuration of this strategy survives out-of-sample testing.** The sweep
+  harness (`backend/scripts/sweep.py`) was run over stop x target x timeframe on
+  both symbols: across 160 cells on a common window, **not one has positive
+  expectancy**. On twelve years of gold H4 the best in-sample cell (sl 260 / tp
+  160, -0.025R, profit factor 0.859) degrades to **-0.188R and a 0.478 profit
+  factor on the held-out final third** — a seven-fold collapse. Read that as the
+  answer to "which parameters should we ship": on this data, a configuration
+  chosen in-sample carries no information about the next period.
+- **Both configured symbols backtest NEGATIVE.** Shipped config, central costs,
+  0.1 lots on $1,000, full cached M5 span, on the engine that resolves the entry
+  bar: gold -$24,181 (-0.12R) and Bitcoin -$3,429 (-0.04R). Bitcoin is the less
+  bad of the two at the same nominal risk; neither is a configuration to fund.
+  Nothing here promises profitability — re-measure on your own data.
+- **The scale-out / break-even rule is enabled because it was requested, not
+  because the data supports it.** It clips the average winner while doing nothing
+  for trades that run straight to the stop. The sweep that used to be quoted here
+  was produced before the entry-bar fix and has been struck; the scale-out is the
+  rule that bias touched hardest, since its trigger is reached on the entry bar in
+  a third of gold's trades. Disable it with `--no-breakeven`,
+  `partial_fraction = 0` in `SYMBOL_CONFIG`, or a scale-out of 0 lots in the
+  dashboard's Position sizing panel.
+- **Every backtest number in this repo moved once already.** The engine did not
+  check SL/TP on the bar a trade filled on, so 47% of gold's trades exited at the
+  *next* bar's open as a rule-5 gap fill — an average 3.0 past a 7.00 stop, and
+  2.1 *better* than a 10.00 target, which a limit order cannot do. See "The
+  entry-bar blind spot" in `CLAUDE.md`. The live bot was never affected: it sends
+  `sl`/`tp` inside the entry order, so the broker has held both from the fill all
+  along. Reports produced before the fix are in `data/reports/pre-entry-bar-fix/`
+  and none of their numbers should be quoted.
 - **`lot_size` defaults to 0.1, which risks ~$70 per trade on either symbol**
   against its stop. It is editable from the dashboard — which shows the dollar
-  risk as you type — and persisted, but it still comes with no equity-based
-  sizing, no daily or weekly loss cap and no margin check.
-  This configuration produced runs of 11-12 consecutive losses in backtest — about
-  $840 — at roughly 4.4 trades per day. Note that "0.1 lots" means a completely
+  risk as you type — and persisted. Equity-based sizing (`risk_pct`) now exists
+  and ships OFF; it is quantised away on a small account, because the broker's
+  smallest position already risks $7 on gold, which is 0.23% of $3,000. There is
+  still no live daily or weekly loss cap and no margin check — those exist in the
+  research engine only.
+  This configuration produced runs of 9-11 consecutive losses in backtest — about
+  $630-770 — at roughly 5.5 trades per day. Note that "0.1 lots" means a completely
   different dollar risk on another instrument: the risk is set by the contract
   size, not the nominal volume. Gold and Bitcoin happening to both cost ~$70 at
   0.1 lots is a coincidence of their contract sizes (100 oz/lot over a 7.00 stop
@@ -76,7 +94,9 @@ against that mean, scaled by `MULT`.
 geometry suggests.** With the centre-line exit off — the shipped default — the
 fixed SL/TP and the break-even stop resolve *every* trade, so the strategy is a
 fixed-barrier scalp with a mean-reversion entry filter. With it on, the centre
-line took **6.4% of gold's exits but 70% of Bitcoin's** on the cached data, which
+line took a small minority of gold's exits but the large majority of Bitcoin's on
+the cached data (the exact split was measured on the pre-fix engine and has been
+struck; re-measure before quoting one), which
 is why it was worth making optional rather than assuming it was marginal. Measure
 it on your own data before assuming either — the backtest reports an exit-reason
 census for exactly this purpose, and `cross_center` is now broken out in it.
@@ -476,7 +496,10 @@ gap-fill rules.
 Backtest numbers are only as good as the execution rules behind them. This engine
 fills at the **next bar's open**, checks stops **intrabar** against high/low,
 fills gaps **at the gap price** rather than the stop level, and models spread,
-commission, slippage and swap. Expect materially worse — and more realistic —
+commission, slippage and swap — and unlike every report written before
+2026-09-06, the default run now actually charges stop slippage (one typical
+spread of the instrument, `--slippage-stop`) and the broker's real swap rates
+from the spec sidecar. Expect materially worse — and more realistic —
 results than a close-only, cost-free backtest.
 
 **1. Snapshot history (on the MT5 host):**

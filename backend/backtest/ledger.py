@@ -43,6 +43,13 @@ EXIT_CROSS = "cross_center"
 # did before this map existed.
 SIGNAL_EXIT_REASONS = {
     "cross_center": EXIT_CROSS,
+    # The engine flattens a position when the equity floor is breached, and it
+    # does so by queueing an ordinary EXIT signal so the fill obeys rule 2. That
+    # means the label has to be routed here like any other, or the one exit that
+    # says "this run stopped early" would be indistinguishable from a strategy
+    # exit in the census -- and `EXIT_RISK` would stay the dead constant it was
+    # from the day it was defined until the risk layer arrived.
+    "risk_halt": EXIT_RISK,
 }
 
 

@@ -238,6 +238,7 @@ const SizingHistory = ({ symbol }: { symbol: string }) => {
 const SizingEditor = ({ symbol, sizing, onSaved }: { symbol: string; sizing: any; onSaved: () => void }) => {
   const [lot, setLot] = useState(String(sizing.lot_size));
   const [scaleOut, setScaleOut] = useState(String(sizing.scale_out_lots));
+  const [riskPct, setRiskPct] = useState(String(sizing.risk_pct ?? 0));
   const [dirty, setDirty] = useState(false);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
@@ -248,10 +249,13 @@ const SizingEditor = ({ symbol, sizing, onSaved }: { symbol: string; sizing: any
     if (dirty) return;
     setLot(String(sizing.lot_size));
     setScaleOut(String(sizing.scale_out_lots));
-  }, [sizing.lot_size, sizing.scale_out_lots, dirty]);
+    setRiskPct(String(sizing.risk_pct ?? 0));
+  }, [sizing.lot_size, sizing.scale_out_lots, sizing.risk_pct, dirty]);
 
   const lotNum = parseFloat(lot);
   const outNum = parseFloat(scaleOut);
+  const riskNum = parseFloat(riskPct);
+  const riskOn = isFinite(riskNum) && riskNum > 0;
   const lotOk = isFinite(lotNum) && lotNum > 0;
   const outOk = isFinite(outNum) && outNum >= 0 && (!lotOk || outNum < lotNum);
   const share = lotOk && outOk && outNum > 0 ? (outNum / lotNum) * 100 : 0;
@@ -263,16 +267,18 @@ const SizingEditor = ({ symbol, sizing, onSaved }: { symbol: string; sizing: any
   else if (!lotOk) problem = 'Lot size must be a positive number.';
   else if (!isFinite(outNum) || outNum < 0) problem = 'Scale-out lots cannot be negative.';
   else if (outNum >= lotNum) problem = 'Scale-out must be smaller than the lot size. Use 0 to turn it off.';
+  else if (!isFinite(riskNum) || riskNum < 0 || riskNum > 5) problem = 'Risk % must be between 0 and 5. Use 0 to size from the lot size instead.';
 
   const save = async () => {
     setBusy(true);
     setMsg(null);
     try {
-      const data = await saveSizing(symbol, lotNum, outNum);
+      const data = await saveSizing(symbol, lotNum, outNum, riskNum);
       // Show what was actually applied, not what was typed: the backend snaps to
       // the broker's volume step, so 0.155 comes back as 0.16.
       setLot(String(data.lot_size));
       setScaleOut(String(data.scale_out_lots));
+      setRiskPct(String(data.risk_pct ?? 0));
       setDirty(false);
       setMsg({ ok: true, text: data.notes?.length ? data.notes.join(' ') : 'Saved.' });
       onSaved();
@@ -289,6 +295,7 @@ const SizingEditor = ({ symbol, sizing, onSaved }: { symbol: string; sizing: any
   const reset = () => {
     setLot(String(sizing.lot_size));
     setScaleOut(String(sizing.scale_out_lots));
+    setRiskPct(String(sizing.risk_pct ?? 0));
     setDirty(false);
     setMsg(null);
   };
@@ -304,8 +311,15 @@ const SizingEditor = ({ symbol, sizing, onSaved }: { symbol: string; sizing: any
       <div className="panel">
         <div className="panel-head">
           <span className="panel-title">Position sizing</span>
-          <span className={`panel-meta ${lotOk ? '' : 'muted'}`}>
-            {lotOk ? `~$${(sizing.risk_per_lot * lotNum).toFixed(0)} at risk / trade` : '—'}
+          {/* With risk sizing ON the lot size no longer decides what a trade
+              costs, so `risk_per_lot * lot_size` would be the wrong number in
+              the one place the dashboard warns about risk at all. */}
+          <span className={`panel-meta ${lotOk || riskOn ? '' : 'muted'}`}>
+            {riskOn
+              ? `${riskNum}% of equity at risk / trade`
+              : lotOk
+                ? `~$${(sizing.risk_per_lot * lotNum).toFixed(0)} at risk / trade`
+                : '—'}
           </span>
         </div>
 
@@ -337,7 +351,32 @@ const SizingEditor = ({ symbol, sizing, onSaved }: { symbol: string; sizing: any
               onChange={edit(setScaleOut)}
             />
           </label>
+          <label className="field">
+            <span>Risk % of equity</span>
+            <input
+              className="input"
+              type="number"
+              inputMode="decimal"
+              min={0}
+              max={5}
+              step={0.1}
+              value={riskPct}
+              disabled={locked || busy}
+              onChange={edit(setRiskPct)}
+            />
+          </label>
         </div>
+
+        {riskOn && (
+          <p className="hint">
+            Sizing from equity, so the lot size above is ignored. The broker
+            minimum of {sizing.volume_min} lots already risks{' '}
+            <b>${(sizing.volume_min * sizing.risk_per_lot).toFixed(2)}</b> on this
+            symbol, so below about{' '}
+            <b>${(sizing.risk_pct_min_equity || 0).toFixed(0)}</b> of equity every
+            entry is <b>skipped</b> rather than rounded up.
+          </p>
+        )}
 
         <div className="stack">
           <p className="hint">

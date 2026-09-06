@@ -50,6 +50,17 @@ class SymbolSpec:
     currency_profit: str = "USD"
     currency_margin: str = "USD"
     typical_spread_points: float = 0.0
+    # Swap, exactly as the broker reports it. Defaulted so sidecars written
+    # before these existed still load (`from_dict` filters to known fields).
+    # `swap_mode` is MT5's SYMBOL_SWAP_MODE_*: 1 is points, which is the only
+    # one CostModel implements -- run_baseline refuses the others rather than
+    # charging a percentage as though it were points.
+    swap_mode: int = 0
+    swap_long: float = 0.0
+    swap_short: float = 0.0
+    # MT5's SYMBOL_SWAP_ROLLOVER3DAYS, where Sunday is 0. Python's weekday()
+    # has Monday at 0, so the two differ by one -- see costs.triple_weekday().
+    swap_rollover_3days: int = 3
     server_utc_offset_seconds: int = 0
     captured_at: str = ""
     source: str = "sidecar"

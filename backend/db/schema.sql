@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS symbol_settings (
     lot_size          DOUBLE PRECISION NOT NULL,
     partial_fraction  DOUBLE PRECISION NOT NULL DEFAULT 0,
     exit_at_mean      BOOLEAN NOT NULL DEFAULT FALSE,
+    risk_pct          DOUBLE PRECISION NOT NULL DEFAULT 0,
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT symbol_settings_lot_positive
         CHECK (lot_size > 0),
@@ -57,6 +58,26 @@ CREATE TABLE IF NOT EXISTS symbol_settings (
 ALTER TABLE symbol_settings
     ADD COLUMN IF NOT EXISTS exit_at_mean BOOLEAN NOT NULL DEFAULT FALSE;
 
+-- Schema version 5. `risk_pct` sizes the ORDER from account equity, so unlike
+-- the columns above it can change how large a real position is without anyone
+-- touching `lot_size`. 0 means off, and every existing row gets 0, so applying
+-- this version changes no behaviour -- deliberately, unlike version 3.
+ALTER TABLE symbol_settings
+    ADD COLUMN IF NOT EXISTS risk_pct DOUBLE PRECISION NOT NULL DEFAULT 0;
+
+-- The CHECKs inside CREATE TABLE above only ever reach a FRESH volume: a
+-- database created before they existed does not have them and never will. That
+-- is a pre-existing hole, and it is tolerable for the columns that already have
+-- it because `_validated()` is the primary defence. For a column that sizes
+-- orders from equity it is worth closing on existing volumes too, and Postgres
+-- has no ADD CONSTRAINT IF NOT EXISTS -- so this is the idempotent form.
+-- `tests/test_db_invariants.py` allows the pair explicitly; see its docstring.
+ALTER TABLE symbol_settings
+    DROP CONSTRAINT IF EXISTS symbol_settings_risk_pct_range;
+ALTER TABLE symbol_settings
+    ADD CONSTRAINT symbol_settings_risk_pct_range
+        CHECK (risk_pct >= 0 AND risk_pct <= 5);
+
 -- Append-only history of every sizing change. `lot_size` is the only risk
 -- control this bot has, so "who moved it to 0.5 and when" is worth more than
 -- the disk it costs; the JSON file overwrote its own history on every save.
@@ -72,9 +93,11 @@ CREATE TABLE IF NOT EXISTS settings_audit (
     lot_size               DOUBLE PRECISION NOT NULL,
     partial_fraction       DOUBLE PRECISION NOT NULL,
     exit_at_mean           BOOLEAN,
+    risk_pct               DOUBLE PRECISION,
     prev_lot_size          DOUBLE PRECISION,
     prev_partial_fraction  DOUBLE PRECISION,
     prev_exit_at_mean      BOOLEAN,
+    prev_risk_pct          DOUBLE PRECISION,
     source                 TEXT NOT NULL DEFAULT 'api',
     notes                  TEXT,
     created_at             TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -85,6 +108,14 @@ ALTER TABLE settings_audit
     ADD COLUMN IF NOT EXISTS exit_at_mean BOOLEAN;
 ALTER TABLE settings_audit
     ADD COLUMN IF NOT EXISTS prev_exit_at_mean BOOLEAN;
+
+-- Schema version 5, nullable for the same reason exit_at_mean is: NULL reads as
+-- "written before the column existed", where a NOT NULL DEFAULT would invent a
+-- value for every historical row.
+ALTER TABLE settings_audit
+    ADD COLUMN IF NOT EXISTS risk_pct DOUBLE PRECISION;
+ALTER TABLE settings_audit
+    ADD COLUMN IF NOT EXISTS prev_risk_pct DOUBLE PRECISION;
 
 CREATE INDEX IF NOT EXISTS settings_audit_symbol_idx
     ON settings_audit (symbol, created_at DESC);
@@ -382,5 +413,9 @@ CREATE INDEX IF NOT EXISTS account_snapshots_captured_idx
 --    NAME, so an un-migrated database fails /trades with an UndefinedColumn
 --    rather than quietly serving a history with no pips in it. That is why
 --    REQUIRED_SCHEMA_VERSION moved with it.
-INSERT INTO schema_version (version) VALUES (1), (2), (3), (4)
+-- 5: symbol_settings.risk_pct -- equity-based position sizing became the
+--    fourth editable key, plus the two matching settings_audit columns.
+--    It ships as 0 (off), so applying this version changes NO behaviour; the
+--    floor moves with it only because `load_settings` NAMES the column.
+INSERT INTO schema_version (version) VALUES (1), (2), (3), (4), (5)
 ON CONFLICT (version) DO NOTHING;

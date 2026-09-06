@@ -31,6 +31,8 @@ const sizing = (symbol: string, pip: number, slPips: number, tpPips: number) => 
   lot_size: 0.1,
   partial_fraction: 0.5,
   exit_at_mean: false,
+  risk_pct: 0,
+  risk_pct_min_equity: 0,
   scale_out_lots: 0.05,
   runner_lots: 0.05,
   splittable: true,
@@ -206,6 +208,40 @@ test('the risk shown per card comes from that symbol\'s own stop', async () => {
 
   const risks = await screen.findAllByText('~$70 at risk / trade');
   expect(risks).toHaveLength(2);
+});
+
+test('risk sizing replaces the dollar figure the lot size implies', async () => {
+  // `risk_per_lot * lot_size` is the dashboard's ONLY warning about risk, and
+  // with sizing derived from equity it is simply the wrong number -- the lot
+  // size no longer decides what a trade costs. It must switch source, not sit
+  // there being confidently stale.
+  const withRisk = {
+    XAUUSDm: { ...settings.XAUUSDm, risk_pct: 1, risk_pct_min_equity: 700 },
+    BTCUSDm: settings.BTCUSDm,
+  };
+  global.fetch = mockApi({ theme: 'light', view: 'dashboard' }, true, withRisk) as any;
+
+  render(<App />);
+
+  expect(await screen.findByText('1% of equity at risk / trade')).toBeInTheDocument();
+  // The other symbol still has risk sizing off, so it keeps the lot-derived one.
+  expect(await screen.findByText('~$70 at risk / trade')).toBeInTheDocument();
+});
+
+test('risk sizing says which equity it stops producing orders below', async () => {
+  // The broker's smallest position risks a fixed number of dollars, so below
+  // that equity every entry is SKIPPED rather than rounded up. An idle bot is a
+  // bad way to find that out.
+  const withRisk = {
+    XAUUSDm: { ...settings.XAUUSDm, risk_pct: 1, risk_pct_min_equity: 700 },
+    BTCUSDm: settings.BTCUSDm,
+  };
+  global.fetch = mockApi({ theme: 'light', view: 'dashboard' }, true, withRisk) as any;
+
+  render(<App />);
+
+  expect(await screen.findByText(/every\s+entry is/i)).toBeInTheDocument();
+  expect(await screen.findByText('$700')).toBeInTheDocument();
 });
 
 test('the trades page offers a per-symbol filter once there are two', async () => {

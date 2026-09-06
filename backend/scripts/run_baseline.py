@@ -42,8 +42,9 @@ from datetime import datetime, timezone
 
 import pandas as pd
 
-from backend.backtest.costs import CostConfig, CostModel
+from backend.backtest.costs import CostConfig, CostModel, triple_weekday
 from backend.backtest.engine import BacktestConfig, BacktestEngine
+from backend.backtest.risk import RiskConfig
 from backend.backtest.metrics import by_group
 from backend.core.symbols import SYMBOL_CONFIG, price_levels
 from backend.data.cache import DEFAULT_ROOT, CachedMarketData
@@ -74,18 +75,38 @@ def build_strategy(args):
 
 def run_one(barset, args, spread_mult, slip_mult, legacy=False):
     spec = barset.spec
+    # A stop is hit precisely during a fast adverse move, so it fills worse than
+    # an average order -- see costs.py's module docstring. Until the entry bar
+    # was resolved, the engine supplied that pessimism by accident (a rule-5 gap
+    # fill averaging 3.0 past a 7.00 gold stop, i.e. ~30 pips). Now it has to be
+    # a number somebody chose. It cannot be a shared constant in POINTS: one
+    # point is 0.001 of gold and 0.01 of Bitcoin, so it defaults to one typical
+    # spread of the instrument and scales with the scenario like every other
+    # cost.
+    stop_slip = (args.slippage if args.slippage_stop is None
+                 else args.slippage_stop)
     costs = CostModel(CostConfig(
         spread_source="none" if args.no_costs else "bar",
         spread_multiplier=spread_mult,
         commission_per_lot_round_turn=args.commission,
         slippage_points_entry=args.slippage * slip_mult,
         slippage_points_exit=args.slippage * slip_mult,
-        slippage_points_stop=args.slippage * slip_mult,
+        slippage_points_stop=stop_slip * slip_mult,
+        swap_long_points_per_day=0.0 if args.no_swap else spec.swap_long,
+        swap_short_points_per_day=0.0 if args.no_swap else spec.swap_short,
+        triple_swap_weekday=triple_weekday(spec.swap_rollover_3days),
     ), spec)
     eng = BacktestEngine(
         build_strategy(args), spec, costs=costs,
-        cfg=BacktestConfig(initial_balance=args.balance, volume=args.volume,
-                           legacy_mode=legacy, pip_size=args.pip_size),
+        cfg=BacktestConfig(
+            initial_balance=args.balance, volume=args.volume,
+            legacy_mode=legacy, pip_size=args.pip_size,
+            risk=RiskConfig(
+                risk_pct_per_trade=args.risk_pct,
+                max_daily_loss_pct=args.max_daily_loss_pct,
+                max_consecutive_losses=args.max_consecutive_losses,
+                cooldown_bars=args.cooldown_bars,
+                min_equity=args.min_equity)),
     )
     return eng.run(barset)
 
@@ -127,6 +148,12 @@ def print_report(name, m):
         ("Largest win (pips)", "largest_win_pips"),
         ("Largest loss (pips)", "largest_loss_pips"),
         ("Max drawdown %", "max_drawdown"),
+        ("Min equity seen", "min_equity_seen"),
+        ("HALTED", "halted"), ("  reason", "halt_reason"),
+        ("Entries blocked: daily loss", "entries_blocked_daily_loss"),
+        ("  cooldown", "entries_blocked_cooldown"),
+        ("  after halt", "entries_blocked_halted"),
+        ("  size below broker minimum", "entries_skipped_too_small"),
         ("Max consec. wins", "max_consecutive_wins"),
         ("Max consec. losses", "max_consecutive_losses"),
         ("  (iid expectation)", "max_consecutive_losses_expected_iid"),
@@ -250,7 +277,14 @@ def main(argv=None):
                    help="target distance, PRICE units (default: the symbol's "
                         "SYMBOL_CONFIG target)")
     p.add_argument("--commission", type=float, default=0.0)
-    p.add_argument("--slippage", type=float, default=0.0, help="points")
+    p.add_argument("--slippage", type=float, default=0.0,
+                   help="points, applied to entries and non-stop exits")
+    p.add_argument("--slippage-stop", type=float, default=None,
+                   help="EXTRA points on SL/break-even exits only. Defaults to "
+                        "one typical spread of the instrument; pass 0 to model "
+                        "stops filling exactly at their level.")
+    p.add_argument("--no-swap", action="store_true",
+                   help="ignore the broker's swap rates, to measure them")
     p.add_argument("--no-costs", action="store_true")
     p.add_argument("--no-breakeven", action="store_true",
                    help="disable the scale-out / break-even rule, to measure it")
@@ -274,6 +308,19 @@ def main(argv=None):
     p.add_argument("--compare-legacy", action="store_true",
                    help="also run the ORIGINAL close-only, cost-free engine to show "
                         "how much it was flattering itself")
+    p.add_argument("--risk-pct", type=float, default=0.0,
+                   help="PERCENT of equity risked at the stop, e.g. 1.0 for 1%%. "
+                        "0 keeps the fixed --volume, which is what every stored "
+                        "report used.")
+    p.add_argument("--max-daily-loss-pct", type=float, default=0.0,
+                   help="percent of the broker day's OPENING equity; blocks new "
+                        "entries for the rest of that day")
+    p.add_argument("--max-consecutive-losses", type=int, default=0)
+    p.add_argument("--cooldown-bars", type=int, default=0,
+                   help="bars to sit out after --max-consecutive-losses")
+    p.add_argument("--min-equity", type=float, default=0.0,
+                   help="absolute equity floor; breaching it STOPS the run, so "
+                        "drawdown stays a readable percentage")
     p.add_argument("--out", default=None, help="directory for ledger + metrics")
     args = p.parse_args(argv)
     _apply_symbol_defaults(args)
@@ -283,6 +330,26 @@ def main(argv=None):
     barset = md.get_bars(args.symbol, args.timeframe, _utc(args.start), _utc(args.end),
                          warmup_bars=strat.warmup_bars())
 
+    spec = barset.spec
+    if args.slippage_stop is None:
+        # One typical spread of THIS instrument. See run_one for why it cannot
+        # be a shared constant in points.
+        args.slippage_stop = float(spec.typical_spread_points or 0.0)
+    if spec.swap_mode not in (0, 1) and not args.no_swap:
+        raise SystemExit(
+            "%s reports swap_mode=%d; CostModel only implements POINTS (mode 1). "
+            "Charging a percentage as though it were points would be wrong by "
+            "orders of magnitude. Re-run with --no-swap to proceed deliberately "
+            "without it." % (spec.name, spec.swap_mode))
+    print("costs: stop slippage %g pt (%g of price)%s | swap %g/%g pt per day, "
+          "triple on %s%s"
+          % (args.slippage_stop, args.slippage_stop * spec.point,
+             " [default: one typical spread]" if args.slippage_stop else "",
+             0.0 if args.no_swap else spec.swap_long,
+             0.0 if args.no_swap else spec.swap_short,
+             ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")[
+                 triple_weekday(spec.swap_rollover_3days)],
+             " (--no-swap)" if args.no_swap else ""))
     print("data: %s" % json.dumps(barset.meta(), indent=2, default=str))
     for w in barset.warnings:
         print("WARNING: %s" % w)

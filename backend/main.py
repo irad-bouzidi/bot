@@ -107,6 +107,10 @@ class SizingUpdate(BaseModel):
     lot_size: Optional[float] = None
     scale_out_lots: Optional[float] = None
     exit_at_mean: Optional[bool] = None
+    # PERCENT of equity, so 1.0 means 1%. 0 turns it off and `lot_size` sizes
+    # the order, which is the shipped default. It travels with the SIZING fields
+    # rather than with `exit_at_mean`, so the open-position refusal covers it.
+    risk_pct: Optional[float] = None
 
 class BacktestSizing(BaseModel):
     """One symbol's sizing for one run, in LOTS. Never a fraction -- see
@@ -237,7 +241,8 @@ def update_settings(ctrl: SizingUpdate):
     cannot re-scale a running trade. See BotManager.update_settings for both."""
     try:
         return manager.update_settings(ctrl.symbol, ctrl.lot_size,
-                                       ctrl.scale_out_lots, ctrl.exit_at_mean)
+                                       ctrl.scale_out_lots, ctrl.exit_at_mean,
+                                       ctrl.risk_pct)
     except ConfigRejected as exc:
         return {"error": str(exc)}
     except DatabaseUnavailable as exc:

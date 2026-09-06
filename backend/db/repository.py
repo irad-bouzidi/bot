@@ -106,7 +106,7 @@ def load_settings(symbols, validate=None, on_reject=None):
     out = {}
     with cursor() as cur:
         cur.execute("""
-            SELECT symbol, lot_size, partial_fraction, exit_at_mean
+            SELECT symbol, lot_size, partial_fraction, exit_at_mean, risk_pct
             FROM symbol_settings
             WHERE symbol = ANY(%s)
         """, (list(symbols),))
@@ -137,7 +137,7 @@ def load_settings(symbols, validate=None, on_reject=None):
 
 
 def save_settings(symbol, lot_size, partial_fraction, exit_at_mean,
-                  source="api", notes=None):
+                  risk_pct=0.0, source="api", notes=None):
     """Upsert the settings and append an audit row, in ONE transaction.
 
     Together, because the audit row's `prev_*` columns are read from the table
@@ -155,32 +155,38 @@ def save_settings(symbol, lot_size, partial_fraction, exit_at_mean,
     with cursor() as cur:
         cur.execute("""
             WITH prev AS (
-                SELECT lot_size, partial_fraction, exit_at_mean
+                SELECT lot_size, partial_fraction, exit_at_mean, risk_pct
                 FROM symbol_settings WHERE symbol = %(symbol)s
             ), upsert AS (
                 INSERT INTO symbol_settings
-                    (symbol, lot_size, partial_fraction, exit_at_mean, updated_at)
-                VALUES (%(symbol)s, %(lot)s, %(fraction)s, %(exit_at_mean)s, now())
+                    (symbol, lot_size, partial_fraction, exit_at_mean,
+                     risk_pct, updated_at)
+                VALUES (%(symbol)s, %(lot)s, %(fraction)s, %(exit_at_mean)s,
+                        %(risk_pct)s, now())
                 ON CONFLICT (symbol) DO UPDATE
                     SET lot_size = EXCLUDED.lot_size,
                         partial_fraction = EXCLUDED.partial_fraction,
                         exit_at_mean = EXCLUDED.exit_at_mean,
+                        risk_pct = EXCLUDED.risk_pct,
                         updated_at = now()
-                RETURNING lot_size, partial_fraction, exit_at_mean, updated_at
+                RETURNING lot_size, partial_fraction, exit_at_mean, risk_pct,
+                          updated_at
             )
             INSERT INTO settings_audit
-                (symbol, lot_size, partial_fraction, exit_at_mean,
+                (symbol, lot_size, partial_fraction, exit_at_mean, risk_pct,
                  prev_lot_size, prev_partial_fraction, prev_exit_at_mean,
-                 source, notes)
+                 prev_risk_pct, source, notes)
             SELECT %(symbol)s, u.lot_size, u.partial_fraction, u.exit_at_mean,
+                   u.risk_pct,
                    (SELECT lot_size FROM prev), (SELECT partial_fraction FROM prev),
-                   (SELECT exit_at_mean FROM prev),
+                   (SELECT exit_at_mean FROM prev), (SELECT risk_pct FROM prev),
                    %(source)s, %(notes)s
             FROM upsert u
-            RETURNING lot_size, partial_fraction, exit_at_mean
+            RETURNING lot_size, partial_fraction, exit_at_mean, risk_pct
         """, {"symbol": symbol, "lot": float(lot_size),
               "fraction": float(partial_fraction),
               "exit_at_mean": bool(exit_at_mean),
+              "risk_pct": float(risk_pct),
               "source": source, "notes": note})
         row = cur.fetchone()
         return {"lot_size": float(row["lot_size"]),
@@ -192,7 +198,9 @@ def settings_history(symbol=None, limit=50):
     with cursor() as cur:
         cur.execute("""
             SELECT id, symbol, lot_size, partial_fraction, exit_at_mean,
+                   risk_pct,
                    prev_lot_size, prev_partial_fraction, prev_exit_at_mean,
+                   prev_risk_pct,
                    source, notes, created_at
             FROM settings_audit
             WHERE (%(symbol)s IS NULL OR symbol = %(symbol)s)
@@ -403,6 +411,36 @@ def get_snapshots():
 DEAL_COLUMNS = ("ticket", "order_ticket", "position_id", "symbol", "magic",
                 "entry_kind", "deal_type", "volume", "price", "profit",
                 "commission", "swap", "fee", "comment", "dealt_at")
+
+
+def opened_volume(position_id):
+    # type: (int) -> Optional[float]
+    """Volume this position was OPENED with, from its entry deals, or None.
+
+    `manage_position()` needs to know whether the scale-out has already fired.
+    It used to answer that by comparing the position's current volume against
+    `SYMBOL_CONFIG["lot_size"]`, which is only valid while the configured size is
+    a constant between trades. The moment sizing derives from equity -- or the
+    moment anyone edits the size between two trades -- an already-reduced
+    position looks untouched and gets scaled out a SECOND time.
+
+    The right answer was already durable and did not need new state: `deals` is
+    keyed on the broker's `position_id` and holds the entry deal. That is a
+    SELECT, not a flag, so it survives the restarts, reconnects and thread
+    replacement that S7 refuses to keep a per-ticket dict across.
+
+    Returns None when nothing is known about the position -- which the caller
+    must treat as "cannot tell", never as "not yet scaled out".
+    """
+    with cursor() as cur:
+        cur.execute(
+            "SELECT COALESCE(SUM(volume), 0) AS v FROM deals "
+            "WHERE position_id = %s AND entry_kind = 'in'",
+            (int(position_id),))
+        row = cur.fetchone()
+    if not row or not row["v"]:
+        return None
+    return float(row["v"])
 
 
 def upsert_deals(rows):

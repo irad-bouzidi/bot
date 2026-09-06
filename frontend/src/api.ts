@@ -144,9 +144,11 @@ export interface SettingsChange {
   // answer: the rule was unconditionally on, so `false` would misreport it and
   // `true` would claim somebody chose it.
   exit_at_mean: boolean | null;
+  risk_pct: number | null;
   prev_lot_size: number | null;
   prev_partial_fraction: number | null;
   prev_exit_at_mean: boolean | null;
+  prev_risk_pct: number | null;
   source: string;
   notes: string | null;
   created_at: string;
@@ -171,11 +173,18 @@ export const getStats = () => request<any>('/stats');
 
 export const getSettings = () => request<Record<string, any>>('/settings');
 
-export const saveSizing = (symbol: string, lotSize: number, scaleOutLots: number) =>
+// `riskPct` is a PERCENT of equity, so 1 means 1%, and 0 means "size from the
+// lot size" -- the shipped default. It travels with the sizing fields, not with
+// the exit-rule toggle, because it decides how large the next order is and is
+// therefore refused while a position is open.
+export const saveSizing = (
+  symbol: string, lotSize: number, scaleOutLots: number, riskPct?: number,
+) =>
   postJson<any>('/settings', {
     symbol,
     lot_size: lotSize,
     scale_out_lots: scaleOutLots,
+    ...(riskPct === undefined ? {} : { risk_pct: riskPct }),
   });
 
 // Sends the flag and NOTHING else, which is the whole point. The backend reads
